@@ -1,6 +1,8 @@
 # -*- coding: cp1252 -*-
 import os
-os.environ['ESMFMKFILE'] = "/gpfs/workdir/shared/juicce/envs/xenv/lib/esmf.mk"
+import config
+os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
+import sys
 import xesmf as xe
 import xarray as xr
 import numpy as np
@@ -15,6 +17,18 @@ import xagg as xa
 from rasterio.features import geometry_mask
 import rasterio
 
+# fit_local_shear.py (ERA5-based per-pixel wind shear exponent) and
+# calculate_wind_solar_cf.py (PVGIS solar model) live in the sibling
+# como24_group5/code_review project, not on the default path.
+_FIT_LOCAL_SHEAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    '..', 'como24_group5', 'code_review')
+if _FIT_LOCAL_SHEAR_DIR not in sys.path:
+    sys.path.insert(0, _FIT_LOCAL_SHEAR_DIR)
+from fit_local_shear import fit_local_shear
+from calculate_wind_solar_cf import (
+    compute_solar_cf, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS,
+)
+
 # -------------------------
 # DS_CF physical constants
 # -------------------------
@@ -22,36 +36,32 @@ import rasterio
 @dataclass
 class DS_CFConfig:
     """
-    Physical constants for the wind and solar potential calculations.
-    
+    Physical constants for the wind potential calculation.
+
+    Solar potential uses the PVGIS relative-efficiency + Faiman
+    module-temperature model instead (see compute_solar_cf, imported from
+    calculate_wind_solar_cf.py; pass a PVGISCoefficients instance as pv_cfg
+    to the calculate_ds_cf_* functions below).
+
     Wind power curve parameters
     ---------------------------
     vr  : rated wind speed (m/s) turbine reaches full output above this
     vci : cut-in wind speed (m/s) turbine starts generating below this
     vco : cut-out wind speed (m/s) turbine shuts down above this
-    wind_height_exponent : Hellmann exponent for log-law extrapolation (10 m ? 80 m)
-    
-    Solar (PV) cell temperature model parameters (Huld et al.)
-    ----------------------------------------------------------
-    gamma : temperature coefficient of PV efficiency (K)
-    T_ref : reference cell temperature (°C)
-    G_stc : irradiance at standard test conditions (W m-2)
-    c_1..c_4 : coefficients for the NOCT-based cell temperature model
+    ref_height : height (m) of the input wind speed (reanalysis/GCM 10 m wind)
+    hub_height : height (m) the wind speed is extrapolated to, using a
+                 per-pixel Hellmann shear exponent fit from reanalysis
+                 100 m/10 m wind (see fit_local_shear / get_local_shear_exponent
+                 below). Defaults to 100 m to match the height that fit
+                 calibrates against -- using a different hub_height applies
+                 the exponent beyond the height it was fit for.
     """
     # Wind turbine curve
     vr:  float = 13.0
     vci: float = 3.5
     vco: float = 25.0
-    wind_height_exponent: float = 0.143   # (80/10)^0.143
-
-    # PV cell temperature
-    gamma: float = -0.005
-    T_ref: float = 25.0
-    G_stc: float = 1000.0
-    c_1: float =  4.3
-    c_2: float =  0.943
-    c_3: float =  0.028
-    c_4: float = -1.528
+    ref_height: float = 10.0
+    hub_height: float = 100.0
 
 
 # Default config instance can be overridden at call sites
@@ -62,20 +72,71 @@ DEFAULT_DS_CF_CONFIG = DS_CFConfig()
 # Helper functions
 # -------------------------
 
+def _match_files(pattern_base):
+    """
+    Search for files/stores matching pattern_base with either a '.zarr' or
+    '.nc' suffix (zarr is preferred when both are present).
+
+    pattern_base is a glob pattern *without* its trailing extension, e.g.
+    "/data/GCM/tas_day_GCM_ssp245_r1i1p1f1*GWL2" the ".zarr"/".nc" suffix
+    is appended before globbing.
+
+    Returns
+    -------
+    (files, fmt) : (list of str, 'zarr' | 'netcdf' | None)
+    """
+    zarr_files = sorted(glob.glob(pattern_base + '.zarr'))
+    if zarr_files:
+        return zarr_files, 'zarr'
+    nc_files = sorted(glob.glob(pattern_base + '.nc'))
+    if nc_files:
+        return nc_files, 'netcdf'
+    return [], None
+
+
+def open_dataset_any(path, chunks=None, **kwargs):
+    """Open a single dataset, whether it is a NetCDF file or a Zarr store."""
+    if str(path).rstrip('/\\').endswith('.zarr'):
+        return xr.open_dataset(path, engine='zarr', chunks=chunks, **kwargs)
+    return xr.open_dataset(path, chunks=chunks, **kwargs)
+
+
+def open_mfdataset_any(paths, chunks=None, **kwargs):
+    """
+    Open one or several datasets (NetCDF or Zarr, not mixed) as a single
+    combined dataset. mfdataset-only kwargs (e.g. combine, parallel) are
+    ignored when a single store is opened.
+    """
+    paths = sorted(paths)
+    if not paths:
+        raise FileNotFoundError("No files provided to open_mfdataset_any")
+    is_zarr = str(paths[0]).rstrip('/\\').endswith('.zarr')
+    if len(paths) == 1:
+        engine = 'zarr' if is_zarr else None
+        return xr.open_dataset(paths[0], chunks=chunks,
+                               **({'engine': engine} if engine else {}))
+    mf_kwargs = dict(kwargs)
+    if is_zarr:
+        mf_kwargs['engine'] = 'zarr'
+    return xr.open_mfdataset(paths, chunks=chunks, **mf_kwargs)
+
+
 def load_variable(var, GCM, ssp, run, path_folder, gwl, chunks):
     """
     Load a single variable dataset from a file matching a pattern.
     Only keep the variable and lat, lon, time coordinates.
     Drop 'height' variable if present.
+    Accepts either NetCDF (.nc) or Zarr (.zarr) stores.
     """
-    pattern = f"{path_folder}{GCM}/{var}_day_{GCM}_{ssp}_{run}*{gwl}.nc"
-    files = glob.glob(pattern)
+    pattern_base = f"{path_folder}{GCM}/{var}_day_{GCM}_{ssp}_{run}*{gwl}"
+    files, _ = _match_files(pattern_base)
     if len(files) == 0:
-        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        raise FileNotFoundError(
+            f"No files found for pattern: {pattern_base}.[nc|zarr]")
     try:
-        ds = xr.open_dataset(files[0], chunks=chunks)
+        ds = open_dataset_any(files[0], chunks=chunks)
     except Exception:
-        ds = xr.open_dataset(files[0], chunks=chunks, decode_times=False)
+        ds = open_dataset_any(files[0], chunks=chunks, decode_times=False)
         ds['time'] = pd.to_datetime(ds['time'], unit='D', origin='2015-01-01')
     ds['time'] = ds['time'].dt.floor('D')
     ds = ds[[var, 'lat', 'lon', 'time']]
@@ -148,31 +209,130 @@ def safe_to_netcdf(ds, path, mode="w", **kwargs):
 
 
 # -------------------------
+# Local (per-pixel) wind shear exponent
+# -------------------------
+
+def get_local_shear_exponent(era5_file_pattern, path_preprocessed,
+                             ref_period=('1982-01-01', '2001-12-31'),
+                             overwrite=False):
+    """
+    Per-pixel Hellmann shear exponent (ref_height -> hub_height), fit from
+    reanalysis daily u10/v10/u100/v100 over `ref_period` (see
+    fit_local_shear.fit_local_shear), cached to
+    {path_preprocessed}/ERA5/shear_exponent_local_{start}_{end}.nc.
+
+    era5_file_pattern : glob pattern for the reanalysis wind files (.nc or
+                        .zarr). Only needed the first time -- ignored once
+                        the cached file exists (pass overwrite=True to refit).
+    """
+    out_dir = os.path.join(path_preprocessed, 'ERA5')
+    out_path = os.path.join(out_dir, f"shear_exponent_local_{ref_period[0]}_{ref_period[1]}.nc")
+
+    if os.path.exists(out_path) and not overwrite:
+        alpha = xr.open_dataset(out_path)['alpha']
+    else:
+        if not era5_file_pattern:
+            raise FileNotFoundError(
+                f"No cached local shear exponent at {out_path} and no "
+                "era5_file_pattern given to fit one."
+            )
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"Fitting local shear exponent from {era5_file_pattern} over {ref_period}")
+        alpha_ds = fit_local_shear(era5_file_pattern, time_slice=ref_period)
+        safe_to_netcdf(alpha_ds, out_path)
+        alpha = alpha_ds['alpha']
+
+    rename = {}
+    if 'latitude' in alpha.dims:
+        rename['latitude'] = 'lat'
+    if 'longitude' in alpha.dims:
+        rename['longitude'] = 'lon'
+    if rename:
+        alpha = alpha.rename(rename)
+    return alpha
+
+
+def regrid_alpha_to_grid(alpha, target_grid, interp_method='linear'):
+    """Interpolate a per-pixel shear-exponent DataArray onto target_grid's lat/lon."""
+    return alpha.interp(lat=target_grid['lat'], lon=target_grid['lon'], method=interp_method)
+
+
+def get_gcm_shear_exponent(GCM, shear_by_gcm_dir, target_grid,
+                           ref_period=('1982-01-01', '2001-12-31')):
+    """
+    Per-pixel local Hellmann shear exponent for `GCM`, already fit on GCM's
+    own native grid (see shear_by_gcm/compute_shear_by_gcm.py, which
+    regrids ERA5 u10/v10/u100/v100 to the GCM grid *before* fitting alpha,
+    rather than fitting on the ERA5 grid and interpolating alpha itself as
+    get_local_shear_exponent / regrid_alpha_to_grid do). Sea pixels are
+    already NaN (masked with shp_re.shp at fit time).
+
+    No interpolation needed here -- unlike get_local_shear_exponent, the
+    cached alpha already sits on target_grid's exact lat/lon grid; this
+    just checks the shapes agree and reuses target_grid's own coordinate
+    values so downstream alignment (compute_wind_potential's xr.where) is
+    exact rather than relying on a float round-trip match.
+    """
+    path = os.path.join(shear_by_gcm_dir, f"shear_exponent_{GCM}_{ref_period[0]}_{ref_period[1]}.nc")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No per-GCM shear exponent file for {GCM} at {path}. "
+            "Run shear_by_gcm/compute_shear_by_gcm.py first."
+        )
+    alpha = xr.open_dataset(path)['alpha']
+    expected_shape = (target_grid.sizes['lat'], target_grid.sizes['lon'])
+    if alpha.shape != expected_shape:
+        raise ValueError(
+            f"Cached shear exponent grid {alpha.shape} for {GCM} does not match "
+            f"the target grid {expected_shape} -- refit with compute_shear_by_gcm.py."
+        )
+    return alpha.assign_coords(lat=target_grid['lat'], lon=target_grid['lon'])
+
+
+def compute_wind_potential(sfcwind, alpha, cfg):
+    """
+    Wind capacity factor: extrapolate sfcwind from cfg.ref_height to
+    cfg.hub_height using the per-pixel Hellmann exponent alpha, then apply
+    the cubic power curve between cut-in and rated speed.
+    """
+    wind_hub = sfcwind * (cfg.hub_height / cfg.ref_height) ** alpha
+    wind_pot = xr.where(wind_hub < cfg.vci, 0, wind_hub)
+    wind_pot = xr.where(wind_pot >= cfg.vco, 0, wind_pot)
+    wind_pot = xr.where((wind_pot >= cfg.vr) & (wind_pot < cfg.vco), 1, wind_pot)
+    wind_pot = xr.where(
+        (wind_pot >= cfg.vci) & (wind_pot < cfg.vr),
+        (wind_pot**3 - cfg.vci**3) / (cfg.vr**3 - cfg.vci**3),
+        wind_pot
+    )
+    return wind_pot
+
+
+# -------------------------
 # Main loading function
 # -------------------------
 
 def load_ds(GCM, ssp, run, path_folder, gwl):
     """
-    Load tasmax, tas, rsds, and either (uas, vas) or sfcWind.
+    Load tas, rsds, and either (uas, vas) or sfcWind.
     Regrid to a common grid, merge, and convert the calendar.
     """
     chunks = {'time': -1, 'lat': 100, 'lon': 100}
 
-    dtasmax = load_variable('tasmax', GCM, ssp, run, path_folder, gwl, chunks)
     dtas    = load_variable('tas',    GCM, ssp, run, path_folder, gwl, chunks)
     drsds   = load_variable('rsds',   GCM, ssp, run, path_folder, gwl, chunks)
 
-    datasets = {'tasmax': dtasmax, 'tas': dtas, 'rsds': drsds}
+    datasets = {'tas': dtas, 'rsds': drsds}
 
-    uas_pattern = f"{path_folder}{GCM}/uas_*{GCM}_{ssp}_{run}*{gwl}.nc"
-    if glob.glob(uas_pattern):
+    uas_pattern_base = f"{path_folder}{GCM}/uas_*{GCM}_{ssp}_{run}*{gwl}"
+    uas_files, _ = _match_files(uas_pattern_base)
+    if uas_files:
         duas = load_variable('uas', GCM, ssp, run, path_folder, gwl, chunks)
         dvas = load_variable('vas', GCM, ssp, run, path_folder, gwl, chunks)
         datasets.update({'uas': duas, 'vas': dvas})
         target_ds = choose_target_grid(datasets, method="min")
         for key, ds in datasets.items():
             datasets[key] = regrid_to_target(ds, target_ds, key)
-        ds = xr.merge([datasets['tasmax'], datasets['tas'],
+        ds = xr.merge([datasets['tas'],
                        datasets['rsds'], datasets['uas'], datasets['vas']])
         ds['sfcWind'] = np.sqrt(ds.uas**2 + ds.vas**2)
         ds = ds.drop_vars(['uas', 'vas'])
@@ -248,8 +408,11 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dhist = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
     chunk_loc = 60
 
-    files_ref = glob.glob(os.path.join(path_folder, reanalysis, f"*{reanalysis}*.nc"))
-    dref = xr.open_mfdataset(files_ref)
+    files_ref, _ = _match_files(os.path.join(path_folder, reanalysis, f"*{reanalysis}*"))
+    if not files_ref:
+        raise FileNotFoundError(
+            f"No reanalysis files found in {os.path.join(path_folder, reanalysis)}")
+    dref = open_mfdataset_any(files_ref)
     dref = dref.sortby('lat').sortby('lon').sortby('time')
     dhist = dhist.sortby('lat').sortby('lon').sortby('time')
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
@@ -307,14 +470,14 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     mask_array = create_mask_from_shapefile(ref_grid, shapefile)
 
-    var_units = {'sfcWind': 'm s-1', 'tas': 'K', 'tasmax': 'K', 'rsds': 'W m-2'}
+    var_units = {'sfcWind': 'm s-1', 'tas': 'K', 'rsds': 'W m-2'}
     dref = dref.where(mask_array)
     dhist = dhist.where(mask_array)
     dref = set_variable_units(dref, var_units)
     dhist = set_variable_units(dhist, var_units)
 
     dref = dref.sel(time=slice('1982-01-01', '2001-12-31'))
-    dref = dref[['sfcWind', 'tas', 'tasmax', 'rsds']]
+    dref = dref[['sfcWind', 'tas', 'rsds']]
 
     lon_ori = dref.lon
     lat_ori = dref.lat
@@ -419,7 +582,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
         dfut = filter_domain(dfut, (lat_ori[0], lat_ori[-1]), (lon_ori[0], lon_ori[-1]))
         dfut = set_variable_units(dfut,
-                                  {'sfcWind': 'm s-1', 'tas': 'K', 'tasmax': 'K', 'rsds': 'W m-2'})
+                                  {'sfcWind': 'm s-1', 'tas': 'K', 'rsds': 'W m-2'})
         dfut = dfut.convert_calendar('noleap').convert_calendar('standard')
         dfut = dfut.sortby('lat').sortby('lon').sortby('time')
         dfut = dfut.stack(location=("lat", "lon"))
@@ -512,8 +675,19 @@ def calculate_ds_cf_reanalysis_grid_GCM(
     reanalysis='W5E5',
     shapefile_path=None,
     cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
+    pv_cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
+    shear_ref_period=('1982-01-01', '2001-12-31'),
+    shear_by_gcm_dir=None,
 ):
-    """Compute wcf/scf reference files from reanalysis regridded to the GCM grid."""
+    """
+    Compute wcf/scf reference files from reanalysis regridded to the GCM grid.
+
+    shear_by_gcm_dir : folder of precomputed per-GCM shear exponent files
+                        (see get_gcm_shear_exponent / shear_by_gcm/compute_shear_by_gcm.py).
+                        Defaults to config.SHEAR_BY_GCM_DIR.
+    """
+    if shear_by_gcm_dir is None:
+        shear_by_gcm_dir = config.SHEAR_BY_GCM_DIR
 
     out_folder = os.path.join(path_preprocessed, GCM)
     os.makedirs(out_folder, exist_ok=True)
@@ -525,28 +699,31 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         return
 
     # 1. Load GCM grid template
-    gcm_file = os.path.join(
+    gcm_file_base = os.path.join(
         path_preprocessed, GCM,
-        f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}.nc"
+        f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}"
     )
-    print("Loading GCM file:", gcm_file)
-    ds_gcm = xr.open_dataset(gcm_file, chunks={'time': 100})
+    gcm_files, _ = _match_files(gcm_file_base)
+    if not gcm_files:
+        raise FileNotFoundError(f"No GCM file found for pattern: {gcm_file_base}.[nc|zarr]")
+    print("Loading GCM file:", gcm_files[0])
+    ds_gcm = open_dataset_any(gcm_files[0], chunks={'time': 100})
     gcm_grid = xr.Dataset(coords={"lat": ds_gcm["lat"], "lon": ds_gcm["lon"]})
 
     # 2. Load reanalysis
-    files_ref = glob.glob(os.path.join(path_folder, reanalysis, f"*{reanalysis}*.nc"))
+    files_ref, _ = _match_files(os.path.join(path_folder, reanalysis, f"*{reanalysis}*"))
     if not files_ref:
         raise FileNotFoundError(
             f"No reanalysis files found in {os.path.join(path_folder, reanalysis)}")
 
     print(f"Found {len(files_ref)} reanalysis files for {reanalysis}")
-    dref = xr.open_mfdataset(
+    dref = open_mfdataset_any(
         files_ref, combine='by_coords',
         chunks={'time': -1, 'lat': 100, 'lon': 100}, parallel=True
     )
     dref = dref.sortby('lat').sortby('lon').sortby('time')
 
-    for v in ('tas', 'tasmax', 'rsds'):
+    for v in ('tas', 'rsds'):
         if v not in dref:
             raise KeyError(f"{v} not found in reanalysis dataset")
 
@@ -556,7 +733,7 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         print("Computing sfcWind from uas/vas")
         dref['sfcWind'] = np.hypot(dref['uas'], dref['vas'])
 
-    dref = dref[['tas', 'tasmax', 'rsds', 'sfcWind']]
+    dref = dref[['tas', 'rsds', 'sfcWind']]
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
 
     # 3. Optional shapefile mask (before regrid)
@@ -587,22 +764,17 @@ def calculate_ds_cf_reanalysis_grid_GCM(
     ds_gcm.close()
 
     dref_rg = dref_rg.convert_calendar('noleap').convert_calendar('standard')
-    dref_rg['tas']    = dref_rg['tas']    - 273.15
-    dref_rg['tasmax'] = dref_rg['tasmax'] - 273.15
+    dref_rg['tas'] = dref_rg['tas'] - 273.15
 
     std_mask = dref_rg.tas.std(dim='time')
     if hasattr(std_mask, 'compute'):
         std_mask = std_mask.compute()
     dref_rg = dref_rg.where(~std_mask.isnull() & (std_mask != 0), drop=True)
 
-    # 5. Solar potential (scf)
+    # 5. Solar potential (scf), PVGIS relative-efficiency + Faiman
+    #    module-temperature model.
     print("Computing solar potential (scf)...")
-    T_cell = (cfg.c_1
-              + cfg.c_2 * ((dref_rg['tasmax'] + dref_rg['tas']) / 2)
-              + cfg.c_3 * dref_rg['rsds']
-              + cfg.c_4 * dref_rg['sfcWind'])
-    P_R = 1 + cfg.gamma * (T_cell - cfg.T_ref)
-    scf = P_R * (dref_rg['rsds'] / cfg.G_stc)
+    scf = compute_solar_cf(dref_rg['tas'], dref_rg['rsds'], dref_rg['sfcWind'], cfg=pv_cfg)
 
     solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
     solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -613,22 +785,17 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         'long_name': 'PVtot potential',
         'SOURCE': 'calculate_ds_cf_reanalysis_grid_GCM',
         'AUTHOR': 'Colin Lenoble',
+        'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
     })
     solar_potential = solar_potential.compute()
     safe_to_netcdf(solar_potential, path_scf_ref)
     print("Written scf to", path_scf_ref)
 
-    # 6. Wind potential (wcf)
+    # 6. Wind potential (wcf), using the per-pixel local shear exponent
+    #    precomputed on GCM's own native grid (see get_gcm_shear_exponent).
     print("Computing wind potential (wcf)...")
-    wind_pot = dref_rg['sfcWind'] * (80.0 / 10.0) ** cfg.wind_height_exponent
-    wind_pot = xr.where(wind_pot < cfg.vci, 0, wind_pot)
-    wind_pot = xr.where(wind_pot >= cfg.vco, 0, wind_pot)
-    wind_pot = xr.where((wind_pot >= cfg.vr) & (wind_pot < cfg.vco), 1, wind_pot)
-    wind_pot = xr.where(
-        (wind_pot >= cfg.vci) & (wind_pot < cfg.vr),
-        (wind_pot**3 - cfg.vci**3) / (cfg.vr**3 - cfg.vci**3),
-        wind_pot
-    )
+    alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, gcm_grid, shear_ref_period)
+    wind_pot = compute_wind_potential(dref_rg['sfcWind'], alpha, cfg)
 
     wind_potential = wind_pot.to_dataset(name='wcf')
     wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -653,12 +820,26 @@ def calculate_ds_cf_reanalysis_grid_GCM(
 
 
 def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
-                      reanalysis='W5E5', cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG):
-    """Compute wcf/scf from a bias-corrected GCM file."""
+                      reanalysis='W5E5', cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
+                      pv_cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
+                      shear_ref_period=('1982-01-01', '2001-12-31'),
+                      shear_by_gcm_dir=None):
+    """
+    Compute wcf/scf from a bias-corrected GCM file.
 
-    ds_path = os.path.join(path_preprocessed, GCM,
-                           f"dadjusted_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc")
-    ds = xr.open_dataset(ds_path)
+    shear_by_gcm_dir : folder of precomputed per-GCM shear exponent files
+                        (see get_gcm_shear_exponent / shear_by_gcm/compute_shear_by_gcm.py).
+                        Defaults to config.SHEAR_BY_GCM_DIR.
+    """
+    if shear_by_gcm_dir is None:
+        shear_by_gcm_dir = config.SHEAR_BY_GCM_DIR
+
+    ds_path_base = os.path.join(path_preprocessed, GCM,
+                                f"dadjusted_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}")
+    ds_files, _ = _match_files(ds_path_base)
+    if not ds_files:
+        raise FileNotFoundError(f"No dadjusted file found for pattern: {ds_path_base}.[nc|zarr]")
+    ds = open_dataset_any(ds_files[0])
 
     wcf_path = os.path.join(path_preprocessed, GCM,
                             f"wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc")
@@ -671,16 +852,10 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
 
     print('Calculating DS_CF')
     ds = ds.convert_calendar('noleap')
-    ds['tasmax'] = ds['tasmax'] - 273.15
-    ds['tas']    = ds['tas']    - 273.15
+    ds['tas'] = ds['tas'] - 273.15
 
-    # Solar potential
-    T_cell = (cfg.c_1
-              + cfg.c_2 * ((ds['tasmax'] + ds['tas']) / 2)
-              + cfg.c_3 * ds['rsds']
-              + cfg.c_4 * ds['sfcWind'])
-    P_R = 1 + cfg.gamma * (T_cell - cfg.T_ref)
-    solar_potential = P_R * (ds['rsds'] / cfg.G_stc)
+    # Solar potential, PVGIS relative-efficiency + Faiman module-temperature model.
+    solar_potential = compute_solar_cf(ds['tas'], ds['rsds'], ds['sfcWind'], cfg=pv_cfg)
 
     solar_xr = solar_potential.to_dataset(name='scf').convert_calendar('noleap')
     solar_xr = solar_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -689,17 +864,14 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
         'DESCRIPTION': f"{GCM} solar potential",
         'units': 'dimensionless', 'long_name': 'PVtot potential',
         'SOURCE': 'calculate_ds_cf_GCM_dask.py', 'AUTHOR': 'Colin Lenoble', 'corrected': 1,
+        'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
     })
     solar_xr.to_netcdf(scf_path, mode='w')
 
-    # Wind potential
-    wind_pot = ds['sfcWind'] * (80 / 10) ** cfg.wind_height_exponent
-    wind_pot = xr.where(wind_pot < cfg.vci, 0, wind_pot)
-    wind_pot = xr.where(wind_pot >= cfg.vco, 0, wind_pot)
-    wind_pot = xr.where((wind_pot >= cfg.vr) & (wind_pot < cfg.vco), 1, wind_pot)
-    wind_pot = xr.where((wind_pot >= cfg.vci) & (wind_pot < cfg.vr),
-                        (wind_pot**3 - cfg.vci**3) / (cfg.vr**3 - cfg.vci**3),
-                        wind_pot)
+    # Wind potential, using the per-pixel local shear exponent precomputed
+    # on GCM's own native grid (see get_gcm_shear_exponent).
+    alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, ds, shear_ref_period)
+    wind_pot = compute_wind_potential(ds['sfcWind'], alpha, cfg)
 
     wind_xr = wind_pot.to_dataset(name='wcf')
     wind_xr = wind_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -721,15 +893,23 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
 def calculate_ds_cf_reanalysis(
     path_folder,
     path_preprocessed,
+    era5_file_pattern,
     reanalysis='W5E5',
     shapefile_path=None,
     cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
+    pv_cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
+    shear_ref_period=('1982-01-01', '2001-12-31'),
 ):
     """
     Compute wcf/scf on the **native reanalysis grid** (no GCM regridding).
 
     Loads the raw reanalysis files, optionally applies a shapefile mask,
     converts units, and writes the DS_CF datasets to disk.
+
+    era5_file_pattern : glob pattern for the reanalysis 10 m/100 m wind files
+                        used to fit the local shear exponent (see
+                        get_local_shear_exponent). Only needed the first
+                        time -- ignored once that fit is cached.
 
     Outputs
     -------
@@ -746,19 +926,19 @@ def calculate_ds_cf_reanalysis(
         return
 
     # 1. Load reanalysis files
-    files_ref = glob.glob(os.path.join(path_folder, reanalysis, f"*{reanalysis}*.nc"))
+    files_ref, _ = _match_files(os.path.join(path_folder, reanalysis, f"*{reanalysis}*"))
     if not files_ref:
         raise FileNotFoundError(
             f"No reanalysis files found in {os.path.join(path_folder, reanalysis)}")
     print(f"Found {len(files_ref)} reanalysis files for {reanalysis}")
 
-    dref = xr.open_mfdataset(
+    dref = open_mfdataset_any(
         files_ref, combine='by_coords',
         chunks={'time': -1, 'lat': 100, 'lon': 100}, parallel=True,
     )
     dref = dref.sortby('lat').sortby('lon').sortby('time')
 
-    for v in ('tas', 'tasmax', 'rsds'):
+    for v in ('tas', 'rsds'):
         if v not in dref:
             raise KeyError(f"'{v}' not found in reanalysis dataset")
 
@@ -768,7 +948,7 @@ def calculate_ds_cf_reanalysis(
         print("Computing sfcWind from uas/vas")
         dref['sfcWind'] = np.hypot(dref['uas'], dref['vas'])
 
-    dref = dref[['tas', 'tasmax', 'rsds', 'sfcWind']]
+    dref = dref[['tas', 'rsds', 'sfcWind']]
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
 
     # 2. Optional shapefile mask
@@ -791,17 +971,12 @@ def calculate_ds_cf_reanalysis(
 
     # 3. Unit conversion (K °C)
     dref = dref.convert_calendar('noleap').convert_calendar('standard')
-    dref['tas']    = dref['tas']    - 273.15
-    dref['tasmax'] = dref['tasmax'] - 273.15
+    dref['tas'] = dref['tas'] - 273.15
 
-    # 4. Solar potential (scf)
+    # 4. Solar potential (scf), PVGIS relative-efficiency + Faiman
+    #    module-temperature model.
     print("Computing solar potential (scf)...")
-    T_cell = (cfg.c_1
-              + cfg.c_2 * ((dref['tasmax'] + dref['tas']) / 2)
-              + cfg.c_3 * dref['rsds']
-              + cfg.c_4 * dref['sfcWind'])
-    P_R = 1 + cfg.gamma * (T_cell - cfg.T_ref)
-    scf = P_R * (dref['rsds'] / cfg.G_stc)
+    scf = compute_solar_cf(dref['tas'], dref['rsds'], dref['sfcWind'], cfg=pv_cfg)
 
     solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
     solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -812,22 +987,18 @@ def calculate_ds_cf_reanalysis(
         'long_name': 'PVtot potential',
         'SOURCE': 'calculate_ds_cf_reanalysis',
         'AUTHOR': 'Colin Lenoble',
+        'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
     })
     solar_potential = solar_potential.compute()
     safe_to_netcdf(solar_potential, path_scf)
     print("Written scf to", path_scf)
 
-    # 5. Wind potential (wcf)
+    # 5. Wind potential (wcf), using a per-pixel local shear exponent fit
+    #    from reanalysis 10 m/100 m wind over the reference period.
     print("Computing wind potential (wcf)...")
-    wind_pot = dref['sfcWind'] * (80.0 / 10.0) ** cfg.wind_height_exponent
-    wind_pot = xr.where(wind_pot < cfg.vci, 0, wind_pot)
-    wind_pot = xr.where(wind_pot >= cfg.vco, 0, wind_pot)
-    wind_pot = xr.where((wind_pot >= cfg.vr) & (wind_pot < cfg.vco), 1, wind_pot)
-    wind_pot = xr.where(
-        (wind_pot >= cfg.vci) & (wind_pot < cfg.vr),
-        (wind_pot**3 - cfg.vci**3) / (cfg.vr**3 - cfg.vci**3),
-        wind_pot,
-    )
+    alpha_native = get_local_shear_exponent(era5_file_pattern, path_preprocessed, shear_ref_period)
+    alpha = regrid_alpha_to_grid(alpha_native, dref)
+    wind_pot = compute_wind_potential(dref['sfcWind'], alpha, cfg)
 
     wind_potential = wind_pot.to_dataset(name='wcf')
     wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -872,18 +1043,26 @@ def aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder, gwl, shapefil
             "Expected 'v1' (capacity-factor weighted) or 'v2' (area weighted)."
         )
 
-    wcf_path = f"{path_preprocessed}{GCM}/wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc"
-    scf_path = f"{path_preprocessed}{GCM}/scf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc"
-    wcf = xr.open_dataset(wcf_path)
-    scf = xr.open_dataset(scf_path)
+    wcf_path_base = f"{path_preprocessed}{GCM}/wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}"
+    scf_path_base = f"{path_preprocessed}{GCM}/scf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}"
+    wcf_files, _ = _match_files(wcf_path_base)
+    scf_files, _ = _match_files(scf_path_base)
+    if not wcf_files:
+        raise FileNotFoundError(f"No wcf file found for pattern: {wcf_path_base}.[nc|zarr]")
+    if not scf_files:
+        raise FileNotFoundError(f"No scf file found for pattern: {scf_path_base}.[nc|zarr]")
+    wcf = open_dataset_any(wcf_files[0])
+    scf = open_dataset_any(scf_files[0])
     shapefile = gpd.read_file(shapefile_path)
 
-    wcf_ref = xr.open_dataset(
-        f"{path_preprocessed}{GCM}/wcf_ref_{GCM}_{reanalysis}.nc"
-    ).sel(time=slice('1982-01-01', '2001-12-31'))
-    scf_ref = xr.open_dataset(
-        f"{path_preprocessed}{GCM}/scf_ref_{GCM}_{reanalysis}.nc"
-    ).sel(time=slice('1982-01-01', '2001-12-31'))
+    wcf_ref_files, _ = _match_files(f"{path_preprocessed}{GCM}/wcf_ref_{GCM}_{reanalysis}")
+    scf_ref_files, _ = _match_files(f"{path_preprocessed}{GCM}/scf_ref_{GCM}_{reanalysis}")
+    if not wcf_ref_files:
+        raise FileNotFoundError(f"No wcf_ref file found for {GCM}/{reanalysis}")
+    if not scf_ref_files:
+        raise FileNotFoundError(f"No scf_ref file found for {GCM}/{reanalysis}")
+    wcf_ref = open_dataset_any(wcf_ref_files[0]).sel(time=slice('1982-01-01', '2001-12-31'))
+    scf_ref = open_dataset_any(scf_ref_files[0]).sel(time=slice('1982-01-01', '2001-12-31'))
 
     wcf_ref = wcf_ref.sel(lat=slice(wcf.lat.values[0], wcf.lat.values[-1]),
                           lon=slice(wcf.lon.values[0], wcf.lon.values[-1]))
@@ -1020,18 +1199,20 @@ def aggregate_ds_cf_reanalysis(
             "Expected 'v1' (capacity-factor weighted) or 'v2' (area weighted)."
         )
 
-    wcf_path = os.path.join(path_preprocessed, reanalysis, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231.nc")
-    scf_path = os.path.join(path_preprocessed, reanalysis, f"scf_day_{reanalysis}_historical_reanalysis_19790101-20191231.nc")
+    wcf_path_base = os.path.join(path_preprocessed, reanalysis, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231")
+    scf_path_base = os.path.join(path_preprocessed, reanalysis, f"scf_day_{reanalysis}_historical_reanalysis_19790101-20191231")
 
-    if not os.path.exists(wcf_path) or not os.path.exists(scf_path):
+    wcf_files, _ = _match_files(wcf_path_base)
+    scf_files, _ = _match_files(scf_path_base)
+    if not wcf_files or not scf_files:
         raise FileNotFoundError(
             f"Reanalysis DS_CF files not found in "
             f"{os.path.join(path_preprocessed, reanalysis)}. "
             "Run calculate_ds_cf_reanalysis first."
         )
 
-    wcf = xr.open_dataset(wcf_path)
-    scf = xr.open_dataset(scf_path)
+    wcf = open_dataset_any(wcf_files[0])
+    scf = open_dataset_any(scf_files[0])
     shapefile = gpd.read_file(shapefile_path)
 
     wm_dir = os.path.join(temp_folder, reanalysis)
@@ -1109,6 +1290,7 @@ def build_available_df(path_preprocessed, ssp, reanalysis='W5E5',
     with a boolean column per GWL indicating whether the wcf_day file exists.
 
     Detection is based on: wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc
+    or the equivalent .zarr store.
 
     Parameters
     ----------
@@ -1121,9 +1303,9 @@ def build_available_df(path_preprocessed, ssp, reanalysis='W5E5',
     -------
     pd.DataFrame with columns: GCM, run, ssp, <one bool col per GWL>, n_gwl_available
     """
-    pattern = os.path.join(path_preprocessed, '*',
-                           f"wcf_day_*_{ssp}_*_{reanalysis}.nc")
-    all_files = glob.glob(pattern)
+    pattern_base = os.path.join(path_preprocessed, '*',
+                                f"wcf_day_*_{ssp}_*_{reanalysis}")
+    all_files = glob.glob(pattern_base + '.nc') + glob.glob(pattern_base + '.zarr')
 
     if not all_files:
         print(f"No wcf files found under {path_preprocessed}")
@@ -1131,8 +1313,8 @@ def build_available_df(path_preprocessed, ssp, reanalysis='W5E5',
 
     records = {}
     for fpath in all_files:
-        fname = os.path.basename(fpath)
-        parts = fname.replace('.nc', '').split('_')
+        fname = os.path.basename(fpath.rstrip('/\\'))
+        parts = fname.replace('.zarr', '').replace('.nc', '').split('_')
         # Filename format: wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc
         # Anchor on ssp and reanalysis to handle GCM names with underscores
         # e.g. EC-Earth3-Veg-LR -> parts between 'day' and ssp = GCM
@@ -1171,34 +1353,42 @@ def build_available_df(path_preprocessed, ssp, reanalysis='W5E5',
 
 
 if __name__ == "__main__":
-    path_folder       = ''
-    path_preprocessed = ''
-    shapefile_path    = ''
-    temp_folder       = ''
-    
-    ssp = 'ssp245'
-    gwl_list  = ['GWL0-61', 'GWL1', 'GWL1-5', 'GWL2', 'GWL3']
-    reanalysis = 'W5E5'
-    
+    path_folder       = config.PATH_FOLDER
+    path_preprocessed = config.PATH_PREPROCESSED
+    shapefile_path    = config.SHAPEFILE_PATH
+    temp_folder       = config.TEMP_FOLDER
+    era5_file_pattern = config.ERA5_WIND_PATTERN  # used by calculate_ds_cf_reanalysis only
+    shear_by_gcm_dir  = config.SHEAR_BY_GCM_DIR    # used by the *_GCM functions below
+
+    ssp             = config.SSP
+    gwl_list        = config.GWL_LIST
+    reanalysis      = config.REANALYSIS
+    shear_ref_period = config.SHEAR_REF_PERIOD
+
     # --- Inventory ---
     df_available = build_available_df(path_preprocessed, ssp, reanalysis, gwl_list)
     print(df_available.to_string())
     df_to_process = df_available.copy()
     
 
-    path_list = glob.glob(f"{path_preprocessed}*/wcf_day_*_ssp245_*_GWL0-61_W5E5.nc")
-    GCM_list  = [os.path.basename(p).split('_')[-5] for p in path_list]
-    run_list  = [os.path.basename(p).split('_')[-3] for p in path_list]
+    path_list_base = f"{path_preprocessed}*/wcf_day_*_ssp245_*_GWL0-61_W5E5"
+    path_list = glob.glob(path_list_base + '.nc') + glob.glob(path_list_base + '.zarr')
+    GCM_list  = [os.path.basename(p.rstrip('/\\')).split('_')[-5] for p in path_list]
+    run_list  = [os.path.basename(p.rstrip('/\\')).split('_')[-3] for p in path_list]
 
     
 
     # Load physical constants
     cfg = DEFAULT_DS_CF_CONFIG
+    pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
     # unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
     #            path_folder, gwl_list, reanalysis)
     # calculate_ds_cf_reanalysis_grid_GCM(GCM, run, ssp, path_preprocessed,
-    #                                    path_folder, reanalysis, shapefile_path, cfg=cfg)
+    #                                    path_folder, reanalysis,
+    #                                    shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
+    #                                    shear_ref_period=shear_ref_period,
+    #                                    shear_by_gcm_dir=shear_by_gcm_dir)
     aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='W5E5', suffix_shp='v1')
     aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='W5E5', suffix_shp='v2')
      # --- Loop over GCM-run pairs, skip GWLs that don't exist ---
@@ -1211,6 +1401,8 @@ if __name__ == "__main__":
                 print(f"  Skipping {gwl} (file not available)")
                 continue
             print(f"  Processing {gwl}")
-            # calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl, cfg=cfg)
+            # calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
+            #                    cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
+            #                    shear_by_gcm_dir=shear_by_gcm_dir)
             #aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
             #              gwl, shapefile_path, reanalysis, suffix_shp='v1')
