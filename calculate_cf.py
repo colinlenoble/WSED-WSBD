@@ -17,6 +17,14 @@ import xagg as xa
 from rasterio.features import geometry_mask
 import rasterio
 
+# Zarr/NetCDF-agnostic file lookup, opener, and atomic-write helpers
+# (kept dependency-light so fig*.py scripts can import them without
+# pulling in xesmf/xclim/xagg the way importing this module would).
+from io_utils import (
+    match_files as _match_files, open_dataset_any, open_mfdataset_any,
+    safe_to_netcdf, safe_to_zarr,
+)
+
 # fit_local_shear.py (ERA5-based per-pixel wind shear exponent) and
 # calculate_wind_solar_cf.py (PVGIS solar model) live in the sibling
 # como24_group5/code_review project, not on the default path.
@@ -71,55 +79,9 @@ DEFAULT_DS_CF_CONFIG = DS_CFConfig()
 # -------------------------
 # Helper functions
 # -------------------------
-
-def _match_files(pattern_base):
-    """
-    Search for files/stores matching pattern_base with either a '.zarr' or
-    '.nc' suffix (zarr is preferred when both are present).
-
-    pattern_base is a glob pattern *without* its trailing extension, e.g.
-    "/data/GCM/tas_day_GCM_ssp245_r1i1p1f1*GWL2" the ".zarr"/".nc" suffix
-    is appended before globbing.
-
-    Returns
-    -------
-    (files, fmt) : (list of str, 'zarr' | 'netcdf' | None)
-    """
-    zarr_files = sorted(glob.glob(pattern_base + '.zarr'))
-    if zarr_files:
-        return zarr_files, 'zarr'
-    nc_files = sorted(glob.glob(pattern_base + '.nc'))
-    if nc_files:
-        return nc_files, 'netcdf'
-    return [], None
-
-
-def open_dataset_any(path, chunks=None, **kwargs):
-    """Open a single dataset, whether it is a NetCDF file or a Zarr store."""
-    if str(path).rstrip('/\\').endswith('.zarr'):
-        return xr.open_dataset(path, engine='zarr', chunks=chunks, **kwargs)
-    return xr.open_dataset(path, chunks=chunks, **kwargs)
-
-
-def open_mfdataset_any(paths, chunks=None, **kwargs):
-    """
-    Open one or several datasets (NetCDF or Zarr, not mixed) as a single
-    combined dataset. mfdataset-only kwargs (e.g. combine, parallel) are
-    ignored when a single store is opened.
-    """
-    paths = sorted(paths)
-    if not paths:
-        raise FileNotFoundError("No files provided to open_mfdataset_any")
-    is_zarr = str(paths[0]).rstrip('/\\').endswith('.zarr')
-    if len(paths) == 1:
-        engine = 'zarr' if is_zarr else None
-        return xr.open_dataset(paths[0], chunks=chunks,
-                               **({'engine': engine} if engine else {}))
-    mf_kwargs = dict(kwargs)
-    if is_zarr:
-        mf_kwargs['engine'] = 'zarr'
-    return xr.open_mfdataset(paths, chunks=chunks, **mf_kwargs)
-
+# (_match_files / open_dataset_any / open_mfdataset_any / safe_to_netcdf /
+# safe_to_zarr now live in io_utils.py, imported above, so fig*.py scripts
+# can reuse them without importing this whole module.)
 
 def load_variable(var, GCM, ssp, run, path_folder, gwl, chunks):
     """
@@ -198,14 +160,6 @@ def rasterize_shapefile(shapefile, coords, shape, transform):
         invert=True
     )
     return mask
-
-
-def safe_to_netcdf(ds, path, mode="w", **kwargs):
-    """Write ds to a temporary file, then rename to path."""
-    tmp_path = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    ds.to_netcdf(tmp_path, mode=mode, **kwargs)
-    os.replace(tmp_path, path)
 
 
 # -------------------------
@@ -691,8 +645,8 @@ def calculate_ds_cf_reanalysis_grid_GCM(
 
     out_folder = os.path.join(path_preprocessed, GCM)
     os.makedirs(out_folder, exist_ok=True)
-    path_wcf_ref = os.path.join(out_folder, f"wcf_ref_{GCM}_{reanalysis}.nc")
-    path_scf_ref = os.path.join(out_folder, f"scf_ref_{GCM}_{reanalysis}.nc")
+    path_wcf_ref = os.path.join(out_folder, f"wcf_ref_{GCM}_{reanalysis}.zarr")
+    path_scf_ref = os.path.join(out_folder, f"scf_ref_{GCM}_{reanalysis}.zarr")
 
     if os.path.exists(path_wcf_ref) and os.path.exists(path_scf_ref):
         print("DS_CF ref files already exist, skipping.")
@@ -771,6 +725,11 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         std_mask = std_mask.compute()
     dref_rg = dref_rg.where(~std_mask.isnull() & (std_mask != 0), drop=True)
 
+    # Persist once here: the solar and wind branches below both build a
+    # separate graph on top of dref_rg (open + regrid + calendar-convert +
+    # mask), so without persisting, Dask would redo all of that work twice.
+    dref_rg = dref_rg.persist()
+
     # 5. Solar potential (scf), PVGIS relative-efficiency + Faiman
     #    module-temperature model.
     print("Computing solar potential (scf)...")
@@ -788,7 +747,7 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
     })
     solar_potential = solar_potential.compute()
-    safe_to_netcdf(solar_potential, path_scf_ref)
+    safe_to_zarr(solar_potential, path_scf_ref)
     print("Written scf to", path_scf_ref)
 
     # 6. Wind potential (wcf), using the per-pixel local shear exponent
@@ -808,7 +767,7 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         'AUTHOR': 'Colin Lenoble',
     })
     wind_potential = wind_potential.compute()
-    safe_to_netcdf(wind_potential, path_wcf_ref)
+    safe_to_zarr(wind_potential, path_wcf_ref)
     print("Written wcf to", path_wcf_ref)
 
     solar_potential.close()
@@ -842,9 +801,9 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
     ds = open_dataset_any(ds_files[0])
 
     wcf_path = os.path.join(path_preprocessed, GCM,
-                            f"wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc")
+                            f"wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.zarr")
     scf_path = os.path.join(path_preprocessed, GCM,
-                            f"scf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.nc")
+                            f"scf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.zarr")
 
     if os.path.exists(wcf_path) and os.path.exists(scf_path):
         print('DS_CF files already exist')
@@ -866,7 +825,7 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
         'SOURCE': 'calculate_ds_cf_GCM_dask.py', 'AUTHOR': 'Colin Lenoble', 'corrected': 1,
         'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
     })
-    solar_xr.to_netcdf(scf_path, mode='w')
+    safe_to_zarr(solar_xr, scf_path)
 
     # Wind potential, using the per-pixel local shear exponent precomputed
     # on GCM's own native grid (see get_gcm_shear_exponent).
@@ -881,7 +840,7 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
         'units': 'dimensionless', 'long_name': 'Wind potential',
         'SOURCE': 'calculate_ds_cf_GCM_dask.py', 'AUTHOR': 'Colin Lenoble', 'corrected': 1,
     })
-    wind_xr.to_netcdf(wcf_path, mode='w')
+    safe_to_zarr(wind_xr, wcf_path)
 
     print('DS_CF saved')
     solar_xr.close()
@@ -918,8 +877,8 @@ def calculate_ds_cf_reanalysis(
     """
     out_folder = os.path.join(path_preprocessed, reanalysis)
     os.makedirs(out_folder, exist_ok=True)
-    path_wcf = os.path.join(out_folder, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231.nc")
-    path_scf = os.path.join(out_folder, f"scf_day_{reanalysis}_historical_reanalysis_19790101-20191231.nc")
+    path_wcf = os.path.join(out_folder, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231.zarr")
+    path_scf = os.path.join(out_folder, f"scf_day_{reanalysis}_historical_reanalysis_19790101-20191231.zarr")
 
     if os.path.exists(path_wcf) and os.path.exists(path_scf):
         print("Reanalysis DS_CF files already exist, skipping.")
@@ -973,6 +932,12 @@ def calculate_ds_cf_reanalysis(
     dref = dref.convert_calendar('noleap').convert_calendar('standard')
     dref['tas'] = dref['tas'] - 273.15
 
+    # Persist once here: the solar and wind branches below both build a
+    # separate graph on top of dref (open_mfdataset + mask + calendar-
+    # convert), so without persisting, Dask would redo all of that work
+    # (i.e. re-read every reanalysis file from disk) twice.
+    dref = dref.persist()
+
     # 4. Solar potential (scf), PVGIS relative-efficiency + Faiman
     #    module-temperature model.
     print("Computing solar potential (scf)...")
@@ -990,7 +955,7 @@ def calculate_ds_cf_reanalysis(
         'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
     })
     solar_potential = solar_potential.compute()
-    safe_to_netcdf(solar_potential, path_scf)
+    safe_to_zarr(solar_potential, path_scf)
     print("Written scf to", path_scf)
 
     # 5. Wind potential (wcf), using a per-pixel local shear exponent fit
@@ -1011,7 +976,7 @@ def calculate_ds_cf_reanalysis(
         'AUTHOR': 'Colin Lenoble',
     })
     wind_potential = wind_potential.compute()
-    safe_to_netcdf(wind_potential, path_wcf)
+    safe_to_zarr(wind_potential, path_wcf)
     print("Written wcf to", path_wcf)
 
     solar_potential.close()

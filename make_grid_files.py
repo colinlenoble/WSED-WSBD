@@ -7,6 +7,10 @@ import numpy as np
 import pandas as pd
 import glob as glob
 
+# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
+# (prefers a .zarr store when present, falls back to .nc).
+from io_utils import match_files, glob_any, open_dataset_any
+
 def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
     """
     Expected shortfall: mean positive deficit on compound-event days,
@@ -136,11 +140,9 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
     Returns:
       data: xarray.Dataset with duration, frequency, and severity per year and spatial point.
     '''
-    # Find and sort file paths
-    wcf_paths = sorted(glob.glob(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_W5E5.nc')))
-    scf_paths = sorted(glob.glob(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_W5E5.nc')))
-    wcf_paths = sorted(wcf_paths)
-    scf_paths = sorted(scf_paths)
+    # Find and sort file paths (zarr preferred, falls back to .nc)
+    wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_W5E5'))
+    scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_W5E5'))
 
     #wcf_paths = wcf_paths[16:]
     #scf_paths = scf_paths[16:]
@@ -155,7 +157,8 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
     gwl_list = [x.split('_')[-2] for x in wcf_paths]
     print(gcm_list)
 
-    wcf_rea = xr.open_dataset(glob.glob(preprocessed_path + 'W5E5/wcf_day*.nc')[0])
+    wcf_rea_files, _ = match_files(preprocessed_path + 'W5E5/wcf_day*')
+    wcf_rea = open_dataset_any(wcf_rea_files[0])
     wcf_rea = wcf_rea.isel(time=slice(0,2))
     # Wrap the per-GCM processing in a delayed function
     def process_single_gcm(i, preprocessed_path, reanalysis):
@@ -164,15 +167,17 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
         ssp = ssp_list[i]
         gwl = gwl_list[i]
         
-        wcf = xr.open_dataset(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5.nc')
-        scf = xr.open_dataset(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5.nc')     
+        wcf_files, _ = match_files(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
+        scf_files, _ = match_files(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
+        wcf = open_dataset_any(wcf_files[0])
+        scf = open_dataset_any(scf_files[0])
         wcf['time'] = pd.to_datetime(wcf.time.dt.strftime('%Y-%m-%d').values)
         scf['time'] = pd.to_datetime(scf.time.dt.strftime('%Y-%m-%d').values)
 
-        wcf_path_ref = glob.glob(os.path.join(preprocessed_path, GCM+'/wcf_day_' +GCM + '*ssp*' + run + '_GWL0-61_W5E5.nc'))
-        scf_path_ref = glob.glob(os.path.join(preprocessed_path, GCM+'/scf_day_' +GCM + '*ssp*' + run + '_GWL0-61_W5E5.nc'))
-        wcf_ref = xr.open_dataset(wcf_path_ref[0])
-        scf_ref = xr.open_dataset(scf_path_ref[0])
+        wcf_path_ref = glob_any(os.path.join(preprocessed_path, GCM+'/wcf_day_' +GCM + '*ssp*' + run + '_GWL0-61_W5E5'))
+        scf_path_ref = glob_any(os.path.join(preprocessed_path, GCM+'/scf_day_' +GCM + '*ssp*' + run + '_GWL0-61_W5E5'))
+        wcf_ref = open_dataset_any(wcf_path_ref[0])
+        scf_ref = open_dataset_any(scf_path_ref[0])
         wcf_ref['time'] = pd.to_datetime(wcf_ref.time.dt.strftime('%Y-%m-%d').values)
         scf_ref['time'] = pd.to_datetime(scf_ref.time.dt.strftime('%Y-%m-%d').values)
         # Compute thresholds (10th percentile)
@@ -234,8 +239,10 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
         
         ### REANALYSIS
         if reanalysis and not os.path.exists(preprocessed_path + 'agg_datasets/gridded_ref/agg_'+GCM+'_ref_regrid_W5E5.nc'):
-            wcf_bis = xr.open_dataset(preprocessed_path+ GCM+'/wcf_ref_' +GCM + '_W5E5.nc')
-            scf_bis = xr.open_dataset(preprocessed_path+ GCM+'/scf_ref_' +GCM + '_W5E5.nc')
+            wcf_bis_files, _ = match_files(preprocessed_path+ GCM+'/wcf_ref_' +GCM + '_W5E5')
+            scf_bis_files, _ = match_files(preprocessed_path+ GCM+'/scf_ref_' +GCM + '_W5E5')
+            wcf_bis = open_dataset_any(wcf_bis_files[0])
+            scf_bis = open_dataset_any(scf_bis_files[0])
             wcf_bis = wcf_bis.convert_calendar('standard')
             scf_bis = scf_bis.convert_calendar('standard')
             wcf_bis['time'] = pd.to_datetime(wcf_bis['time'].values)
@@ -303,11 +310,9 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
     Returns:
       data: xarray.Dataset with duration, frequency, and severity per year and spatial point.
     '''
-    # Find and sort file paths
-    wcf_paths = sorted(glob.glob(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_W5E5.nc')))
-    scf_paths = sorted(glob.glob(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_W5E5.nc')))
-    wcf_paths = sorted(wcf_paths)
-    scf_paths = sorted(scf_paths)
+    # Find and sort file paths (zarr preferred, falls back to .nc)
+    wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_W5E5'))
+    scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_W5E5'))
 
     #wcf_paths = wcf_paths[0:4]
     #scf_paths = scf_paths[0:4]
@@ -322,7 +327,8 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
     gwl_list = [x.split('_')[-2] for x in wcf_paths]
     print(gcm_list)
 
-    wcf_rea = xr.open_dataset(glob.glob(preprocessed_path + 'W5E5/wcf_day*.nc')[0])
+    wcf_rea_files, _ = match_files(preprocessed_path + 'W5E5/wcf_day*')
+    wcf_rea = open_dataset_any(wcf_rea_files[0])
     wcf_rea = wcf_rea.isel(time=slice(0,2))
     # Wrap the per-GCM processing in a delayed function
     def process_single_gcm(i, preprocessed_path, rolling):
@@ -331,8 +337,10 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
         ssp = ssp_list[i]
         gwl = gwl_list[i]
         
-        wcf = xr.open_dataset(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5.nc')
-        scf = xr.open_dataset(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5.nc')
+        wcf_files, _ = match_files(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
+        scf_files, _ = match_files(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
+        wcf = open_dataset_any(wcf_files[0])
+        scf = open_dataset_any(scf_files[0])
         wcf = wcf.mean(dim='time')
         scf = scf.mean(dim='time')
         ds_final = wcf.copy()

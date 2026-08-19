@@ -5,7 +5,6 @@ os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 
 import argparse
-import glob
 import gc
 
 import cartopy.crs as ccrs
@@ -17,6 +16,10 @@ import geopandas as gpd
 import rasterio
 from rasterio.features import geometry_mask
 from scipy import stats
+
+# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
+# (prefers a .zarr store when present, falls back to .nc).
+from io_utils import match_files, open_dataset_any
 
 import matplotlib
 matplotlib.use("Agg")
@@ -123,11 +126,17 @@ def duration_xr(da):
 
 def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shapefile_path):
     print(f"  Loading wcf/scf for reanalysis={reanalysis}  ")
-    wcf_path = glob.glob(os.path.join(path_preprocessed, reanalysis, "wcf_day_*.nc"))[0]
-    scf_path = glob.glob(os.path.join(path_preprocessed, reanalysis, "scf_day_*.nc"))[0]
+    wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
+    scf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "scf_day_*"))
+    if not wcf_files:
+        raise FileNotFoundError(
+            f"No wcf_day_* file found under {os.path.join(path_preprocessed, reanalysis)}")
+    if not scf_files:
+        raise FileNotFoundError(
+            f"No scf_day_* file found under {os.path.join(path_preprocessed, reanalysis)}")
     chunks   = {"time": 1000, "lat": -1, "lon": -1}
-    wcf = xr.open_dataset(wcf_path, chunks=chunks).sel(lat=slice(-58, 68))
-    scf = xr.open_dataset(scf_path, chunks=chunks).sel(lat=slice(-58, 68))
+    wcf = open_dataset_any(wcf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
+    scf = open_dataset_any(scf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
 
     print(f"  Computing thresholds (quantile={thr}, ref={ref_start}-{ref_end})  ")
     wcf_ref = wcf.sel(time=slice(ref_start, ref_end))
@@ -494,12 +503,12 @@ def plot_mean_variables_6panel(
     ocean_mask_comp = land_mask_comp & (da_comp.isnull())
 
     print(f"  Loading wcf/scf for 6-panel map (ref: {ref_start}-{ref_end})  ")
-    wcf_path = glob.glob(os.path.join(path_preprocessed, reanalysis, "wcf_day_*.nc"))[0]
-    scf_path = glob.glob(os.path.join(path_preprocessed, reanalysis, "scf_day_*.nc"))[0]
+    wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
+    scf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "scf_day_*"))
     chunks   = {"time": 1000, "lat": -1, "lon": -1}
-    wcf_ref  = xr.open_dataset(wcf_path, chunks=chunks).sel(
+    wcf_ref  = open_dataset_any(wcf_files[0], chunks=chunks).sel(
         lat=slice(-58, 68), time=slice(ref_start, ref_end))
-    scf_ref  = xr.open_dataset(scf_path, chunks=chunks).sel(
+    scf_ref  = open_dataset_any(scf_files[0], chunks=chunks).sel(
         lat=slice(-58, 68), time=slice(ref_start, ref_end))
     da_wcf   = wcf_ref.wcf.isel(time=0)
     t_wcf    = rasterio.transform.from_bounds(

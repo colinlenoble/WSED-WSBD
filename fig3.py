@@ -19,6 +19,10 @@ import rasterio
 from rasterio.features import geometry_mask
 from scipy import stats
 
+# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
+# (prefers a .zarr store when present, falls back to .nc).
+from io_utils import match_files, glob_any, open_dataset_any
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -58,8 +62,9 @@ def parse_args():
         "--preprocessed_path",
         default=config.PATH_PREPROCESSED,
         help=(
-            "Root folder of the preprocessed daily wpp/spp .nc files "
-            "(e.g. <GCM>/wpp_day_*.nc). Used when building the aggregated datasets."
+            "Root folder of the preprocessed daily wcf/scf files (zarr, falls "
+            "back to .nc) (e.g. <GCM>/wcf_day_*.zarr). Used when building the "
+            "aggregated datasets."
         ),
     )
     parser.add_argument(
@@ -157,14 +162,14 @@ def parse_args():
 # -- DATASET BUILDING (from load_gridded_data_compound) ----------------------
 # =============================================================================
 
-def compute_severity(comp_da, spp_ds, wpp_ds, spp_thr, wpp_thr):
+def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
     """
     Expected shortfall: mean positive deficit on compound-event days,
     aggregated yearly.
     """
-    deficit_spp = xr.where(spp_ds["spp"] < spp_thr, spp_thr - spp_ds["spp"], 0)
-    deficit_wpp = xr.where(wpp_ds["wpp"] < wpp_thr, wpp_thr - wpp_ds["wpp"], 0)
-    daily_deficit = deficit_spp + deficit_wpp
+    deficit_scf = xr.where(scf_ds["scf"] < scf_thr, scf_thr - scf_ds["scf"], 0)
+    deficit_wcf = xr.where(wcf_ds["wcf"] < wcf_thr, wcf_thr - wcf_ds["wcf"], 0)
+    daily_deficit = deficit_scf + deficit_wcf
 
     masked = xr.where(comp_da == 1, daily_deficit, np.nan)
     severity = masked.resample(time="YE").mean().fillna(0)
@@ -260,7 +265,7 @@ def _agg_output_path(preprocessed_path, gwl, gcm, run, ssp):
     return os.path.join(out_dir, f"agg_{gcm}_{run}_{ssp}_{gwl}_W5E5.nc")
 
 
-def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wpp_rea, force_rebuild=False):
+def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebuild=False):
     """
     Build the aggregated gridded dataset for one (GCM, GWL) pair and save it.
     Skips if the output file already exists and force_rebuild is False.
@@ -273,46 +278,44 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wpp_rea, force_rebu
     print(f"    Building {gcm} / {gwl} �")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    # Load projection data
-    wpp = xr.open_dataset(
-        os.path.join(preprocessed_path, gcm, f"wpp_day_{gcm}_{ssp}_{run}_{gwl}_W5E5.nc")
-    )
-    spp = xr.open_dataset(
-        os.path.join(preprocessed_path, gcm, f"spp_day_{gcm}_{ssp}_{run}_{gwl}_W5E5.nc")
-    )
-    wpp["time"] = pd.to_datetime(wpp.time.dt.strftime("%Y-%m-%d").values)
-    spp["time"] = pd.to_datetime(spp.time.dt.strftime("%Y-%m-%d").values)
+    # Load projection data (zarr preferred, falls back to .nc)
+    wcf_files, _ = match_files(
+        os.path.join(preprocessed_path, gcm, f"wcf_day_{gcm}_{ssp}_{run}_{gwl}_W5E5"))
+    scf_files, _ = match_files(
+        os.path.join(preprocessed_path, gcm, f"scf_day_{gcm}_{ssp}_{run}_{gwl}_W5E5"))
+    wcf = open_dataset_any(wcf_files[0])
+    scf = open_dataset_any(scf_files[0])
+    wcf["time"] = pd.to_datetime(wcf.time.dt.strftime("%Y-%m-%d").values)
+    scf["time"] = pd.to_datetime(scf.time.dt.strftime("%Y-%m-%d").values)
 
     # Load reference (GWL0-61) data for threshold computation
-    wpp_ref_paths = glob.glob(
-        os.path.join(preprocessed_path, gcm, f"wpp_day_{gcm}*ssp*{run}_GWL0-61_W5E5.nc")
-    )
-    spp_ref_paths = glob.glob(
-        os.path.join(preprocessed_path, gcm, f"spp_day_{gcm}*ssp*{run}_GWL0-61_W5E5.nc")
-    )
-    wpp_ref = xr.open_dataset(wpp_ref_paths[0])
-    spp_ref = xr.open_dataset(spp_ref_paths[0])
-    wpp_ref["time"] = pd.to_datetime(wpp_ref.time.dt.strftime("%Y-%m-%d").values)
-    spp_ref["time"] = pd.to_datetime(spp_ref.time.dt.strftime("%Y-%m-%d").values)
+    wcf_ref_paths = glob_any(
+        os.path.join(preprocessed_path, gcm, f"wcf_day_{gcm}*ssp*{run}_GWL0-61_W5E5"))
+    scf_ref_paths = glob_any(
+        os.path.join(preprocessed_path, gcm, f"scf_day_{gcm}*ssp*{run}_GWL0-61_W5E5"))
+    wcf_ref = open_dataset_any(wcf_ref_paths[0])
+    scf_ref = open_dataset_any(scf_ref_paths[0])
+    wcf_ref["time"] = pd.to_datetime(wcf_ref.time.dt.strftime("%Y-%m-%d").values)
+    scf_ref["time"] = pd.to_datetime(scf_ref.time.dt.strftime("%Y-%m-%d").values)
 
     # 10th-percentile thresholds (over positive values only)
-    wpp_thr = wpp_ref.wpp.where(wpp_ref.wpp > 0).quantile(0.1, dim="time")
-    spp_thr = spp_ref.spp.where(spp_ref.spp > 0).quantile(0.1, dim="time")
+    wcf_thr = wcf_ref.wcf.where(wcf_ref.wcf > 0).quantile(0.1, dim="time")
+    scf_thr = scf_ref.scf.where(scf_ref.scf > 0).quantile(0.1, dim="time")
 
     # Compound event flag
-    wpp["low_wind"]   = xr.where(wpp.wpp <= wpp_thr, 1, 0)
-    spp["low_solar"]  = xr.where(spp.spp <= spp_thr, 1, 0)
-    compound = (wpp.low_wind * spp.low_solar).to_dataset(name="start_cooc")
+    wcf["low_wind"]   = xr.where(wcf.wcf <= wcf_thr, 1, 0)
+    scf["low_solar"]  = xr.where(scf.scf <= scf_thr, 1, 0)
+    compound = (wcf.low_wind * scf.low_solar).to_dataset(name="start_cooc")
 
     compound = compound.convert_calendar("standard")
-    wpp      = wpp.convert_calendar("standard")
-    spp      = spp.convert_calendar("standard")
+    wcf      = wcf.convert_calendar("standard")
+    scf      = scf.convert_calendar("standard")
 
     # Severity, duration, frequency
-    severity_ds     = compute_severity(compound.start_cooc, spp, wpp, spp_thr, wpp_thr)
+    severity_ds     = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr)
     ds_dur, ds_freq = duration_xr(compound.start_cooc)
-    ds_dur  = ds_dur.reindex( {"lat": spp.lat, "lon": spp.lon})
-    ds_freq = ds_freq.reindex({"lat": spp.lat, "lon": spp.lon})
+    ds_dur  = ds_dur.reindex( {"lat": scf.lat, "lon": scf.lon})
+    ds_freq = ds_freq.reindex({"lat": scf.lat, "lon": scf.lon})
 
     severity_ds["time"] = severity_ds.time.dt.year
     severity_ds         = severity_ds.rename({"time": "year"})
@@ -331,7 +334,7 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wpp_rea, force_rebu
 
     # Regrid to W5E5 grid and attach metadata
     ds_final            = ds_final.expand_dims({"realization": [0]})
-    regrid              = xe.Regridder(ds_final, wpp_rea, method="nearest_s2d")
+    regrid              = xe.Regridder(ds_final, wcf_rea, method="nearest_s2d")
     ds_final            = regrid(ds_final)
     ds_final["GCM"]     = xr.DataArray([gcm], dims="realization")
     ds_final["run"]     = xr.DataArray([run],  dims="realization")
@@ -342,7 +345,7 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wpp_rea, force_rebu
     print(f"    Saved ? {out_path}")
 
     # Release memory
-    del wpp, spp, wpp_ref, spp_ref, compound, severity_ds, ds_dur, ds_freq, ds_final
+    del wcf, scf, wcf_ref, scf_ref, compound, severity_ds, ds_dur, ds_freq, ds_final
     gc.collect()
 
 
@@ -365,28 +368,27 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
     exclude_gcm_run = set(tuple(x.split(":")) for x in (exclude_gcm_run or []))
 
     # Load the W5E5 reference grid (needed for regridding)
-    rea_paths = glob.glob(os.path.join(preprocessed_path, "W5E5", "wpp_day*.nc"))
-    if not rea_paths:
+    rea_files, _ = match_files(os.path.join(preprocessed_path, "W5E5", "wcf_day*"))
+    if not rea_files:
         raise FileNotFoundError(
             f"No W5E5 reference file found under {preprocessed_path}/W5E5/. "
             "Cannot determine target regrid grid."
         )
-    wpp_rea = xr.open_dataset(rea_paths[0]).isel(time=slice(0, 2))
+    wcf_rea = open_dataset_any(rea_files[0]).isel(time=slice(0, 2))
 
     for gwl in gwl_list:
         print(f"\n  -- Building datasets for {gwl} --")
 
         # Discover available projection files for this GWL
-        wpp_paths = sorted(
-            glob.glob(os.path.join(preprocessed_path, "*/wpp_day_*ssp*" + gwl + "_W5E5.nc"))
-        )
-        if not wpp_paths:
+        wcf_paths = glob_any(
+            os.path.join(preprocessed_path, "*/wcf_day_*ssp*" + gwl + "_W5E5"))
+        if not wcf_paths:
             print(f"  No files found for {gwl}, skipping.")
             continue
 
-        gcm_list = [p.split("_")[-5] for p in wpp_paths]
-        run_list = [p.split("_")[-3] for p in wpp_paths]
-        ssp_list = [p.split("_")[-4] for p in wpp_paths]
+        gcm_list = [p.split("_")[-5] for p in wcf_paths]
+        run_list = [p.split("_")[-3] for p in wcf_paths]
+        ssp_list = [p.split("_")[-4] for p in wcf_paths]
 
         for i, (gcm, run, ssp) in enumerate(zip(gcm_list, run_list, ssp_list)):
             if gcm in exclude_gcm or (gcm, run) in exclude_gcm_run:
@@ -394,7 +396,7 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
                 continue
             try:
                 _build_single_gcm(
-                    preprocessed_path, gwl, gcm, run, ssp, wpp_rea,
+                    preprocessed_path, gwl, gcm, run, ssp, wcf_rea,
                     force_rebuild=force_rebuild,
                 )
             except Exception as exc:
