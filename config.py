@@ -23,7 +23,7 @@ CARTOPY_DATA_DIR_XCLIM = "/gpfs/workdir/shared/juicce/envs/xclim/cartopy_cache"
 # -------------------------
 # Paths
 # -------------------------
-PATH_FOLDER = ''        # root folder containing raw GCM / reanalysis netCDF files
+PATH_FOLDER = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_raw/"        # root folder containing raw GCM / reanalysis netCDF files
 PATH_PREPROCESSED = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/"
 SHAPEFILE_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/shapefile_data/shp_re.shp"
 SHAPEFILE_PATH_LIGHT = "/gpfs/workdir/shared/juicce/RE_Colin/shapefile_data/ne_mix_adm0_adm1_light/ne_mix_adm0_adm1.shp"
