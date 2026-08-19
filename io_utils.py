@@ -3,8 +3,7 @@ Zarr/NetCDF-agnostic file lookup, opening, and atomic-write helpers shared
 across calculate_cf.py and every fig*.py / make_*_files.py script.
 
 Kept dependency-free (only glob/os/shutil/xarray) so importing it doesn't
-drag in xesmf/xclim/xagg or the sibling como24_group5/code_review project
-the way importing calculate_cf.py directly would.
+drag in xesmf/xclim/xagg the way importing calculate_cf.py directly would.
 """
 import os
 import glob

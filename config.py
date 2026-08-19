@@ -37,7 +37,7 @@ SUMMARY_FIGS_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures
 # calculate_cf.get_local_shear_exponent). Only needed the first time -- the
 # fit is cached under PATH_PREPROCESSED/ERA5/ afterwards. Used by
 # calculate_ds_cf_reanalysis (native reanalysis grid, no target GCM).
-ERA5_WIND_PATTERN = ''
+ERA5_WIND_PATTERN = 'E:/climate_data/ERA5/daily/ERA5_daily_*.zarr'
 
 # Folder holding one precomputed local shear exponent file per target GCM,
 # already regridded to that GCM's own native grid: shear_by_gcm/shear_exponent_{GCM}_{start}_{end}.nc
@@ -54,7 +54,7 @@ SHEAR_BY_GCM_DIR = "E:/climate_data/ERA5/shear_by_gcm"
 SSP = 'ssp245'
 GWL_LIST = ['GWL0-61', 'GWL1', 'GWL1-5', 'GWL2', 'GWL3']
 GWL_LEVELS = ['1.5', '2.0', '3.0']  # projection-only subset (no GWL0-61/GWL1) used by fig2.py/fig3.py
-REANALYSIS = 'W5E5'
+REANALYSIS = 'ERA5'
 SHEAR_REF_PERIOD = ('1982-01-01', '2001-12-31')  # local wind shear exponent fit period
 EXCLUDE_GCM_RUN = ['EC-Earth3-Veg-LR:r3i1p1f1']  # GCM:run pairs excluded from ensemble figures
 AGREEMENT_THRESHOLD = 15.0  # % of models agreeing below which cells are hatched on figures

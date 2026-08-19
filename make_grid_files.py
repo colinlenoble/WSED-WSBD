@@ -141,8 +141,8 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
       data: xarray.Dataset with duration, frequency, and severity per year and spatial point.
     '''
     # Find and sort file paths (zarr preferred, falls back to .nc)
-    wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_W5E5'))
-    scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_W5E5'))
+    wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_ERA5'))
+    scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_ERA5'))
 
     #wcf_paths = wcf_paths[16:]
     #scf_paths = scf_paths[16:]
@@ -157,7 +157,7 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
     gwl_list = [x.split('_')[-2] for x in wcf_paths]
     print(gcm_list)
 
-    wcf_rea_files, _ = match_files(preprocessed_path + 'W5E5/wcf_day*')
+    wcf_rea_files, _ = match_files(preprocessed_path + 'ERA5/wcf_day*')
     wcf_rea = open_dataset_any(wcf_rea_files[0])
     wcf_rea = wcf_rea.isel(time=slice(0,2))
     # Wrap the per-GCM processing in a delayed function
@@ -167,15 +167,15 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
         ssp = ssp_list[i]
         gwl = gwl_list[i]
         
-        wcf_files, _ = match_files(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
-        scf_files, _ = match_files(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
+        wcf_files, _ = match_files(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_ERA5')
+        scf_files, _ = match_files(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_ERA5')
         wcf = open_dataset_any(wcf_files[0])
         scf = open_dataset_any(scf_files[0])
         wcf['time'] = pd.to_datetime(wcf.time.dt.strftime('%Y-%m-%d').values)
         scf['time'] = pd.to_datetime(scf.time.dt.strftime('%Y-%m-%d').values)
 
-        wcf_path_ref = glob_any(os.path.join(preprocessed_path, GCM+'/wcf_day_' +GCM + '*ssp*' + run + '_GWL0-61_W5E5'))
-        scf_path_ref = glob_any(os.path.join(preprocessed_path, GCM+'/scf_day_' +GCM + '*ssp*' + run + '_GWL0-61_W5E5'))
+        wcf_path_ref = glob_any(os.path.join(preprocessed_path, GCM+'/wcf_day_' +GCM + '*ssp*' + run + '_GWL0-61_ERA5'))
+        scf_path_ref = glob_any(os.path.join(preprocessed_path, GCM+'/scf_day_' +GCM + '*ssp*' + run + '_GWL0-61_ERA5'))
         wcf_ref = open_dataset_any(wcf_path_ref[0])
         scf_ref = open_dataset_any(scf_path_ref[0])
         wcf_ref['time'] = pd.to_datetime(wcf_ref.time.dt.strftime('%Y-%m-%d').values)
@@ -235,12 +235,12 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
         ds_final = ds_final.load()
         if not os.path.exists(preprocessed_path + 'agg_datasets/gridded_'+gwl+'/'):
             os.makedirs(preprocessed_path + 'agg_datasets/gridded_'+gwl+'/')
-        ds_final.to_netcdf(preprocessed_path + 'agg_datasets/gridded_'+gwl+'/agg_'+GCM+'_'+run+'_'+ssp+'_'+gwl+'_W5E5.nc')
+        ds_final.to_netcdf(preprocessed_path + 'agg_datasets/gridded_'+gwl+'/agg_'+GCM+'_'+run+'_'+ssp+'_'+gwl+'_ERA5.nc')
         
         ### REANALYSIS
-        if reanalysis and not os.path.exists(preprocessed_path + 'agg_datasets/gridded_ref/agg_'+GCM+'_ref_regrid_W5E5.nc'):
-            wcf_bis_files, _ = match_files(preprocessed_path+ GCM+'/wcf_ref_' +GCM + '_W5E5')
-            scf_bis_files, _ = match_files(preprocessed_path+ GCM+'/scf_ref_' +GCM + '_W5E5')
+        if reanalysis and not os.path.exists(preprocessed_path + 'agg_datasets/gridded_ref/agg_'+GCM+'_ref_regrid_ERA5.nc'):
+            wcf_bis_files, _ = match_files(preprocessed_path+ GCM+'/wcf_ref_' +GCM + '_ERA5')
+            scf_bis_files, _ = match_files(preprocessed_path+ GCM+'/scf_ref_' +GCM + '_ERA5')
             wcf_bis = open_dataset_any(wcf_bis_files[0])
             scf_bis = open_dataset_any(scf_bis_files[0])
             wcf_bis = wcf_bis.convert_calendar('standard')
@@ -291,7 +291,7 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
             ds_final = ds_final.load()
             if not os.path.exists(preprocessed_path + 'agg_datasets/gridded_ref/'):
                 os.makedirs(preprocessed_path + 'agg_datasets/gridded_ref/')
-            ds_final.to_netcdf(preprocessed_path + 'agg_datasets/gridded_ref/agg_'+GCM+'_ref_regrid_W5E5.nc')
+            ds_final.to_netcdf(preprocessed_path + 'agg_datasets/gridded_ref/agg_'+GCM+'_ref_regrid_ERA5.nc')
         
         
 
@@ -311,8 +311,8 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
       data: xarray.Dataset with duration, frequency, and severity per year and spatial point.
     '''
     # Find and sort file paths (zarr preferred, falls back to .nc)
-    wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_W5E5'))
-    scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_W5E5'))
+    wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_ERA5'))
+    scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_ERA5'))
 
     #wcf_paths = wcf_paths[0:4]
     #scf_paths = scf_paths[0:4]
@@ -327,7 +327,7 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
     gwl_list = [x.split('_')[-2] for x in wcf_paths]
     print(gcm_list)
 
-    wcf_rea_files, _ = match_files(preprocessed_path + 'W5E5/wcf_day*')
+    wcf_rea_files, _ = match_files(preprocessed_path + 'ERA5/wcf_day*')
     wcf_rea = open_dataset_any(wcf_rea_files[0])
     wcf_rea = wcf_rea.isel(time=slice(0,2))
     # Wrap the per-GCM processing in a delayed function
@@ -337,8 +337,8 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
         ssp = ssp_list[i]
         gwl = gwl_list[i]
         
-        wcf_files, _ = match_files(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
-        scf_files, _ = match_files(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_W5E5')
+        wcf_files, _ = match_files(preprocessed_path+ GCM+'/wcf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_ERA5')
+        scf_files, _ = match_files(preprocessed_path+ GCM+'/scf_day_' +GCM + '_' + ssp + '_' + run + '_'+gwl+'_ERA5')
         wcf = open_dataset_any(wcf_files[0])
         scf = open_dataset_any(scf_files[0])
         wcf = wcf.mean(dim='time')
@@ -358,7 +358,7 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
         ds_final = ds_final.load()
         if not os.path.exists(preprocessed_path + 'agg_datasets/gridded_'+gwl+'_ds_cf/'):
             os.makedirs(preprocessed_path + 'agg_datasets/gridded_'+gwl+'_ds_cf/')
-        ds_final.to_netcdf(preprocessed_path + 'agg_datasets/gridded_'+gwl+'_ds_cf/agg_ds_cf_'+GCM+'_'+run+'_'+ssp+'_'+gwl+'_W5E5.nc')
+        ds_final.to_netcdf(preprocessed_path + 'agg_datasets/gridded_'+gwl+'_ds_cf/agg_ds_cf_'+GCM+'_'+run+'_'+ssp+'_'+gwl+'_ERA5.nc')
 
         
         

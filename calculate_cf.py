@@ -2,7 +2,6 @@
 import os
 import config
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
-import sys
 import xesmf as xe
 import xarray as xr
 import numpy as np
@@ -25,17 +24,8 @@ from io_utils import (
     safe_to_netcdf, safe_to_zarr,
 )
 
-# fit_local_shear.py (ERA5-based per-pixel wind shear exponent) and
-# calculate_wind_solar_cf.py (PVGIS solar model) live in the sibling
-# como24_group5/code_review project, not on the default path.
-_FIT_LOCAL_SHEAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    '..', 'como24_group5', 'code_review')
-if _FIT_LOCAL_SHEAR_DIR not in sys.path:
-    sys.path.insert(0, _FIT_LOCAL_SHEAR_DIR)
 from fit_local_shear import fit_local_shear
-from calculate_wind_solar_cf import (
-    compute_solar_cf, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS,
-)
+from compute_solar_cf import compute_solar_cf, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS
 
 # -------------------------
 # DS_CF physical constants
@@ -335,7 +325,7 @@ def get_output_filename(path_preprocessed, GCM, ssp, run, gwl, reanalysis):
 # -------------------------
 
 def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gwl_list,
-               reanalysis='W5E5', overwrite=False):
+               reanalysis='ERA5', overwrite=False):
     """
     Train an MBCn adjustment on historical data and apply it to each future GWL.
 
@@ -626,7 +616,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 def calculate_ds_cf_reanalysis_grid_GCM(
     GCM, run, ssp,
     path_preprocessed, path_folder,
-    reanalysis='W5E5',
+    reanalysis='ERA5',
     shapefile_path=None,
     cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
     pv_cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
@@ -682,10 +672,10 @@ def calculate_ds_cf_reanalysis_grid_GCM(
             raise KeyError(f"{v} not found in reanalysis dataset")
 
     if 'sfcWind' not in dref:
-        if not {'uas', 'vas'}.issubset(dref.data_vars):
-            raise KeyError("Need either 'sfcWind' or both 'uas' and 'vas' in reanalysis")
-        print("Computing sfcWind from uas/vas")
-        dref['sfcWind'] = np.hypot(dref['uas'], dref['vas'])
+        if not {'u10', 'v10'}.issubset(dref.data_vars):
+            raise KeyError("Need either 'sfcWind' or both 'u10' and 'v10' in reanalysis")
+        print("Computing sfcWind from u10/v10")
+        dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
 
     dref = dref[['tas', 'rsds', 'sfcWind']]
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
@@ -779,7 +769,7 @@ def calculate_ds_cf_reanalysis_grid_GCM(
 
 
 def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
-                      reanalysis='W5E5', cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
+                      reanalysis='ERA5', cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
                       pv_cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
                       shear_ref_period=('1982-01-01', '2001-12-31'),
                       shear_by_gcm_dir=None):
@@ -853,7 +843,7 @@ def calculate_ds_cf_reanalysis(
     path_folder,
     path_preprocessed,
     era5_file_pattern,
-    reanalysis='W5E5',
+    reanalysis='ERA5',
     shapefile_path=None,
     cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
     pv_cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
@@ -902,10 +892,10 @@ def calculate_ds_cf_reanalysis(
             raise KeyError(f"'{v}' not found in reanalysis dataset")
 
     if 'sfcWind' not in dref:
-        if not {'uas', 'vas'}.issubset(dref.data_vars):
-            raise KeyError("Need either 'sfcWind' or both 'uas' and 'vas' in reanalysis")
-        print("Computing sfcWind from uas/vas")
-        dref['sfcWind'] = np.hypot(dref['uas'], dref['vas'])
+        if not {'u10', 'v10'}.issubset(dref.data_vars):
+            raise KeyError("Need either 'sfcWind' or both 'u10' and 'v10' in reanalysis")
+        print("Computing sfcWind from u10/v10")
+        dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
 
     dref = dref[['tas', 'rsds', 'sfcWind']]
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
@@ -990,7 +980,7 @@ def calculate_ds_cf_reanalysis(
 # Spatial aggregation
 # -------------------------
 def aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder, gwl, shapefile_path,
-                  reanalysis='W5E5', suffix_shp='v1'):
+                  reanalysis='ERA5', suffix_shp='v1'):
     """
     Aggregate wind and solar potential by region.
 
@@ -1141,7 +1131,7 @@ def aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder, gwl, shapefil
 
 def aggregate_ds_cf_reanalysis(
     path_preprocessed, temp_folder, shapefile_path,
-    reanalysis='W5E5', suffix_shp='v1',
+    reanalysis='ERA5', suffix_shp='v1',
 ):
     """
     Aggregate reanalysis wcf/scf (native grid) by region.
@@ -1248,7 +1238,7 @@ def aggregate_ds_cf_reanalysis(
     print("Written aggregated wcf to", wcf_out)
 
 
-def build_available_df(path_preprocessed, ssp, reanalysis='W5E5',
+def build_available_df(path_preprocessed, ssp, reanalysis='ERA5',
                        gwl_list=('GWL0-61', 'GWL1', 'GWL1-5', 'GWL2', 'GWL3')):
     """
     Scan path_preprocessed and return a DataFrame of all GCM-run pairs
@@ -1261,7 +1251,7 @@ def build_available_df(path_preprocessed, ssp, reanalysis='W5E5',
     ----------
     path_preprocessed : str
     ssp               : str   e.g. 'ssp245'
-    reanalysis        : str   e.g. 'W5E5'
+    reanalysis        : str   e.g. 'ERA5'
     gwl_list          : sequence of GWL strings to check
 
     Returns
@@ -1336,7 +1326,7 @@ if __name__ == "__main__":
     df_to_process = df_available.copy()
     
 
-    path_list_base = f"{path_preprocessed}*/wcf_day_*_ssp245_*_GWL0-61_W5E5"
+    path_list_base = f"{path_preprocessed}*/wcf_day_*_ssp245_*_GWL0-61_ERA5"
     path_list = glob.glob(path_list_base + '.nc') + glob.glob(path_list_base + '.zarr')
     GCM_list  = [os.path.basename(p.rstrip('/\\')).split('_')[-5] for p in path_list]
     run_list  = [os.path.basename(p.rstrip('/\\')).split('_')[-3] for p in path_list]
@@ -1347,6 +1337,22 @@ if __name__ == "__main__":
     cfg = DEFAULT_DS_CF_CONFIG
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
+    
+    calculate_ds_cf_reanalysis(
+        path_folder,
+        path_preprocessed,
+        era5_file_pattern,
+        reanalysis='ERA5',
+        shapefile_path=shapefile_path,
+        cfg=cfg,
+        pv_cfg=pv_cfg,
+        shear_ref_period=shear_ref_period
+    )
+
+  
+    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
+    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
+
     # unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
     #            path_folder, gwl_list, reanalysis)
     # calculate_ds_cf_reanalysis_grid_GCM(GCM, run, ssp, path_preprocessed,
@@ -1354,18 +1360,16 @@ if __name__ == "__main__":
     #                                    shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
     #                                    shear_ref_period=shear_ref_period,
     #                                    shear_by_gcm_dir=shear_by_gcm_dir)
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='W5E5', suffix_shp='v1')
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='W5E5', suffix_shp='v2')
-     # --- Loop over GCM-run pairs, skip GWLs that don't exist ---
-    for _, row in df_to_process.iterrows():
-        GCM = row['GCM']
-        run = row['run']
-        print(f"\n--- Processing {GCM} {run} ---")
-        for gwl in gwl_list:
-            if not row[gwl]:
-                print(f"  Skipping {gwl} (file not available)")
-                continue
-            print(f"  Processing {gwl}")
+    # --- Loop over GCM-run pairs, skip GWLs that don't exist ---
+    # for _, row in df_to_process.iterrows():
+    #     GCM = row['GCM']
+    #     run = row['run']
+    #     print(f"\n--- Processing {GCM} {run} ---")
+    #     for gwl in gwl_list:
+    #         if not row[gwl]:
+    #             print(f"  Skipping {gwl} (file not available)")
+    #             continue
+    #         print(f"  Processing {gwl}")
             # calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
             #                    cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
             #                    shear_by_gcm_dir=shear_by_gcm_dir)

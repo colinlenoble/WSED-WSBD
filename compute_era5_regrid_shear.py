@@ -6,8 +6,8 @@ regrid_era5_to_w5e5.py) over the reference period 1982-01-01..2001-12-31.
 
 alpha(lat, lon) = mean_t[ log(ws100(t) / ws10(t)) / log(10) ]
 
-Reuses fit_local_shear (como24_group5/code_review/fit_local_shear.py, already
-generic over file_pattern/time_slice) pointed at the regridded zarr stores
+Reuses fit_local_shear (fit_local_shear.py, already generic over
+file_pattern/time_slice) pointed at the regridded zarr stores
 instead of the native 0.25 deg ERA5 archive, so the exponent is fit on the
 same grid calculate_cf.py's wcf calculation consumes it on -- no interp step
 needed downstream.
@@ -21,7 +21,6 @@ Usage:
     python compute_era5_regrid_shear.py
 """
 import os
-import sys
 
 # Must be imported before xarray/zarr/dask (pulled in below via fit_local_shear):
 # on this machine, zarr's codec libs shadow netCDF4's HDF5 DLL of the same name
@@ -32,10 +31,6 @@ SRC_DIR = r"E:/climate_data/ERA5/daily_regrid"
 OUT_DIR = r"E:/climate_data/ERA5"
 REF_PERIOD = ("1982-01-01", "2001-12-31")
 
-_FIT_LOCAL_SHEAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    '..', 'como24_group5', 'code_review')
-if _FIT_LOCAL_SHEAR_DIR not in sys.path:
-    sys.path.insert(0, _FIT_LOCAL_SHEAR_DIR)
 from fit_local_shear import fit_local_shear, safe_to_netcdf
 
 

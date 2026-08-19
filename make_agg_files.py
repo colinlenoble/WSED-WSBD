@@ -160,8 +160,8 @@ def load_agg_data_compound(preprocessed_path):
     that returns the duration, frequency and severity of the compound events per year and poly_idx
 
   '''
-    wpp_paths = glob.glob(os.path.join(preprocessed_path , '*/wpp_agg_*ssp*_W5E5_v1.nc'))
-    spp_paths = glob.glob(os.path.join(preprocessed_path , '*/spp_agg_*ssp*_W5E5_v1.nc'))
+    wpp_paths = glob.glob(os.path.join(preprocessed_path , '*/wpp_agg_*ssp*_ERA5_v1.nc'))
+    spp_paths = glob.glob(os.path.join(preprocessed_path , '*/spp_agg_*ssp*_ERA5_v1.nc'))
 
     wpp_paths.sort()
     spp_paths.sort()
@@ -193,13 +193,13 @@ def load_agg_data_compound(preprocessed_path):
         spp = xr.open_dataset(spp_paths[i])
 
         if gwl=='GWL0-61':
-            wpp_ref = xr.open_dataset(preprocessed_path + GCM + '/wpp_agg_ref_' +GCM+'_W5E5_v1.nc')
-            spp_ref = xr.open_dataset(preprocessed_path + GCM + '/spp_agg_ref_' +GCM+'_W5E5_v1.nc')
+            wpp_ref = xr.open_dataset(preprocessed_path + GCM + '/wpp_agg_ref_' +GCM+'_ERA5_v1.nc')
+            spp_ref = xr.open_dataset(preprocessed_path + GCM + '/spp_agg_ref_' +GCM+'_ERA5_v1.nc')
             wpp_ref = wpp_ref.sel(time=slice('1982-01-01','2001-12-31'))
             spp_ref = spp_ref.sel(time=slice('1982-01-01','2001-12-31'))
         else:
-            wpp_path = glob.glob(preprocessed_path + GCM + '/wpp_agg_*ssp*'+run_list[i]+'_GWL0-61_W5E5_v1.nc')
-            spp_path = glob.glob(preprocessed_path + GCM + '/spp_agg_*ssp*'+run_list[i]+'_GWL0-61_W5E5_v1.nc')
+            wpp_path = glob.glob(preprocessed_path + GCM + '/wpp_agg_*ssp*'+run_list[i]+'_GWL0-61_ERA5_v1.nc')
+            spp_path = glob.glob(preprocessed_path + GCM + '/spp_agg_*ssp*'+run_list[i]+'_GWL0-61_ERA5_v1.nc')
             wpp_ref = xr.open_dataset(wpp_path[0])
             spp_ref = xr.open_dataset(spp_path[0])
         
@@ -262,7 +262,7 @@ if __name__ == '__main__':
         'threshold': '10th percentile of non-zero days over GWL0-61 reference window (ssp245)',
         'excluded': 'MIROC6; EC-Earth3-Veg-LR r3i1p1f1; GWL1',
         'variables': 'duration [days], frequency [count/year], severity [wpp+spp deficit on event days], low_wind [days/year], low_solar [days/year]',
-        'source': 'W5E5-bias-corrected ISIMIP3b projections',
+        'source': 'ERA5-bias-corrected ISIMIP3b projections',
         'creation_date': '2026-03-30',
     }
     data['duration'].attrs   = {'long_name': 'Mean compound event duration'}

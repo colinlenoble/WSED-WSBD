@@ -49,10 +49,10 @@ import netCDF4  # noqa: F401
 import numpy as np
 import xarray as xr
 
-_FIT_LOCAL_SHEAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    '..', '..', 'como24_group5', 'code_review')
-if _FIT_LOCAL_SHEAR_DIR not in sys.path:
-    sys.path.insert(0, _FIT_LOCAL_SHEAR_DIR)
+# fit_local_shear.py lives one level up, at the repo root.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from fit_local_shear import DEFAULT_SHAPEFILE, rasterize_region_mask, safe_to_netcdf
 
 GCMS = [

@@ -146,9 +146,9 @@ def parse_args():
     parser.add_argument("--dpi", type=int, default=300, help="DPI for saved figures (default: 300).")
     parser.add_argument(
         "--path_hist",
-        default=config.PATH_PREPROCESSED + 'agg_datasets/ds_final_non_zero_0.1_W5E5.nc',
+        default=config.PATH_PREPROCESSED + 'agg_datasets/ds_final_non_zero_0.1_ERA5.nc',
         help=(
-            "Path to the historical ds_final .nc file (W5E5 reanalysis). "
+            "Path to the historical ds_final .nc file (ERA5 reanalysis). "
             "Used to draw the dark grey layer for pixels with no wind potential "
             "(where historical duration is null). If not provided, falls back to "
             "the GCM baseline null pattern."
@@ -262,7 +262,7 @@ def duration_xr(da):
 def _agg_output_path(preprocessed_path, gwl, gcm, run, ssp):
     """Return the standard output .nc path for one GCM / GWL combination."""
     out_dir = os.path.join(preprocessed_path, "agg_datasets", f"gridded_{gwl}")
-    return os.path.join(out_dir, f"agg_{gcm}_{run}_{ssp}_{gwl}_W5E5.nc")
+    return os.path.join(out_dir, f"agg_{gcm}_{run}_{ssp}_{gwl}_ERA5.nc")
 
 
 def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebuild=False):
@@ -280,9 +280,9 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebu
 
     # Load projection data (zarr preferred, falls back to .nc)
     wcf_files, _ = match_files(
-        os.path.join(preprocessed_path, gcm, f"wcf_day_{gcm}_{ssp}_{run}_{gwl}_W5E5"))
+        os.path.join(preprocessed_path, gcm, f"wcf_day_{gcm}_{ssp}_{run}_{gwl}_ERA5"))
     scf_files, _ = match_files(
-        os.path.join(preprocessed_path, gcm, f"scf_day_{gcm}_{ssp}_{run}_{gwl}_W5E5"))
+        os.path.join(preprocessed_path, gcm, f"scf_day_{gcm}_{ssp}_{run}_{gwl}_ERA5"))
     wcf = open_dataset_any(wcf_files[0])
     scf = open_dataset_any(scf_files[0])
     wcf["time"] = pd.to_datetime(wcf.time.dt.strftime("%Y-%m-%d").values)
@@ -290,9 +290,9 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebu
 
     # Load reference (GWL0-61) data for threshold computation
     wcf_ref_paths = glob_any(
-        os.path.join(preprocessed_path, gcm, f"wcf_day_{gcm}*ssp*{run}_GWL0-61_W5E5"))
+        os.path.join(preprocessed_path, gcm, f"wcf_day_{gcm}*ssp*{run}_GWL0-61_ERA5"))
     scf_ref_paths = glob_any(
-        os.path.join(preprocessed_path, gcm, f"scf_day_{gcm}*ssp*{run}_GWL0-61_W5E5"))
+        os.path.join(preprocessed_path, gcm, f"scf_day_{gcm}*ssp*{run}_GWL0-61_ERA5"))
     wcf_ref = open_dataset_any(wcf_ref_paths[0])
     scf_ref = open_dataset_any(scf_ref_paths[0])
     wcf_ref["time"] = pd.to_datetime(wcf_ref.time.dt.strftime("%Y-%m-%d").values)
@@ -332,7 +332,7 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebu
     comp_annual           = comp_annual.rename({"time": "year"})
     ds_final["nb_days"]   = comp_annual.start_cooc
 
-    # Regrid to W5E5 grid and attach metadata
+    # Regrid to ERA5 grid and attach metadata
     ds_final            = ds_final.expand_dims({"realization": [0]})
     regrid              = xe.Regridder(ds_final, wcf_rea, method="nearest_s2d")
     ds_final            = regrid(ds_final)
@@ -367,11 +367,11 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
     exclude_gcm     = exclude_gcm or []
     exclude_gcm_run = set(tuple(x.split(":")) for x in (exclude_gcm_run or []))
 
-    # Load the W5E5 reference grid (needed for regridding)
-    rea_files, _ = match_files(os.path.join(preprocessed_path, "W5E5", "wcf_day*"))
+    # Load the ERA5 reference grid (needed for regridding)
+    rea_files, _ = match_files(os.path.join(preprocessed_path, "ERA5", "wcf_day*"))
     if not rea_files:
         raise FileNotFoundError(
-            f"No W5E5 reference file found under {preprocessed_path}/W5E5/. "
+            f"No ERA5 reference file found under {preprocessed_path}/ERA5/. "
             "Cannot determine target regrid grid."
         )
     wcf_rea = open_dataset_any(rea_files[0]).isel(time=slice(0, 2))
@@ -381,7 +381,7 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
 
         # Discover available projection files for this GWL
         wcf_paths = glob_any(
-            os.path.join(preprocessed_path, "*/wcf_day_*ssp*" + gwl + "_W5E5"))
+            os.path.join(preprocessed_path, "*/wcf_day_*ssp*" + gwl + "_ERA5"))
         if not wcf_paths:
             print(f"  No files found for {gwl}, skipping.")
             continue
@@ -734,7 +734,7 @@ def plot_gwl_valuebyalpha_discrete(
     land_shp   = rasterize_shapefile(shp, da_mask.shape, t_mask)
     land_shp   = land_shp[::-1, :]
     # Dark grey layer: land pixels with no wind potential
-    # Prefer the W5E5 historical null mask (hist_null_da); fall back to GCM baseline mask.
+    # Prefer the ERA5 historical null mask (hist_null_da); fall back to GCM baseline mask.
     if hist_null_da is not None:
         _null_float = hist_null_da.astype(float).interp(
             lat=da_mask.lat, lon=da_mask.lon, method="nearest"
@@ -1016,7 +1016,7 @@ def _compute_ensemble_rel_change(
 ):
     """
     Return the ensemble-weighted mean relative change (%) as a 2-D numpy array
-    on the cropped W5E5 grid.  Used to freeze colour-bin membership at GWL1.5
+    on the cropped ERA5 grid.  Used to freeze colour-bin membership at GWL1.5
     and apply the same spatial masks to higher GWLs.
     """
     def _crop(da):
@@ -1403,7 +1403,7 @@ def main():
     ref_2d = _reduce_to_2d(ds_baseline.duration)
     mask   = build_land_mask(ref_2d, args.shapefile)
 
-    # Historical W5E5 null mask (True = no wind potential) for the dark grey layer
+    # Historical ERA5 null mask (True = no wind potential) for the dark grey layer
     hist_null_da = None
     if args.path_hist is not None:
         if os.path.exists(args.path_hist):
