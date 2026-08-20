@@ -166,19 +166,27 @@ def get_local_shear_exponent(era5_file_pattern, path_preprocessed,
     {path_preprocessed}/ERA5/shear_exponent_local_{start}_{end}.nc.
 
     era5_file_pattern : glob pattern for the reanalysis wind files (.nc or
-                        .zarr). Only needed the first time -- ignored once
-                        the cached file exists (pass overwrite=True to refit).
+                        .zarr). Only needed if no cached alpha file is found
+                        -- checked first at {path_preprocessed}/ERA5/, then
+                        at {config.PATH_FOLDER}/ERA5/ (in case it was fit and
+                        left alongside the raw reanalysis archive instead of
+                        the preprocessed one). Pass overwrite=True to refit
+                        from era5_file_pattern regardless of either cache.
     """
+    fname = f"shear_exponent_local_{ref_period[0]}_{ref_period[1]}.nc"
     out_dir = os.path.join(path_preprocessed, 'ERA5')
-    out_path = os.path.join(out_dir, f"shear_exponent_local_{ref_period[0]}_{ref_period[1]}.nc")
+    out_path = os.path.join(out_dir, fname)
+    fallback_path = os.path.join(config.PATH_FOLDER, 'ERA5', fname)
 
-    if os.path.exists(out_path) and not overwrite:
+    if not overwrite and os.path.exists(out_path):
         alpha = xr.open_dataset(out_path)['alpha']
+    elif not overwrite and os.path.exists(fallback_path):
+        alpha = xr.open_dataset(fallback_path)['alpha']
     else:
         if not era5_file_pattern:
             raise FileNotFoundError(
-                f"No cached local shear exponent at {out_path} and no "
-                "era5_file_pattern given to fit one."
+                f"No cached local shear exponent at {out_path} or "
+                f"{fallback_path}, and no era5_file_pattern given to fit one."
             )
         os.makedirs(out_dir, exist_ok=True)
         print(f"Fitting local shear exponent from {era5_file_pattern} over {ref_period}")
