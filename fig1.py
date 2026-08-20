@@ -81,46 +81,74 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold):
     return severity
 
 
-def duration_xr(da):
-    first_time = pd.Timestamp(da.time[0].values)
-    da_dur = xr.concat(
-        [xr.zeros_like(da.isel(time=0)).expand_dims(
-             time=[first_time - pd.Timedelta(days=1)]),
-         da],
-        dim="time",
+def _pixel_duration_frequency(x, times_year, out_years):
+    """
+    Run-length-encode one pixel's 0/1 daily series into per-year event
+    duration (mean length of events starting that year) and frequency
+    (count of events starting that year). NaN where no event started in
+    that year at that pixel, matching the semantics of the original
+    event_id/groupby("year","lat","lon") approach (a pixel-year with zero
+    events simply had no row in that groupby, i.e. NaN after to_xarray).
+    Called once per pixel by duration_xr's apply_ufunc, so it only ever
+    sees a single (time,) series -- no global stack/dropna over the whole
+    cube.
+    """
+    n_years = out_years.shape[0]
+    dur_sum = np.zeros(n_years)
+    count   = np.zeros(n_years)
+    x = np.asarray(x)
+    if x.size and np.any(x > 0):
+        xb     = (x > 0).astype(np.int8)
+        padded = np.concatenate(([0], xb, [0]))
+        d      = np.diff(padded)
+        starts = np.flatnonzero(d == 1)
+        stops  = np.flatnonzero(d == -1) - 1
+        if starts.size:
+            lengths     = (stops - starts + 1).astype(np.float64)
+            start_years = times_year[starts]
+            year_idx    = np.searchsorted(out_years, start_years)
+            year_idx_c  = np.clip(year_idx, 0, n_years - 1)
+            valid       = ((year_idx >= 0) & (year_idx < n_years)
+                            & (out_years[year_idx_c] == start_years))
+            np.add.at(dur_sum, year_idx_c[valid], lengths[valid])
+            np.add.at(count,   year_idx_c[valid], 1)
+    duration  = np.full(n_years, np.nan)
+    frequency = np.full(n_years, np.nan)
+    has_event = count > 0
+    duration[has_event]  = dur_sum[has_event] / count[has_event]
+    frequency[has_event] = count[has_event]
+    return duration, frequency
+
+
+def duration_xr(da, tile_lat=60, tile_lon=60):
+    """
+    Per-pixel event duration/frequency via a dask-chunked apply_ufunc:
+    lat/lon are tiled (tile_lat x tile_lon x full time per task) so each
+    dask task only ever holds one tile in memory and tiles run in
+    parallel, instead of the previous approach which cumsum'd and
+    stack()+dropna()'d the *entire* (time x lat x lon) global cube into
+    one dense array/pandas dataframe -- that materialization (tens of GB
+    for a multi-decade daily global grid) is what was causing the OOM.
+    """
+    da = da.chunk({"time": -1, "lat": tile_lat, "lon": tile_lon})
+    years_arr = da["time"].dt.year.values
+    out_years = np.unique(years_arr)
+
+    duration, frequency = xr.apply_ufunc(
+        _pixel_duration_frequency,
+        da,
+        input_core_dims=[["time"]],
+        output_core_dims=[["year"], ["year"]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[np.float64, np.float64],
+        dask_gufunc_kwargs={"output_sizes": {"year": out_years.size}},
+        kwargs={"times_year": years_arr, "out_years": out_years},
     )
-    start_event        = da_dur.diff(dim="time", label="lower") > 0
-    start_event["time"] = da.time
-    start_event["year"] = start_event.time.dt.year
-    id_event = start_event.cumsum(dim="time") * da
-    id_event = id_event.where(id_event > 0)
-
-    stacked   = id_event.stack(z=("lat", "lon", "time")).dropna("z")
-    event_ids = stacked.values.astype(int)
-    lat_idxs  = stacked["lat"].values
-    lon_idxs  = stacked["lon"].values
-    year_idxs = stacked["year"].values.astype(int)
-
-    df = pd.DataFrame({"event_id": event_ids, "lat": lat_idxs,
-                        "lon": lon_idxs, "year": year_idxs})
-    df["year"] = df.groupby(["event_id", "lat", "lon"])["year"].transform("min")
-    keys = (df["event_id"].astype(str) + ";" + df["lat"].astype(str) + ";"
-            + df["lon"].astype(str) + ";" + df["year"].astype(str))
-    unique_keys, counts = np.unique(keys.values, return_counts=True)
-    split  = np.array([k.split(";") for k in unique_keys])
-    dur_da = xr.DataArray(
-        counts, dims="event_instance",
-        coords={"event_instance": np.arange(len(counts)),
-                "event_id": ("event_instance", split[:, 0].astype(int)),
-                "lat":      ("event_instance", split[:, 1].astype(float)),
-                "lon":      ("event_instance", split[:, 2].astype(float)),
-                "year":     ("event_instance", split[:, 3].astype(int))},
-    ).to_dataset(name="duration")
-
-    df2     = dur_da.to_dataframe()
-    ds      = df2.groupby(["year", "lat", "lon"])[["duration"]].mean().to_xarray()
-    ds_freq = df2.groupby(["year", "lat", "lon"])[["duration"]].count().rename(
-        columns={"duration": "frequency"}).to_xarray()
+    duration  = duration.assign_coords(year=("year", out_years))
+    frequency = frequency.assign_coords(year=("year", out_years))
+    ds      = duration.rename("duration").to_dataset()
+    ds_freq = frequency.rename("frequency").to_dataset()
     return ds, ds_freq
 
 
@@ -151,6 +179,12 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
     scf["low_solar"] = xr.where(scf.scf >= scf_thr, 1, 0)
     compound = (wcf.low_wind * scf.low_solar).to_dataset(name="start_cooc")
 
+    land_mask = build_land_mask_from_grid(compound.lat.values, compound.lon.values,
+                                          shapefile_path)
+    land_mask_da = xr.DataArray(land_mask, dims=("lat", "lon"),
+                                coords={"lat": compound.lat, "lon": compound.lon})
+    compound["start_cooc"] = compound["start_cooc"].where(land_mask_da)
+
     print("  Computing severity  ")
     severity_ds = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr)
     severity_ds["time"] = severity_ds.time.dt.year
@@ -177,6 +211,25 @@ def rasterize_shapefile(shapefile, shape, transform):
     mask = geometry_mask(geometries=geometries, all_touched=True,
                           out_shape=shape, transform=transform, invert=True)
     return mask
+
+
+def build_land_mask_from_grid(lat, lon, shapefile_path):
+    """
+    Land/ocean mask straight from a lat/lon grid, without depending on
+    ds_final (which doesn't exist yet inside build_ds_final). Used to drop
+    ocean cells before the expensive duration/severity step instead of
+    only masking afterwards for plotting -- a coarse superset of the
+    final build_land_mask() (that one additionally excludes cells where
+    duration ends up all-null, which can't be known before it's computed).
+    """
+    shapefile = gpd.read_file(shapefile_path)
+    shape = (len(lat), len(lon))
+    transform = rasterio.transform.from_bounds(
+        float(np.min(lon)), float(np.min(lat)), float(np.max(lon)), float(np.max(lat)),
+        len(lon), len(lat),
+    )
+    mask = rasterize_shapefile(shapefile, shape, transform)
+    return mask[::-1, :]
 
 
 def build_land_mask(ds_final, shapefile_path):
@@ -461,7 +514,7 @@ def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
     cbar = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.6, aspect=40)
     cbar.set_label("Interannual variability", fontsize=6)
     cbar.ax.tick_params(labelsize=5)
-    ax.set_title("Interannual variability of annual severity (1979�2019)",
+    ax.set_title("Interannual variability of annual severity (1982-2021)",
                  fontsize=8, fontweight="bold")
     ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
     plt.tight_layout()
