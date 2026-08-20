@@ -37,7 +37,7 @@ SUMMARY_FIGS_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures
 # calculate_cf.get_local_shear_exponent). Only needed the first time -- the
 # fit is cached under PATH_PREPROCESSED/ERA5/ afterwards. Used by
 # calculate_ds_cf_reanalysis (native reanalysis grid, no target GCM).
-ERA5_WIND_PATTERN = 'E:/climate_data/ERA5/daily/ERA5_daily_*.zarr'
+ERA5_WIND_PATTERN = '/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_raw/ERA5/ERA5_daily_*.zarr'
 
 # Folder holding one precomputed local shear exponent file per target GCM,
 # already regridded to that GCM's own native grid: shear_by_gcm/shear_exponent_{GCM}_{start}_{end}.nc
@@ -46,7 +46,7 @@ ERA5_WIND_PATTERN = 'E:/climate_data/ERA5/daily/ERA5_daily_*.zarr'
 # regrid_alpha_to_grid, since alpha is already on the right grid for these 14
 # GCMs -- no interpolation needed. Windows path below is where these were
 # computed locally; update if you move to a different machine.
-SHEAR_BY_GCM_DIR = "E:/climate_data/ERA5/shear_by_gcm"
+SHEAR_BY_GCM_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_raw/ERA5/shear_by_gcm"
 
 # -------------------------
 # Run parameters

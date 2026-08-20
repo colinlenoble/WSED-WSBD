@@ -357,6 +357,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         raise FileNotFoundError(
             f"No reanalysis files found in {os.path.join(path_folder, reanalysis)}")
     dref = open_mfdataset_any(files_ref)
+    dref = _standardize_reanalysis_names(dref)
     dref = dref.sortby('lat').sortby('lon').sortby('time')
     dhist = dhist.sortby('lat').sortby('lon').sortby('time')
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
@@ -679,10 +680,7 @@ def calculate_ds_cf_reanalysis_grid_GCM(
 
     print(f"Found {len(files_ref)} reanalysis files for {reanalysis}")
     dref = open_mfdataset_any(
-        files_ref, combine='by_coords',
-        chunks={'time': -1, 'lat': 100, 'lon': 100,
-                'valid_time': -1, 'latitude': 100, 'longitude': 100},
-        parallel=True
+        files_ref, combine='by_coords', chunks={}, parallel=True
     )
     dref = _standardize_reanalysis_names(dref)
     dref = dref.sortby('lat').sortby('lon').sortby('time')
@@ -742,46 +740,52 @@ def calculate_ds_cf_reanalysis_grid_GCM(
 
     # 5. Solar potential (scf), PVGIS relative-efficiency + Faiman
     #    module-temperature model.
-    print("Computing solar potential (scf)...")
-    scf = compute_solar_cf(dref_rg['tas'], dref_rg['rsds'], dref_rg['sfcWind'], cfg=pv_cfg)
+    if os.path.exists(path_scf_ref):
+        print("scf file already exists, skipping:", path_scf_ref)
+    else:
+        print("Computing solar potential (scf)...")
+        scf = compute_solar_cf(dref_rg['tas'], dref_rg['rsds'], dref_rg['sfcWind'], cfg=pv_cfg)
 
-    solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
-    solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
-    solar_potential['scf'] = solar_potential['scf'].astype('f4')
-    solar_potential.attrs.update({
-        'DESCRIPTION': f'scf reference for {reanalysis} regridded to {GCM} grid',
-        'units': 'dimensionless',
-        'long_name': 'PVtot potential',
-        'SOURCE': 'calculate_ds_cf_reanalysis_grid_GCM',
-        'AUTHOR': 'Colin Lenoble',
-        'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
-    })
-    solar_potential = solar_potential.compute()
-    safe_to_zarr(solar_potential, path_scf_ref)
-    print("Written scf to", path_scf_ref)
+        solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
+        solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
+        solar_potential['scf'] = solar_potential['scf'].astype('f4')
+        solar_potential.attrs.update({
+            'DESCRIPTION': f'scf reference for {reanalysis} regridded to {GCM} grid',
+            'units': 'dimensionless',
+            'long_name': 'PVtot potential',
+            'SOURCE': 'calculate_ds_cf_reanalysis_grid_GCM',
+            'AUTHOR': 'Colin Lenoble',
+            'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
+        })
+        solar_potential = solar_potential.compute()
+        safe_to_zarr(solar_potential, path_scf_ref)
+        print("Written scf to", path_scf_ref)
+        solar_potential.close()
 
     # 6. Wind potential (wcf), using the per-pixel local shear exponent
     #    precomputed on GCM's own native grid (see get_gcm_shear_exponent).
-    print("Computing wind potential (wcf)...")
-    alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, gcm_grid, shear_ref_period)
-    wind_pot = compute_wind_potential(dref_rg['sfcWind'], alpha, cfg)
+    if os.path.exists(path_wcf_ref):
+        print("wcf file already exists, skipping:", path_wcf_ref)
+    else:
+        print("Computing wind potential (wcf)...")
+        alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, gcm_grid, shear_ref_period)
+        wind_pot = compute_wind_potential(dref_rg['sfcWind'], alpha, cfg)
 
-    wind_potential = wind_pot.to_dataset(name='wcf')
-    wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
-    wind_potential['wcf'] = wind_potential['wcf'].astype('f4')
-    wind_potential.attrs.update({
-        'DESCRIPTION': f'wcf reference for {reanalysis} regridded to {GCM} grid',
-        'units': 'dimensionless',
-        'long_name': 'Wind potential',
-        'SOURCE': 'calculate_ds_cf_reanalysis_grid_GCM',
-        'AUTHOR': 'Colin Lenoble',
-    })
-    wind_potential = wind_potential.compute()
-    safe_to_zarr(wind_potential, path_wcf_ref)
-    print("Written wcf to", path_wcf_ref)
+        wind_potential = wind_pot.to_dataset(name='wcf')
+        wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
+        wind_potential['wcf'] = wind_potential['wcf'].astype('f4')
+        wind_potential.attrs.update({
+            'DESCRIPTION': f'wcf reference for {reanalysis} regridded to {GCM} grid',
+            'units': 'dimensionless',
+            'long_name': 'Wind potential',
+            'SOURCE': 'calculate_ds_cf_reanalysis_grid_GCM',
+            'AUTHOR': 'Colin Lenoble',
+        })
+        wind_potential = wind_potential.compute()
+        safe_to_zarr(wind_potential, path_wcf_ref)
+        print("Written wcf to", path_wcf_ref)
+        wind_potential.close()
 
-    solar_potential.close()
-    wind_potential.close()
     dref_rg.close()
     dref.close()
     gc.collect()
@@ -902,10 +906,7 @@ def calculate_ds_cf_reanalysis(
     print(f"Found {len(files_ref)} reanalysis files for {reanalysis}")
 
     dref = open_mfdataset_any(
-        files_ref, combine='by_coords',
-        chunks={'time': -1, 'lat': 100, 'lon': 100,
-                'valid_time': -1, 'latitude': 100, 'longitude': 100},
-        parallel=True,
+        files_ref, combine='by_coords', chunks={}, parallel=True,
     )
     dref = _standardize_reanalysis_names(dref)
     dref = dref.sortby('lat').sortby('lon').sortby('time')
@@ -953,47 +954,53 @@ def calculate_ds_cf_reanalysis(
 
     # 4. Solar potential (scf), PVGIS relative-efficiency + Faiman
     #    module-temperature model.
-    print("Computing solar potential (scf)...")
-    scf = compute_solar_cf(dref['tas'], dref['rsds'], dref['sfcWind'], cfg=pv_cfg)
+    if os.path.exists(path_scf):
+        print("scf file already exists, skipping:", path_scf)
+    else:
+        print("Computing solar potential (scf)...")
+        scf = compute_solar_cf(dref['tas'], dref['rsds'], dref['sfcWind'], cfg=pv_cfg)
 
-    solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
-    solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
-    solar_potential['scf'] = solar_potential['scf'].astype('f4')
-    solar_potential.attrs.update({
-        'DESCRIPTION': f'scf on native {reanalysis} grid',
-        'units': 'dimensionless',
-        'long_name': 'PVtot potential',
-        'SOURCE': 'calculate_ds_cf_reanalysis',
-        'AUTHOR': 'Colin Lenoble',
-        'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
-    })
-    solar_potential = solar_potential.compute()
-    safe_to_zarr(solar_potential, path_scf)
-    print("Written scf to", path_scf)
+        solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
+        solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
+        solar_potential['scf'] = solar_potential['scf'].astype('f4')
+        solar_potential.attrs.update({
+            'DESCRIPTION': f'scf on native {reanalysis} grid',
+            'units': 'dimensionless',
+            'long_name': 'PVtot potential',
+            'SOURCE': 'calculate_ds_cf_reanalysis',
+            'AUTHOR': 'Colin Lenoble',
+            'MODEL': 'PVGIS relative efficiency + Faiman module temperature (calculate_wind_solar_cf.py)',
+        })
+        solar_potential = solar_potential.compute()
+        safe_to_zarr(solar_potential, path_scf)
+        print("Written scf to", path_scf)
+        solar_potential.close()
 
     # 5. Wind potential (wcf), using a per-pixel local shear exponent fit
     #    from reanalysis 10 m/100 m wind over the reference period.
-    print("Computing wind potential (wcf)...")
-    alpha_native = get_local_shear_exponent(era5_file_pattern, path_preprocessed, shear_ref_period)
-    alpha = regrid_alpha_to_grid(alpha_native, dref)
-    wind_pot = compute_wind_potential(dref['sfcWind'], alpha, cfg)
+    if os.path.exists(path_wcf):
+        print("wcf file already exists, skipping:", path_wcf)
+    else:
+        print("Computing wind potential (wcf)...")
+        alpha_native = get_local_shear_exponent(era5_file_pattern, path_preprocessed, shear_ref_period)
+        alpha = regrid_alpha_to_grid(alpha_native, dref)
+        wind_pot = compute_wind_potential(dref['sfcWind'], alpha, cfg)
 
-    wind_potential = wind_pot.to_dataset(name='wcf')
-    wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
-    wind_potential['wcf'] = wind_potential['wcf'].astype('f4')
-    wind_potential.attrs.update({
-        'DESCRIPTION': f'wcf on native {reanalysis} grid',
-        'units': 'dimensionless',
-        'long_name': 'Wind potential',
-        'SOURCE': 'calculate_ds_cf_reanalysis',
-        'AUTHOR': 'Colin Lenoble',
-    })
-    wind_potential = wind_potential.compute()
-    safe_to_zarr(wind_potential, path_wcf)
-    print("Written wcf to", path_wcf)
+        wind_potential = wind_pot.to_dataset(name='wcf')
+        wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
+        wind_potential['wcf'] = wind_potential['wcf'].astype('f4')
+        wind_potential.attrs.update({
+            'DESCRIPTION': f'wcf on native {reanalysis} grid',
+            'units': 'dimensionless',
+            'long_name': 'Wind potential',
+            'SOURCE': 'calculate_ds_cf_reanalysis',
+            'AUTHOR': 'Colin Lenoble',
+        })
+        wind_potential = wind_potential.compute()
+        safe_to_zarr(wind_potential, path_wcf)
+        print("Written wcf to", path_wcf)
+        wind_potential.close()
 
-    solar_potential.close()
-    wind_potential.close()
     dref.close()
     gc.collect()
     print("Reanalysis DS_CF files saved:", path_scf, path_wcf)
