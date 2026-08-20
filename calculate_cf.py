@@ -613,6 +613,23 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 # DS_CF calculation
 # -------------------------
 
+def _standardize_reanalysis_names(ds):
+    """
+    Rename raw ERA5 dims/vars (latitude/longitude/valid_time/t2m/ssrd) to
+    the CF-ish names used downstream (lat/lon/time/tas/rsds). u10/v10 are
+    left as-is since they're combined into sfcWind later. No-op for
+    datasets that already use the target names.
+    """
+    rename = {}
+    for src, dst in (
+        ('latitude', 'lat'), ('longitude', 'lon'), ('valid_time', 'time'),
+        ('t2m', 'tas'), ('ssrd', 'rsds'),
+    ):
+        if src in ds.dims or src in ds.variables:
+            rename[src] = dst
+    return ds.rename(rename) if rename else ds
+
+
 def calculate_ds_cf_reanalysis_grid_GCM(
     GCM, run, ssp,
     path_preprocessed, path_folder,
@@ -663,8 +680,11 @@ def calculate_ds_cf_reanalysis_grid_GCM(
     print(f"Found {len(files_ref)} reanalysis files for {reanalysis}")
     dref = open_mfdataset_any(
         files_ref, combine='by_coords',
-        chunks={'time': -1, 'lat': 100, 'lon': 100}, parallel=True
+        chunks={'time': -1, 'lat': 100, 'lon': 100,
+                'valid_time': -1, 'latitude': 100, 'longitude': 100},
+        parallel=True
     )
+    dref = _standardize_reanalysis_names(dref)
     dref = dref.sortby('lat').sortby('lon').sortby('time')
 
     for v in ('tas', 'rsds'):
@@ -883,8 +903,11 @@ def calculate_ds_cf_reanalysis(
 
     dref = open_mfdataset_any(
         files_ref, combine='by_coords',
-        chunks={'time': -1, 'lat': 100, 'lon': 100}, parallel=True,
+        chunks={'time': -1, 'lat': 100, 'lon': 100,
+                'valid_time': -1, 'latitude': 100, 'longitude': 100},
+        parallel=True,
     )
+    dref = _standardize_reanalysis_names(dref)
     dref = dref.sortby('lat').sortby('lon').sortby('time')
 
     for v in ('tas', 'rsds'):
