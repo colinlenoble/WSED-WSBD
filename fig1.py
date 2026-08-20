@@ -137,6 +137,8 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
     chunks   = {"time": 1000, "lat": -1, "lon": -1}
     wcf = open_dataset_any(wcf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
     scf = open_dataset_any(scf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
+    wcf = wcf.convert_calendar("standard")
+    scf = scf.convert_calendar("standard")
 
     print(f"  Computing thresholds (quantile={thr}, ref={ref_start}-{ref_end})  ")
     wcf_ref = wcf.sel(time=slice(ref_start, ref_end))
@@ -148,9 +150,6 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
     wcf["low_wind"]  = xr.where(wcf.wcf >= wcf_thr, 1, 0)
     scf["low_solar"] = xr.where(scf.scf >= scf_thr, 1, 0)
     compound = (wcf.low_wind * scf.low_solar).to_dataset(name="start_cooc")
-    compound = compound.convert_calendar("standard")
-    wcf      = wcf.convert_calendar("standard")
-    scf      = scf.convert_calendar("standard")
 
     print("  Computing severity  ")
     severity_ds = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr)
