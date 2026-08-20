@@ -242,7 +242,7 @@ def build_land_mask(ds_final, shapefile_path):
     )
     mask = rasterize_shapefile(shapefile, da.shape, transform)
     mask = mask[::-1, :]
-    mask_update = ds_final.duration.isnull()
+    mask_update = ds_final.isel(year=0).duration.isnull() if "year" in ds_final.dims else ds_final.duration.isnull()
     mask = mask & (~mask_update)
     return mask
 
