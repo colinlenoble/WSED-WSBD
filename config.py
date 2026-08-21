@@ -39,6 +39,12 @@ SUMMARY_FIGS_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures
 # calculate_ds_cf_reanalysis (native reanalysis grid, no target GCM).
 ERA5_WIND_PATTERN = '/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_raw/ERA5/ERA5_daily_*.zarr'
 
+# Regridded ERA5 archive (W5E5 0.5 deg grid, Zarr format 2; u10/v10/u100/
+# v100/t2m/ssrd -- see regrid_era5_to_w5e5.py + convert_regrid_to_zarr2.py).
+# Used by compare_wind_methods.py to compare the three DS_CFConfig.wind_method
+# options (needs u100/v100 for the 'wind100' method).
+ERA5_REGRID_ZARR2_DIR = '/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_raw/ERA5/'
+
 # Folder holding one precomputed local shear exponent file per target GCM,
 # already regridded to that GCM's own native grid: shear_by_gcm/shear_exponent_{GCM}_{start}_{end}.nc
 # (see shear_by_gcm/compute_shear_by_gcm.py). Used by calculate_ds_cf_GCM and

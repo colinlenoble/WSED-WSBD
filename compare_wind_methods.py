@@ -6,10 +6,13 @@ against each other on real ERA5 data, treating wind100 -- the reanalysis
 shear_local (per-pixel fitted Hellmann exponent) and shear_uniform (single
 global exponent, default 1/7) are checked against.
 
-Source data: E:/climate_data/ERA5/daily_regrid_zarr2 (W5E5 0.5 deg grid,
-Zarr format 2, has u10/v10/u100/v100/t2m/ssrd -- see
+Source data: config.ERA5_REGRID_ZARR2_DIR (W5E5 0.5 deg grid, Zarr format 2,
+has u10/v10/u100/v100/t2m/ssrd -- see regrid_era5_to_w5e5.py +
 convert_regrid_to_zarr2.py), so all three methods see exactly the same
 input and only the wcf formula differs.
+
+All paths default from config.py -- edit that file (not the constants here)
+to point at wherever this runs (HPC, local machine, ...).
 
 Runs without xesmf/xclim/xagg. wind_potential.py and compute_solar_cf.py
 are already dependency-light and imported directly; two short formulas
@@ -41,6 +44,7 @@ import pandas as pd
 import xarray as xr
 from scipy import stats
 
+import config
 from wind_potential import DS_CFConfig, get_hub_height_wind, compute_wind_potential_from_hub_wind
 from compute_solar_cf import compute_solar_cf, DEFAULT_PVGIS_COEFFICIENTS
 
@@ -52,18 +56,35 @@ try:
 except ImportError:
     _HAS_MASKING = False
 
-SRC_DIR = r"E:/climate_data/ERA5/daily_regrid_zarr2"
-ALPHA_PATH = r"E:/climate_data/ERA5/shear_exponent_local_1982-01-01_2001-12-31.nc"
-SHAPEFILE_PATH = r"C:/Users/colin/Documents/These/Recherche/Compound_ER/shapefiles/final_shp/shp_re.shp"
-OUT_DIR = r"C:/Users/colin/Documents/These/Recherche/Compound_ER/preliminaries_figs/wind_method_comparison"
-
-REF_PERIOD = ("1982-01-01", "2001-12-31")  # matches config.SHEAR_REF_PERIOD
 # Seconds per daily ssrd accumulation step -- mirrors
 # calculate_cf.ERA5_SSRD_ACCUM_SECONDS / _standardize_reanalysis_names.
 ERA5_SSRD_ACCUM_SECONDS = 86400.0
 
 METHODS = ["wind100", "shear_uniform", "shear_local"]
 REFERENCE_METHOD = "wind100"
+
+
+def local_shear_alpha_path(path_preprocessed, path_folder, ref_period):
+    """
+    Path to the cached local shear exponent file, mirroring
+    calculate_cf.get_local_shear_exponent's naming/fallback convention:
+    checked first under path_preprocessed/ERA5/, then under path_folder/ERA5/
+    (in case it was fit and left alongside the raw reanalysis archive
+    instead of the preprocessed one). Always under an 'ERA5' subfolder --
+    the shear exponent is fit from ERA5's own 10 m/100 m wind regardless of
+    config.REANALYSIS, matching get_local_shear_exponent's hardcoded path.
+    """
+    fname = f"shear_exponent_local_{ref_period[0]}_{ref_period[1]}.nc"
+    preferred = os.path.join(path_preprocessed, "ERA5", fname)
+    if os.path.exists(preferred):
+        return preferred
+    fallback = os.path.join(path_folder, "ERA5", fname)
+    if os.path.exists(fallback):
+        return fallback
+    raise FileNotFoundError(
+        f"No cached local shear exponent at {preferred} or {fallback} -- "
+        "run compute_era5_regrid_shear.py (or calculate_cf.get_local_shear_exponent) first."
+    )
 
 
 def load_reanalysis(src_dir, limit=None):
@@ -160,13 +181,23 @@ def r2_score(y_true, y_pred):
 
 
 def main():
+    default_out_dir = os.path.join(config.SUMMARY_FIGS_DIR, "wind_method_comparison")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src_dir", default=SRC_DIR)
-    ap.add_argument("--alpha_path", default=ALPHA_PATH)
-    ap.add_argument("--shapefile", default=SHAPEFILE_PATH)
-    ap.add_argument("--out_dir", default=OUT_DIR)
-    ap.add_argument("--ref_start", default=REF_PERIOD[0])
-    ap.add_argument("--ref_end", default=REF_PERIOD[1])
+    ap.add_argument("--src_dir", default=config.ERA5_REGRID_ZARR2_DIR,
+                    help="regridded ERA5 archive, W5E5 grid, Zarr format 2 (default: config.ERA5_REGRID_ZARR2_DIR)")
+    ap.add_argument("--path_folder", default=config.PATH_FOLDER,
+                    help="fallback root for the cached shear exponent (default: config.PATH_FOLDER)")
+    ap.add_argument("--path_preprocessed", default=config.PATH_PREPROCESSED,
+                    help="preferred root for the cached shear exponent (default: config.PATH_PREPROCESSED)")
+    ap.add_argument("--alpha_path", default=None,
+                    help="cached local shear exponent .nc; default derived from "
+                         "--path_preprocessed/--path_folder + --ref_start/--ref_end "
+                         "(see local_shear_alpha_path)")
+    ap.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
+    ap.add_argument("--out_dir", default=default_out_dir)
+    ap.add_argument("--reanalysis", default=config.REANALYSIS)
+    ap.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
+    ap.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
     ap.add_argument("--quantile", type=float, default=0.1, help="low-wind/low-solar event threshold (fraction)")
     ap.add_argument("--limit", type=int, default=None, help="only load the first N monthly stores (for testing)")
     ap.add_argument("--no_mask", action="store_true", help="skip the land/region shapefile mask")
@@ -183,8 +214,10 @@ def main():
     elif not args.no_mask:
         print("Shapefile masking unavailable/not found -- using the full grid.")
 
-    print("Loading alpha (local shear exponent):", args.alpha_path)
-    alpha = xr.open_dataset(args.alpha_path)["alpha"]
+    alpha_path = args.alpha_path or local_shear_alpha_path(
+        args.path_preprocessed, args.path_folder, ref_period)
+    print("Loading alpha (local shear exponent):", alpha_path)
+    alpha = xr.open_dataset(alpha_path)["alpha"]
     alpha = alpha.reindex(latitude=ds["latitude"], longitude=ds["longitude"],
                           method="nearest", tolerance=1e-6)
 
