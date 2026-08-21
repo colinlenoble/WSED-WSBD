@@ -127,8 +127,8 @@ def main():
 
     # --- 3. Compound flag direction / frequency ---------------------------------
     print("\nDetecting compound events")
-    wcf["low_wind"] = xr.where(wcf.wcf >= wcf_thr, 1, 0)
-    scf["low_solar"] = xr.where(scf.scf >= scf_thr, 1, 0)
+    wcf["low_wind"] = xr.where(wcf.wcf <= wcf_thr, 1, 0)
+    scf["low_solar"] = xr.where(scf.scf <= scf_thr, 1, 0)
     frac_low_wind = float(wcf["low_wind"].mean().compute())
     frac_low_solar = float(scf["low_solar"].mean().compute())
     print(f"  fraction of (day,pixel) flagged low_wind:  {frac_low_wind:.3f}")

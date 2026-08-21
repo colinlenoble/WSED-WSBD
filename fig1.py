@@ -175,8 +175,8 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
     scf_thr = scf_ref.scf.where(scf_ref.scf > 0).quantile(thr, dim="time")
 
     print("  Detecting compound events  ")
-    wcf["low_wind"]  = xr.where(wcf.wcf >= wcf_thr, 1, 0)
-    scf["low_solar"] = xr.where(scf.scf >= scf_thr, 1, 0)
+    wcf["low_wind"]  = xr.where(wcf.wcf <= wcf_thr, 1, 0)
+    scf["low_solar"] = xr.where(scf.scf <= scf_thr, 1, 0)
     compound = (wcf.low_wind * scf.low_solar).to_dataset(name="start_cooc")
 
     land_mask = build_land_mask_from_grid(compound.lat.values, compound.lon.values,
