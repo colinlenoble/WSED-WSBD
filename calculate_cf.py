@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import glob as glob
 import gc
-from dataclasses import dataclass
 from xclim import sdba
 from dask import delayed, compute
 import geopandas as gpd
@@ -27,43 +26,14 @@ from io_utils import (
 from fit_local_shear import fit_local_shear
 from compute_solar_cf import compute_solar_cf, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS
 
-# -------------------------
-# DS_CF physical constants
-# -------------------------
-
-@dataclass
-class DS_CFConfig:
-    """
-    Physical constants for the wind potential calculation.
-
-    Solar potential uses the PVGIS relative-efficiency + Faiman
-    module-temperature model instead (see compute_solar_cf, imported from
-    calculate_wind_solar_cf.py; pass a PVGISCoefficients instance as pv_cfg
-    to the calculate_ds_cf_* functions below).
-
-    Wind power curve parameters
-    ---------------------------
-    vr  : rated wind speed (m/s) turbine reaches full output above this
-    vci : cut-in wind speed (m/s) turbine starts generating below this
-    vco : cut-out wind speed (m/s) turbine shuts down above this
-    ref_height : height (m) of the input wind speed (reanalysis/GCM 10 m wind)
-    hub_height : height (m) the wind speed is extrapolated to, using a
-                 per-pixel Hellmann shear exponent fit from reanalysis
-                 100 m/10 m wind (see fit_local_shear / get_local_shear_exponent
-                 below). Defaults to 100 m to match the height that fit
-                 calibrates against -- using a different hub_height applies
-                 the exponent beyond the height it was fit for.
-    """
-    # Wind turbine curve
-    vr:  float = 13.0
-    vci: float = 3.5
-    vco: float = 25.0
-    ref_height: float = 10.0
-    hub_height: float = 100.0
-
-
-# Default config instance can be overridden at call sites
-DEFAULT_DS_CF_CONFIG = DS_CFConfig()
+# Wind capacity-factor physics (power curve + the three wind_method
+# extrapolation strategies) -- kept dependency-light (numpy/xarray only,
+# same rationale as io_utils.py) in its own module so it can be imported
+# by scripts that don't want xesmf/xclim/xagg (e.g. compare_wind_methods.py).
+from wind_potential import (
+    WIND_METHODS, DS_CFConfig, DEFAULT_DS_CF_CONFIG,
+    compute_wind_potential_from_hub_wind, get_hub_height_wind, compute_wind_potential,
+)
 
 
 # -------------------------
@@ -239,24 +209,6 @@ def get_gcm_shear_exponent(GCM, shear_by_gcm_dir, target_grid,
             f"the target grid {expected_shape} -- refit with compute_shear_by_gcm.py."
         )
     return alpha.assign_coords(lat=target_grid['lat'], lon=target_grid['lon'])
-
-
-def compute_wind_potential(sfcwind, alpha, cfg):
-    """
-    Wind capacity factor: extrapolate sfcwind from cfg.ref_height to
-    cfg.hub_height using the per-pixel Hellmann exponent alpha, then apply
-    the cubic power curve between cut-in and rated speed.
-    """
-    wind_hub = sfcwind * (cfg.hub_height / cfg.ref_height) ** alpha
-    wind_pot = xr.where(wind_hub < cfg.vci, 0, wind_hub)
-    wind_pot = xr.where(wind_pot >= cfg.vco, 0, wind_pot)
-    wind_pot = xr.where((wind_pot >= cfg.vr) & (wind_pot < cfg.vco), 1, wind_pot)
-    wind_pot = xr.where(
-        (wind_pot >= cfg.vci) & (wind_pot < cfg.vr),
-        (wind_pot**3 - cfg.vci**3) / (cfg.vr**3 - cfg.vci**3),
-        wind_pot
-    )
-    return wind_pot
 
 
 # -------------------------
@@ -678,7 +630,11 @@ def calculate_ds_cf_reanalysis_grid_GCM(
 
     out_folder = os.path.join(path_preprocessed, GCM)
     os.makedirs(out_folder, exist_ok=True)
-    path_wcf_ref = os.path.join(out_folder, f"wcf_ref_{GCM}_{reanalysis}.zarr")
+    # wind_method is tagged onto the wcf filename so the three methods don't
+    # overwrite each other; 'shear_local' (the original default) keeps the
+    # untagged name for backward compatibility -- see calculate_ds_cf_reanalysis.
+    wcf_suffix = '' if cfg.wind_method == 'shear_local' else f'_{cfg.wind_method}'
+    path_wcf_ref = os.path.join(out_folder, f"wcf_ref_{GCM}_{reanalysis}{wcf_suffix}.zarr")
     path_scf_ref = os.path.join(out_folder, f"scf_ref_{GCM}_{reanalysis}.zarr")
 
     if os.path.exists(path_wcf_ref) and os.path.exists(path_scf_ref):
@@ -720,7 +676,15 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         print("Computing sfcWind from u10/v10")
         dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
 
-    dref = dref[['tas', 'rsds', 'sfcWind']]
+    keep_vars = ['tas', 'rsds', 'sfcWind']
+    if cfg.wind_method == 'wind100':
+        if not {'u100', 'v100'}.issubset(dref.data_vars):
+            raise KeyError(
+                "wind_method='wind100' requires 'u100'/'v100' in the reanalysis "
+                f"files matched under {os.path.join(path_folder, reanalysis)}"
+            )
+        keep_vars += ['u100', 'v100']
+    dref = dref[keep_vars]
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
 
     # 3. Optional shapefile mask (before regrid)
@@ -787,14 +751,22 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         print("Written scf to", path_scf_ref)
         solar_potential.close()
 
-    # 6. Wind potential (wcf), using the per-pixel local shear exponent
-    #    precomputed on GCM's own native grid (see get_gcm_shear_exponent).
+    # 6. Wind potential (wcf). cfg.wind_method selects how ref_height wind is
+    #    turned into hub_height wind (see get_hub_height_wind): a per-pixel
+    #    shear exponent precomputed on GCM's own native grid (default,
+    #    'shear_local' -- see get_gcm_shear_exponent), a single global
+    #    exponent ('shear_uniform'), or the reanalysis 100 m wind read
+    #    directly, regridded to the GCM grid alongside sfcWind ('wind100').
     if os.path.exists(path_wcf_ref):
         print("wcf file already exists, skipping:", path_wcf_ref)
     else:
-        print("Computing wind potential (wcf)...")
-        alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, gcm_grid, shear_ref_period)
-        wind_pot = compute_wind_potential(dref_rg['sfcWind'], alpha, cfg)
+        print(f"Computing wind potential (wcf), wind_method={cfg.wind_method!r}...")
+        if cfg.wind_method == 'shear_local':
+            alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, gcm_grid, shear_ref_period)
+        else:
+            alpha = None
+        wind_hub = get_hub_height_wind(dref_rg, cfg, alpha=alpha)
+        wind_pot = compute_wind_potential_from_hub_wind(wind_hub, cfg)
 
         wind_potential = wind_pot.to_dataset(name='wcf')
         wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -805,6 +777,8 @@ def calculate_ds_cf_reanalysis_grid_GCM(
             'long_name': 'Wind potential',
             'SOURCE': 'calculate_ds_cf_reanalysis_grid_GCM',
             'AUTHOR': 'Colin Lenoble',
+            'wind_method': cfg.wind_method,
+            'uniform_shear_exponent': cfg.uniform_shear_exponent if cfg.wind_method == 'shear_uniform' else 'n/a',
         })
         wind_potential = wind_potential.compute()
         safe_to_zarr(wind_potential, path_wcf_ref)
@@ -839,8 +813,12 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
         raise FileNotFoundError(f"No dadjusted file found for pattern: {ds_path_base}.[nc|zarr]")
     ds = open_dataset_any(ds_files[0])
 
+    # wind_method is tagged onto the wcf filename so the three methods don't
+    # overwrite each other; 'shear_local' (the original default) keeps the
+    # untagged name for backward compatibility -- see calculate_ds_cf_reanalysis.
+    wcf_suffix = '' if cfg.wind_method == 'shear_local' else f'_{cfg.wind_method}'
     wcf_path = os.path.join(path_preprocessed, GCM,
-                            f"wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.zarr")
+                            f"wcf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}{wcf_suffix}.zarr")
     scf_path = os.path.join(path_preprocessed, GCM,
                             f"scf_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.zarr")
 
@@ -866,10 +844,18 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
     })
     safe_to_zarr(solar_xr, scf_path)
 
-    # Wind potential, using the per-pixel local shear exponent precomputed
-    # on GCM's own native grid (see get_gcm_shear_exponent).
-    alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, ds, shear_ref_period)
-    wind_pot = compute_wind_potential(ds['sfcWind'], alpha, cfg)
+    # Wind potential. cfg.wind_method selects how sfcWind is turned into
+    # hub-height wind (see get_hub_height_wind): a per-pixel shear exponent
+    # precomputed on GCM's own native grid (default, 'shear_local' -- see
+    # get_gcm_shear_exponent) or a single global exponent ('shear_uniform').
+    # 'wind100' isn't available here -- the bias-corrected dadjusted_* file
+    # only carries tas/rsds/sfcWind, no 100 m wind -- and raises accordingly.
+    if cfg.wind_method == 'shear_local':
+        alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, ds, shear_ref_period)
+    else:
+        alpha = None
+    wind_hub = get_hub_height_wind(ds, cfg, alpha=alpha)
+    wind_pot = compute_wind_potential_from_hub_wind(wind_hub, cfg)
 
     wind_xr = wind_pot.to_dataset(name='wcf')
     wind_xr = wind_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -878,6 +864,8 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
         'DESCRIPTION': f"{GCM} wind potential",
         'units': 'dimensionless', 'long_name': 'Wind potential',
         'SOURCE': 'calculate_ds_cf_GCM_dask.py', 'AUTHOR': 'Colin Lenoble', 'corrected': 1,
+        'wind_method': cfg.wind_method,
+        'uniform_shear_exponent': cfg.uniform_shear_exponent if cfg.wind_method == 'shear_uniform' else 'n/a',
     })
     safe_to_zarr(wind_xr, wcf_path)
 
@@ -891,7 +879,7 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
 def calculate_ds_cf_reanalysis(
     path_folder,
     path_preprocessed,
-    era5_file_pattern,
+    era5_file_pattern=None,
     reanalysis='ERA5',
     shapefile_path=None,
     cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
@@ -906,8 +894,10 @@ def calculate_ds_cf_reanalysis(
 
     era5_file_pattern : glob pattern for the reanalysis 10 m/100 m wind files
                         used to fit the local shear exponent (see
-                        get_local_shear_exponent). Only needed the first
-                        time -- ignored once that fit is cached.
+                        get_local_shear_exponent). Only needed for
+                        cfg.wind_method='shear_local' (the default), and
+                        ignored once that fit is cached; 'shear_uniform' and
+                        'wind100' don't need it.
 
     Outputs
     -------
@@ -916,7 +906,12 @@ def calculate_ds_cf_reanalysis(
     """
     out_folder = os.path.join(path_preprocessed, reanalysis)
     os.makedirs(out_folder, exist_ok=True)
-    path_wcf = os.path.join(out_folder, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231.zarr")
+    # wind_method is tagged onto the wcf filename so the three methods don't
+    # overwrite each other; 'shear_local' (the original default) keeps the
+    # untagged name for backward compatibility with already-cached files and
+    # downstream globs (e.g. make_grid_files.py's wcf_day_* pattern).
+    wcf_suffix = '' if cfg.wind_method == 'shear_local' else f'_{cfg.wind_method}'
+    path_wcf = os.path.join(out_folder, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231{wcf_suffix}.zarr")
     path_scf = os.path.join(out_folder, f"scf_day_{reanalysis}_historical_reanalysis_19790101-20191231.zarr")
 
     if os.path.exists(path_wcf) and os.path.exists(path_scf):
@@ -946,7 +941,15 @@ def calculate_ds_cf_reanalysis(
         print("Computing sfcWind from u10/v10")
         dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
 
-    dref = dref[['tas', 'rsds', 'sfcWind']]
+    keep_vars = ['tas', 'rsds', 'sfcWind']
+    if cfg.wind_method == 'wind100':
+        if not {'u100', 'v100'}.issubset(dref.data_vars):
+            raise KeyError(
+                "wind_method='wind100' requires 'u100'/'v100' in the reanalysis "
+                f"files matched under {os.path.join(path_folder, reanalysis)}"
+            )
+        keep_vars += ['u100', 'v100']
+    dref = dref[keep_vars]
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
 
     # 2. Optional shapefile mask
@@ -1001,15 +1004,23 @@ def calculate_ds_cf_reanalysis(
         print("Written scf to", path_scf)
         solar_potential.close()
 
-    # 5. Wind potential (wcf), using a per-pixel local shear exponent fit
-    #    from reanalysis 10 m/100 m wind over the reference period.
+    # 5. Wind potential (wcf). cfg.wind_method selects how ref_height wind is
+    #    turned into hub_height wind before the power curve (see
+    #    get_hub_height_wind): a per-pixel local shear exponent fit from
+    #    reanalysis 10 m/100 m wind (default, 'shear_local'), a single global
+    #    Hellmann exponent ('shear_uniform'), or the reanalysis 100 m wind
+    #    read directly, no extrapolation ('wind100').
     if os.path.exists(path_wcf):
         print("wcf file already exists, skipping:", path_wcf)
     else:
-        print("Computing wind potential (wcf)...")
-        alpha_native = get_local_shear_exponent(era5_file_pattern, path_preprocessed, shear_ref_period)
-        alpha = regrid_alpha_to_grid(alpha_native, dref)
-        wind_pot = compute_wind_potential(dref['sfcWind'], alpha, cfg)
+        print(f"Computing wind potential (wcf), wind_method={cfg.wind_method!r}...")
+        if cfg.wind_method == 'shear_local':
+            alpha_native = get_local_shear_exponent(era5_file_pattern, path_preprocessed, shear_ref_period)
+            alpha = regrid_alpha_to_grid(alpha_native, dref)
+        else:
+            alpha = None
+        wind_hub = get_hub_height_wind(dref, cfg, alpha=alpha)
+        wind_pot = compute_wind_potential_from_hub_wind(wind_hub, cfg)
 
         wind_potential = wind_pot.to_dataset(name='wcf')
         wind_potential = wind_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -1020,6 +1031,8 @@ def calculate_ds_cf_reanalysis(
             'long_name': 'Wind potential',
             'SOURCE': 'calculate_ds_cf_reanalysis',
             'AUTHOR': 'Colin Lenoble',
+            'wind_method': cfg.wind_method,
+            'uniform_shear_exponent': cfg.uniform_shear_exponent if cfg.wind_method == 'shear_uniform' else 'n/a',
         })
         wind_potential = wind_potential.compute()
         safe_to_zarr(wind_potential, path_wcf)
