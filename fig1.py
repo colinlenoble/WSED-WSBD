@@ -304,6 +304,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
     y0, y1 = period_hist
     y2, y3 = period_comp
     years_all  = da.sel(year=slice(y0, y3)).year.values.astype(float)
+    n_years    = len(years_all)
     da_hist    = da.sel(year=slice(y0, y1)).mean("year", skipna=True)
     da_comp    = da.sel(year=slice(y2, y3)).mean("year", skipna=True)
     rel_change = 100.0 * (da_comp - da_hist) / da_hist
@@ -420,7 +421,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
                         year=slice(y0, y3))
         ts     = da_reg.mean(("lat", "lon"), skipna=True).values
         mean_slope, mean_intercept, low_vals, up_vals = stationary_bootstrap_ci_1d(
-            ts, np.arange(y3 - y0 + 1), n_boot=n_boot, block_size=3, ci=95,
+            ts, np.arange(n_years), n_boot=n_boot, block_size=3, ci=95,
         )
 
         # Map box (unchanged)
@@ -442,7 +443,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         region_panels.append(dict(
             label=panellabels[ridx], name=reg["name"],
             years=years_all, ts=ts,
-            fit_line=mean_intercept + mean_slope * np.arange(y3 - y0 + 1),
+            fit_line=mean_intercept + mean_slope * np.arange(n_years),
             low_line=low_vals, up_line=up_vals,
         ))
 
