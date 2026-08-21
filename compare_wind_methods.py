@@ -180,6 +180,60 @@ def r2_score(y_true, y_pred):
     return float(r2), int(y_true.size)
 
 
+def plot_discrepancy_maps(mean_severity, other_methods, out_dir, axis_thr=1e-6):
+    """
+    For each non-reference method, map (method - wind100) long-term mean
+    severity (diverging colormap), with the "axis" mismatches from the R2
+    scatter -- pixels sitting on the x or y axis because one method reports
+    ~0 severity there (no compound day ever crossed that pixel's
+    reference-period threshold) while the other reports a nonzero value --
+    marked explicitly, split by direction. Plain lat/lon pcolormesh (no
+    cartopy) to avoid a dependency that may need network access for
+    coastline data on a compute node.
+
+    Returns {method: (n_axis_x, n_axis_y)} -- axis_x = method > 0 where
+    wind100 ~ 0 (method sees severity wind100 misses), axis_y = wind100 > 0
+    where method ~ 0 (method misses severity wind100 sees).
+    """
+    ref = mean_severity[REFERENCE_METHOD]
+    lat = ref["latitude"].values
+    lon = ref["longitude"].values
+    ref_vals = ref.values
+
+    counts = {}
+    fig, axes = plt.subplots(1, len(other_methods), figsize=(7 * len(other_methods), 5.5), squeeze=False)
+    axes = axes[0]
+    for ax, method in zip(axes, other_methods):
+        method_vals = mean_severity[method].values
+        diff = method_vals - ref_vals
+
+        vmax = np.nanpercentile(np.abs(diff), 99)
+        vmax = vmax if vmax > 0 else 1e-6
+        im = ax.pcolormesh(lon, lat, diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+
+        axis_x = (ref_vals <= axis_thr) & (method_vals > axis_thr)
+        axis_y = (ref_vals > axis_thr) & (method_vals <= axis_thr)
+        counts[method] = (int(np.nansum(axis_x)), int(np.nansum(axis_y)))
+
+        lon2d, lat2d = np.meshgrid(lon, lat)
+        ax.scatter(lon2d[axis_x], lat2d[axis_x], s=8, facecolor="none", edgecolor="crimson",
+                  linewidth=0.8, marker="o", label=f"{method}>0, {REFERENCE_METHOD}~0 (n={counts[method][0]})")
+        ax.scatter(lon2d[axis_y], lat2d[axis_y], s=8, facecolor="none", edgecolor="lime",
+                  linewidth=0.8, marker="s", label=f"{REFERENCE_METHOD}>0, {method}~0 (n={counts[method][1]})")
+
+        ax.set_title(f"{method} - {REFERENCE_METHOD} (mean severity)")
+        ax.set_xlabel("longitude")
+        ax.set_ylabel("latitude")
+        ax.legend(loc="lower left", fontsize=7, markerscale=1.5)
+        fig.colorbar(im, ax=ax, orientation="horizontal", pad=0.1, shrink=0.8, label="severity difference")
+
+    fig.tight_layout()
+    fig_path = os.path.join(out_dir, "severity_discrepancy_map.png")
+    fig.savefig(fig_path, dpi=150)
+    print("Wrote", fig_path)
+    return counts
+
+
 def main():
     default_out_dir = os.path.join(config.SUMMARY_FIGS_DIR, "wind_method_comparison")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -195,7 +249,6 @@ def main():
                          "(see local_shear_alpha_path)")
     ap.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
     ap.add_argument("--out_dir", default=default_out_dir)
-    ap.add_argument("--reanalysis", default=config.REANALYSIS)
     ap.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
     ap.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
     ap.add_argument("--quantile", type=float, default=0.1, help="low-wind/low-solar event threshold (fraction)")
@@ -263,6 +316,15 @@ def main():
     print("Wrote", r2_fig_path)
 
     # ------------------------------------------------------------------
+    # 1b. Map of where the discrepancy is largest -- the axis-hugging
+    #     points in the R2 scatter above, located geographically.
+    # ------------------------------------------------------------------
+    axis_counts = plot_discrepancy_maps(mean_severity, other_methods, args.out_dir)
+    for method, (n_x, n_y) in axis_counts.items():
+        print(f"{method}: {n_x} pixels with {method}>0/{REFERENCE_METHOD}~0, "
+              f"{n_y} pixels with {REFERENCE_METHOD}>0/{method}~0")
+
+    # ------------------------------------------------------------------
     # 2. Spearman: per-pixel relative change in mean severity,
     #    ref_period -> rest of record, method vs wind100
     # ------------------------------------------------------------------
@@ -308,6 +370,8 @@ def main():
         "spearman_rho_relchange_vs_wind100": [spearman_results[m][0] for m in other_methods],
         "spearman_pvalue": [spearman_results[m][1] for m in other_methods],
         "n_pixels": [spearman_results[m][2] for m in other_methods],
+        "n_axis_x_method_gt0_wind100_0": [axis_counts[m][0] for m in other_methods],
+        "n_axis_y_wind100_gt0_method_0": [axis_counts[m][1] for m in other_methods],
     })
     summary_path = os.path.join(args.out_dir, "wind_method_comparison_summary.csv")
     summary.to_csv(summary_path, index=False)
