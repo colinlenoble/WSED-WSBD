@@ -234,6 +234,52 @@ def plot_discrepancy_maps(mean_severity, other_methods, out_dir, axis_thr=1e-6):
     return counts
 
 
+def plot_relative_discrepancy_maps(mean_severity, other_methods, out_dir, zero_thr=1e-6, pct_clip=99):
+    """
+    For each non-reference method, map the relative difference in long-term
+    mean severity, (method - wind100) / wind100 in percent. Both panels
+    share one colorbar (scale set from the pooled pct_clip percentile of
+    |relative difference| across all methods), so the two comparisons are
+    directly comparable rather than each auto-scaled to its own range.
+
+    Pixels where wind100 ~ 0 are masked (NaN, left blank) -- the relative
+    difference is undefined/blows up there; see plot_discrepancy_maps for
+    the absolute map, which covers those pixels via the axis-mismatch
+    markers instead.
+    """
+    ref = mean_severity[REFERENCE_METHOD]
+    lat = ref["latitude"].values
+    lon = ref["longitude"].values
+    ref_vals = ref.values
+
+    rel_diff = {}
+    for method in other_methods:
+        method_vals = mean_severity[method].values
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rd = np.where(ref_vals > zero_thr, (method_vals - ref_vals) / ref_vals * 100.0, np.nan)
+        rel_diff[method] = rd
+
+    pooled = np.concatenate([rd[np.isfinite(rd)] for rd in rel_diff.values()])
+    vmax = np.nanpercentile(np.abs(pooled), pct_clip) if pooled.size else 1.0
+    vmax = vmax if vmax > 0 else 1.0
+
+    fig, axes = plt.subplots(1, len(other_methods), figsize=(7 * len(other_methods), 5.5), squeeze=False)
+    axes = axes[0]
+    im = None
+    for ax, method in zip(axes, other_methods):
+        im = ax.pcolormesh(lon, lat, rel_diff[method], cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+        ax.set_title(f"{method} vs {REFERENCE_METHOD}: relative difference in mean severity")
+        ax.set_xlabel("longitude")
+        ax.set_ylabel("latitude")
+
+    fig.colorbar(im, ax=list(axes), orientation="horizontal", pad=0.12, shrink=0.6,
+                label=f"relative difference (%), shared scale clipped at pct{pct_clip}=+-{vmax:.0f}%")
+    fig_path = os.path.join(out_dir, "severity_relative_discrepancy_map.png")
+    fig.savefig(fig_path, dpi=150)
+    print("Wrote", fig_path)
+    return rel_diff
+
+
 def main():
     default_out_dir = os.path.join(config.SUMMARY_FIGS_DIR, "wind_method_comparison")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -323,6 +369,8 @@ def main():
     for method, (n_x, n_y) in axis_counts.items():
         print(f"{method}: {n_x} pixels with {method}>0/{REFERENCE_METHOD}~0, "
               f"{n_y} pixels with {REFERENCE_METHOD}>0/{method}~0")
+
+    plot_relative_discrepancy_maps(mean_severity, other_methods, args.out_dir)
 
     # ------------------------------------------------------------------
     # 2. Spearman: per-pixel relative change in mean severity,
