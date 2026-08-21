@@ -622,12 +622,24 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 # DS_CF calculation
 # -------------------------
 
-def _standardize_reanalysis_names(ds):
+# Seconds represented by one ssrd accumulation step, for converting raw
+# ERA5 ssrd (accumulated J/m2) to rsds (W/m2 mean). The wcf_day_*/scf_day_*
+# naming and config.ERA5_WIND_PATTERN ("ERA5_daily_*.zarr") indicate the raw
+# files here are daily sums of 24 hourly J/m2 values (see the sibling
+# como24_group5/code_review/calculate_wind_solar_cf.py:load_era5, which uses
+# the same 86400 divisor for its "daily" file family) -- if your raw ERA5
+# ssrd is still hourly-accumulated, pass ssrd_accum_seconds=3600 instead.
+ERA5_SSRD_ACCUM_SECONDS = 86400.0
+
+
+def _standardize_reanalysis_names(ds, ssrd_accum_seconds=ERA5_SSRD_ACCUM_SECONDS):
     """
     Rename raw ERA5 dims/vars (latitude/longitude/valid_time/t2m/ssrd) to
-    the CF-ish names used downstream (lat/lon/time/tas/rsds). u10/v10 are
-    left as-is since they're combined into sfcWind later. No-op for
-    datasets that already use the target names.
+    the CF-ish names used downstream (lat/lon/time/tas/rsds), and convert
+    ssrd from accumulated J/m2 to a W/m2 mean (divide by ssrd_accum_seconds)
+    since compute_solar_cf expects rsds in W/m2. u10/v10 are left as-is
+    since they're combined into sfcWind later. No-op for datasets that
+    already use the target names.
     """
     rename = {}
     for src, dst in (
@@ -636,7 +648,12 @@ def _standardize_reanalysis_names(ds):
     ):
         if src in ds.dims or src in ds.variables:
             rename[src] = dst
-    return ds.rename(rename) if rename else ds
+    had_ssrd = 'ssrd' in ds.variables
+    ds = ds.rename(rename) if rename else ds
+    if had_ssrd:
+        ds['rsds'] = ds['rsds'] / ssrd_accum_seconds
+        ds['rsds'].attrs['units'] = 'W m-2'
+    return ds
 
 
 def calculate_ds_cf_reanalysis_grid_GCM(
@@ -1389,7 +1406,7 @@ if __name__ == "__main__":
 
   
     aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
+    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
 
     # unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
     #            path_folder, gwl_list, reanalysis)
