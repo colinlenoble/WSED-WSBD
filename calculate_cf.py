@@ -318,6 +318,13 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             f"No reanalysis files found in {os.path.join(path_folder, reanalysis)}")
     dref = open_mfdataset_any(files_ref)
     dref = _standardize_reanalysis_names(dref)
+
+    if 'sfcWind' not in dref:
+        if not {'u10', 'v10'}.issubset(dref.data_vars):
+            raise KeyError("Need either 'sfcWind' or both 'u10' and 'v10' in reanalysis")
+        print("Computing sfcWind from u10/v10")
+        dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
+
     dref = dref.sortby('lat').sortby('lon').sortby('time')
     dhist = dhist.sortby('lat').sortby('lon').sortby('time')
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
