@@ -548,6 +548,17 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         real_future_times = dfut.time.values  # restore onto adj before saving
         dfut = dfut.assign_coords(time=ref.time.values)
 
+        # Diagnostic: MBCn's per-location energy-score step can divide by
+        # zero if a location's block is all-NaN or exactly constant. dref
+        # already gets a constant/all-NaN location scrub (remove_constant_
+        # locations + dropna), dfut never has, so check it explicitly here.
+        for var in ['tas', 'rsds', 'sfcWind']:
+            da = dfut[var].compute()
+            n_allnan = int(da.isnull().all('time').sum())
+            n_const = int((da.std('time', skipna=True) == 0).sum())
+            print(f"[Delayed] GWL {gwl}: {var} -- all-NaN locations={n_allnan}, "
+                  f"zero-variance locations={n_const} (out of {da.sizes['location']})")
+
         dfut = dfut.drop_vars(['lat', 'lon', 'location'], errors='ignore')
         fut  = sdba.processing.stack_variables(dfut)
         fut = fut.chunk({'time': -1, 'location': chunk_loc})
