@@ -157,6 +157,28 @@ def events_stats_from_table(df, template_da, time_dim="time"):
     return ds_dur, ds_freq
 
 
+def compute_freq_by_duration_thresholds(df, template_da, thresholds=(2, 3, 5, 7), time_dim="time"):
+    """
+    Annual per-pixel count of persistent compound-drought events whose total
+    duration exceeds each of `thresholds` (days). Reuses the long-format
+    event table from compute_event_table (one row per event day) --
+    de-duplicating to one row per event before filtering on 'duration' so
+    each qualifying event is counted once, not once per day it spans.
+    """
+    df_events = df.drop_duplicates(["event_id", "lat", "lon"])
+    full_years = np.unique(pd.DatetimeIndex(template_da[time_dim].values).year)
+
+    counts = []
+    for thr in thresholds:
+        sub = df_events[df_events["duration"] > thr]
+        da_count = (sub.groupby(["year", "lat", "lon"]).size()
+                    .rename("n_events").to_xarray())
+        da_count = da_count.reindex(year=full_years, lat=template_da.lat, lon=template_da.lon,
+                                     fill_value=0).fillna(0)
+        counts.append(da_count)
+    return xr.concat(counts, dim=pd.Index(list(thresholds), name="duration_threshold"))
+
+
 def compute_severity_persistent(scf_roll, wcf_roll, scf_threshold, wcf_threshold):
     """
     Expected shortfall on persistent compound-drought days: mean positive
@@ -220,6 +242,11 @@ def build_ds_final_persistent(
         df_events, compound,
     )
 
+    print("  Computing event counts by duration threshold (>2, >3, >5, >7 days)")
+    ds_freq_by_dur = compute_freq_by_duration_thresholds(
+        df_events, compound, thresholds=(2, 3, 5, 7),
+    )
+
     print("  Computing severity of persistent compound events")
     severity_ds = compute_severity_persistent(scf_roll, wcf_roll, scf_thr, wcf_thr)
     severity_ds["time"] = severity_ds.time.dt.year
@@ -234,6 +261,7 @@ def build_ds_final_persistent(
 
     ds_final = ds_dur.copy()
     ds_final["frequency"] = ds_freq.frequency
+    ds_final["n_events_gt_duration"] = ds_freq_by_dur["n_events"]
     ds_final["severity"] = severity_ds
     ds_final["resource_valid"] = resource_valid.astype("int8")
     ds_final["wcf_ref_mean"] = wcf_roll_ref_mean
@@ -301,6 +329,57 @@ def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
     low = np.nanpercentile(fitted, alpha, axis=0)
     up = np.nanpercentile(fitted, 100.0 - alpha, axis=0)
     return float(np.nanmean(slopes)), float(np.nanmean(intercepts)), low, up
+
+
+def _stationary_bootstrap_indices(n, n_boot, block_size):
+    """(n_boot, n) matrix of stationary-bootstrap resample indices into an axis of length n."""
+    p = 1.0 / block_size
+    idx = np.empty((n_boot, n), dtype=int)
+    for b in range(n_boot):
+        idx_parts, total = [], 0
+        while total < n:
+            L = np.random.geometric(p)
+            s = np.random.randint(0, n)
+            take = min(L, n - total)
+            idx_parts.append((s + np.arange(take)) % n)
+            total += take
+        idx[b] = np.concatenate(idx_parts)[:n]
+    return idx
+
+
+def stationary_bootstrap_diff_significance(hist_vals, comp_vals, n_boot=1000, block_size=5,
+                                            ci=95, lat_chunk_size=40):
+    """
+    Per-pixel block-bootstrap CI of the mean difference (comp - hist) across
+    the year axis (axis 0) of `hist_vals`/`comp_vals`, each (year, lat, lon).
+    The same bootstrap time-index draws are reused across every pixel (only
+    the resampled values differ), so the whole thing stays vectorized;
+    latitude is processed in chunks to bound memory on global-resolution
+    grids. Returns (diff, low, high, significant) as (lat, lon) arrays,
+    where `significant` marks pixels whose CI excludes zero.
+    """
+    n_h, nlat, nlon = hist_vals.shape
+    n_c = comp_vals.shape[0]
+    diff = np.nanmean(comp_vals, axis=0) - np.nanmean(hist_vals, axis=0)
+    low = np.full((nlat, nlon), np.nan)
+    high = np.full((nlat, nlon), np.nan)
+    alpha = (100.0 - ci) / 2.0
+
+    idx_h = _stationary_bootstrap_indices(n_h, n_boot, block_size)
+    idx_c = _stationary_bootstrap_indices(n_c, n_boot, block_size)
+
+    for lat0 in range(0, nlat, lat_chunk_size):
+        lat1 = min(lat0 + lat_chunk_size, nlat)
+        h_chunk = hist_vals[:, lat0:lat1, :].astype(np.float32)
+        c_chunk = comp_vals[:, lat0:lat1, :].astype(np.float32)
+        h_boot = np.nanmean(h_chunk[idx_h], axis=1)   # (n_boot, chunk_lat, nlon)
+        c_boot = np.nanmean(c_chunk[idx_c], axis=1)
+        diff_boot = c_boot - h_boot
+        low[lat0:lat1, :] = np.nanpercentile(diff_boot, alpha, axis=0)
+        high[lat0:lat1, :] = np.nanpercentile(diff_boot, 100.0 - alpha, axis=0)
+
+    significant = (low > 0) | (high < 0)
+    return diff, low, high, significant
 
 
 # =============================================================================
@@ -502,6 +581,109 @@ def plot_valuebyalpha_persistent(
 
 
 # =============================================================================
+# Figure: Change in event count by duration threshold (persistent events)
+# =============================================================================
+
+def plot_freq_by_duration_change_persistent(
+    ds_final, mask, shapefile_path,
+    thresholds=(2, 3, 5, 7),
+    period_hist=(1980, 1999), period_comp=(2000, 2019),
+    lat_min=-60, lat_max=72,
+    n_boot=1000, block_size=5, ci=95,
+    cmap="RdBu_r",
+):
+    """
+    2x2 panel figure: absolute change (recent-period mean minus
+    historical-period mean) in the annual number of persistent compound
+    WSE-drought events lasting more than `thresholds[i]` days, for each of
+    the 4 thresholds. Pixels where a per-pixel stationary block-bootstrap
+    CI of that difference spans zero are hatched as not significant.
+    """
+    shp = gpd.read_file(shapefile_path)
+    y0, y1 = period_hist
+    y2, y3 = period_comp
+
+    da_full = ds_final["n_events_gt_duration"].where(mask == 1)
+    da_full = da_full.sel(lat=slice(-60, 68))
+    da_full = da_full.where(da_full.lat > lat_min, drop=True).where(da_full.lat < lat_max, drop=True)
+
+    da_mask_ref = ds_final.frequency.isel(year=0)
+    t_mask = rasterio.transform.from_bounds(
+        da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
+        da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
+        len(da_mask_ref.lon), len(da_mask_ref.lat),
+    )
+    land_mask = rasterize_shapefile(shp, da_mask_ref.shape, t_mask)[::-1, :]
+    ocean_mask = land_mask & (mask == 0)
+
+    lon_vals = da_full.lon.values
+    lat_vals = da_full.lat.values
+
+    results = []
+    for thr in thresholds:
+        da_thr = da_full.sel(duration_threshold=thr)
+        hist_vals = da_thr.sel(year=slice(y0, y1)).values
+        comp_vals = da_thr.sel(year=slice(y2, y3)).values
+        diff, low, high, sig = stationary_bootstrap_diff_significance(
+            hist_vals, comp_vals, n_boot=n_boot, block_size=block_size, ci=ci,
+        )
+        results.append((diff, sig))
+
+    vabs = max(np.nanmax(np.abs(d)) for d, _ in results if np.isfinite(d).any())
+    vabs = vabs if np.isfinite(vabs) and vabs > 0 else 1.0
+
+    fig_width_in = FIG_WIDTH_IN * 1.6
+    fig_height_in = fig_width_in * 0.62
+    fig, axes = plt.subplots(2, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
+                              subplot_kw={"projection": ccrs.Robinson()})
+    axes_flat = axes.flatten()
+    panellabels = list(ascii_lowercase[:len(thresholds)])
+
+    for i, (thr, ax) in enumerate(zip(thresholds, axes_flat)):
+        diff, sig = results[i]
+        ax.set_global()
+        ax.coastlines(resolution="50m", linewidth=0.15, color="black")
+        ax.contourf(
+            da_mask_ref.lon, da_mask_ref.lat, ocean_mask.astype(float),
+            levels=[0.5, 1], colors=["gray"],
+            transform=ccrs.PlateCarree(), zorder=5,
+        )
+        mesh = ax.pcolormesh(
+            lon_vals, lat_vals, diff,
+            transform=ccrs.PlateCarree(), cmap=cmap,
+            vmin=-vabs, vmax=vabs, rasterized=True, zorder=3,
+        )
+        ax.contourf(
+            lon_vals, lat_vals, (~sig).astype(float),
+            levels=[0.5, 1], hatches=["....."], colors="none",
+            transform=ccrs.PlateCarree(), zorder=4,
+        )
+        shp.boundary.plot(ax=ax, color="black", linewidth=0.1,
+                           transform=ccrs.PlateCarree(), zorder=6)
+        cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", shrink=0.7, pad=0.05)
+        cbar.set_label(f"$\\Delta$ events/yr lasting > {thr} d", fontsize=5)
+        cbar.ax.tick_params(labelsize=5)
+        ax.annotate(
+            f"$\\mathbf{{{panellabels[i]}}}$",
+            xy=(0.02, 1.02), xycoords="axes fraction",
+            ha="left", va="bottom", fontsize=6,
+            path_effects=[withStroke(linewidth=1.5, foreground="white")],
+        )
+        ax.set_title(f"> {thr} days", fontsize=6)
+        ax.set_extent([-180, 180, lat_min, lat_max], crs=ccrs.PlateCarree())
+        ax.spines["geo"].set_visible(False)
+
+    fig.suptitle(
+        f"Change in annual number of persistent compound WSE-drought events\n"
+        f"({period_comp[0]}-{period_comp[1]} minus {period_hist[0]}-{period_hist[1]} mean); "
+        f"hatched = not significant (bootstrap {ci}% CI)",
+        fontsize=6,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    return fig
+
+
+# =============================================================================
 # Figure: Reference-period persistent-drought summary
 # =============================================================================
 
@@ -694,24 +876,22 @@ def main():
     print("Building land/resource mask")
     mask = build_land_mask(ds_final, args.shapefile)
 
-    print("Plotting persistent-drought value-by-alpha figure")
-    fig_vba = plot_valuebyalpha_persistent(
+    print("Plotting persistent-drought duration-threshold change figure")
+    fig_dur = plot_freq_by_duration_change_persistent(
         ds_final=ds_final, mask=mask, shapefile_path=args.shapefile,
-        map_title=" ",
-        relchange_label="Relative change in annual\npersistent WSE drought\nseverity (%)",
-        sev_label="Historical average annual\npersistent WSE drought severity",
-        lat_min=-60, lat_max=75,
+        thresholds=(2, 3, 5, 7),
         period_hist=(1980, 1999), period_comp=(2000, 2019),
+        lat_min=-60, lat_max=75,
         n_boot=args.n_boot,
     )
-    out_vba = os.path.join(
+    out_dur = os.path.join(
         args.output_dir, "main",
-        f"fig_persistent_valuebyalpha_{thr_str}_roll{args.roll_window}.png",
+        f"fig_persistent_durationchange_{thr_str}_roll{args.roll_window}.png",
     )
-    os.makedirs(os.path.dirname(out_vba), exist_ok=True)
-    fig_vba.savefig(out_vba, dpi=args.dpi, bbox_inches="tight")
-    plt.close(fig_vba)
-    print(f"Saved {out_vba}")
+    os.makedirs(os.path.dirname(out_dur), exist_ok=True)
+    fig_dur.savefig(out_dur, dpi=args.dpi, bbox_inches="tight")
+    plt.close(fig_dur)
+    print(f"Saved {out_dur}")
 
     print("Plotting reference persistent-drought figure")
     ref_start_year = pd.Timestamp(args.ref_start).year
