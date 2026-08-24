@@ -520,10 +520,14 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         # intersecting, mirroring how hist is aligned onto ref above.
         dfut = dfut.assign_coords(time=dfut.time - dfut.time.values[-1] + ref.time.values[-1])
 
-        # Intersect times between ref/hist and fut
+        # Intersect times between ref/hist and fut. dfut's shifted time axis
+        # only matches ref/hist's calendar day-for-day at the anchor date;
+        # leap-day/calendar differences mean it won't contain every entry of
+        # common_times, so select by membership instead of exact label match
+        # (xr.align below then reconciles the two sides on both dims).
         common_times = np.intersect1d(ref.time.values, hist.time.values)
         dref_t = dref.sel(time=common_times)
-        dfut   = dfut.sel(time=common_times)
+        dfut   = dfut.sel(time=dfut.time.isin(common_times))
 
         # Align on the location dimension
         dref_t, dfut = xr.align(dref_t, dfut, join="inner", copy=False)
