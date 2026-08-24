@@ -261,7 +261,7 @@ def build_ds_final_persistent(
 
     ds_final = ds_dur.copy()
     ds_final["frequency"] = ds_freq.frequency
-    ds_final["n_events_gt_duration"] = ds_freq_by_dur["n_events"]
+    ds_final["n_events_gt_duration"] = ds_freq_by_dur
     ds_final["severity"] = severity_ds
     ds_final["resource_valid"] = resource_valid.astype("int8")
     ds_final["wcf_ref_mean"] = wcf_roll_ref_mean

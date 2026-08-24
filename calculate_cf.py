@@ -456,6 +456,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     ref  = ref.chunk({'time': -1, 'location': chunk_loc})
     hist = hist.chunk({'time': -1, 'location': chunk_loc})
+    print(f"Training window time steps: ref={ref.sizes['time']}, hist={hist.sizes['time']}")
 
     # Train once
     ADJ = sdba.MBCn.train(
@@ -499,7 +500,10 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         dfut = filter_domain(dfut, (lat_ori[0], lat_ori[-1]), (lon_ori[0], lon_ori[-1]))
         dfut = set_variable_units(dfut,
                                   {'sfcWind': 'm s-1', 'tas': 'K', 'rsds': 'W m-2'})
+        n_raw = dfut.sizes['time']
         dfut = dfut.convert_calendar('noleap').convert_calendar('standard')
+        print(f"[Delayed] GWL {gwl}: dfut time steps raw={n_raw}, "
+              f"after noleap/standard round-trip={dfut.sizes['time']}")
         dfut = dfut.sortby('lat').sortby('lon').sortby('time')
         dfut = dfut.stack(location=("lat", "lon"))
 
@@ -516,18 +520,27 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             )
         )
 
-        # Align fut's (synthetic) time axis onto the reference period before
-        # intersecting, mirroring how hist is aligned onto ref above.
-        dfut = dfut.assign_coords(time=dfut.time - dfut.time.values[-1] + ref.time.values[-1])
-
-        # Intersect times between ref/hist and fut. dfut's shifted time axis
-        # only matches ref/hist's calendar day-for-day at the anchor date;
-        # leap-day/calendar differences mean it won't contain every entry of
-        # common_times, so select by membership instead of exact label match
-        # (xr.align below then reconciles the two sides on both dims).
+        # Align fut onto the reference period. MBCn was trained with a
+        # single block spanning the whole ref/hist series (group="time"),
+        # so it requires sim to have exactly the same number of time steps
+        # as hist -- calendar-based label matching (shifting by a constant
+        # offset, then selecting matching dates) is unreliable here because
+        # dfut went through a noleap->standard conversion and can drift out
+        # of exact day-for-day alignment with ref/hist over a multi-year
+        # window. Instead, take the last n steps of dfut positionally (n =
+        # len(common_times)) and stamp them with ref/hist's own time labels,
+        # which guarantees an exact-length match.
         common_times = np.intersect1d(ref.time.values, hist.time.values)
         dref_t = dref.sel(time=common_times)
-        dfut   = dfut.sel(time=dfut.time.isin(common_times))
+
+        n = len(common_times)
+        if dfut.sizes['time'] < n:
+            raise ValueError(
+                f"GWL {gwl}: future window has only {dfut.sizes['time']} "
+                f"time steps, need at least {n} to match the training period."
+            )
+        dfut = dfut.isel(time=slice(-n, None))
+        dfut = dfut.assign_coords(time=common_times)
 
         # Align on the location dimension
         dref_t, dfut = xr.align(dref_t, dfut, join="inner", copy=False)
