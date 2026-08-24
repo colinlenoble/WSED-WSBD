@@ -443,8 +443,8 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     loc_values = dref.location.to_dataframe().reset_index(drop=True)
     loc_values['location_index'] = loc_values.index
 
-    ref  = dref.drop_vars(['lat', 'lon'])
-    hist = dhist.drop_vars(['lat', 'lon'])
+    ref  = dref.drop_vars(['lat', 'lon', 'location'])
+    hist = dhist.drop_vars(['lat', 'lon', 'location'])
     ref  = sdba.processing.stack_variables(ref)
     hist = sdba.processing.stack_variables(hist)
 
@@ -466,6 +466,10 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         n_escore=1000,
         pts_dim='multivar',
     )
+    # xclim's TrainAdjust objects subclass dict (via Parametrizable), so
+    # dask.delayed would otherwise traverse ADJ like a plain mapping and
+    # rebuild it as a bare dict inside the delayed tasks, dropping .adjust().
+    ADJ = delayed(ADJ, traverse=False)
 
     # Load all future datasets eagerly so they are available inside delayed tasks
     dfut_datasets = {
@@ -524,7 +528,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         # Align on the location dimension
         dref_t, dfut = xr.align(dref_t, dfut, join="inner", copy=False)
 
-        dfut = dfut.drop_vars(['lat', 'lon'], errors='ignore')
+        dfut = dfut.drop_vars(['lat', 'lon', 'location'], errors='ignore')
         fut  = sdba.processing.stack_variables(dfut)
 
         # Shift fut time axis onto the reference period (required by MBCn)
