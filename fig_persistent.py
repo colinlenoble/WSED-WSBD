@@ -442,8 +442,9 @@ def plot_valuebyalpha_persistent(
         da_reg = da.sel(lat=slice(lat0, lat1), lon=slice(lon0, lon1),
                          year=slice(y0, y3))
         ts = da_reg.mean(("lat", "lon"), skipna=True).values
+        n_years_reg = len(years_all)
         mean_slope, mean_intercept, low_vals, up_vals = stationary_bootstrap_ci_1d(
-            ts, np.arange(y3 - y0 + 1), n_boot=n_boot, block_size=3, ci=95,
+            ts, np.arange(n_years_reg), n_boot=n_boot, block_size=3, ci=95,
         )
 
         ax_map.plot(
@@ -464,7 +465,7 @@ def plot_valuebyalpha_persistent(
         region_panels.append(dict(
             label=panellabels[ridx], name=reg["name"],
             years=years_all, ts=ts,
-            fit_line=mean_intercept + mean_slope * np.arange(y3 - y0 + 1),
+            fit_line=mean_intercept + mean_slope * np.arange(n_years_reg),
             low_line=low_vals, up_line=up_vals,
         ))
 
