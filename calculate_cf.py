@@ -512,6 +512,10 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             )
         )
 
+        # Align fut's (synthetic) time axis onto the reference period before
+        # intersecting, mirroring how hist is aligned onto ref above.
+        dfut = dfut.assign_coords(time=dfut.time - dfut.time.values[-1] + ref.time.values[-1])
+
         # Intersect times between ref/hist and fut
         common_times = np.intersect1d(ref.time.values, hist.time.values)
         dref_t = dref.sel(time=common_times)
