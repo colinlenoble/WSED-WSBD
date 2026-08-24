@@ -1405,41 +1405,43 @@ if __name__ == "__main__":
     cfg = DEFAULT_DS_CF_CONFIG
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
+    GCM, run = 'CanESM5', 'r10i1p1f1'
+
     
-    calculate_ds_cf_reanalysis(
-        path_folder,
-        path_preprocessed,
-        era5_file_pattern,
-        reanalysis='ERA5',
-        shapefile_path=shapefile_path,
-        cfg=cfg,
-        pv_cfg=pv_cfg,
-        shear_ref_period=shear_ref_period
-    )
+    # calculate_ds_cf_reanalysis(
+    #     path_folder,
+    #     path_preprocessed,
+    #     era5_file_pattern,
+    #     reanalysis='ERA5',
+    #     shapefile_path=shapefile_path,
+    #     cfg=cfg,
+    #     pv_cfg=pv_cfg,
+    #     shear_ref_period=shear_ref_period
+    # )
 
   
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
+    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
     # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
 
-    # unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
-    #            path_folder, gwl_list, reanalysis)
-    # calculate_ds_cf_reanalysis_grid_GCM(GCM, run, ssp, path_preprocessed,
-    #                                    path_folder, reanalysis,
-    #                                    shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
-    #                                    shear_ref_period=shear_ref_period,
-    #                                    shear_by_gcm_dir=shear_by_gcm_dir)
+    unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
+                path_folder, gwl_list, reanalysis)
+    calculate_ds_cf_reanalysis_grid_GCM(GCM, run, ssp, path_preprocessed,
+                                       path_folder, reanalysis,
+                                       shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
+                                       shear_ref_period=shear_ref_period,
+                                       shear_by_gcm_dir=shear_by_gcm_dir)
     # --- Loop over GCM-run pairs, skip GWLs that don't exist ---
-    # for _, row in df_to_process.iterrows():
-    #     GCM = row['GCM']
-    #     run = row['run']
-    #     print(f"\n--- Processing {GCM} {run} ---")
-    #     for gwl in gwl_list:
-    #         if not row[gwl]:
-    #             print(f"  Skipping {gwl} (file not available)")
-    #             continue
-    #         print(f"  Processing {gwl}")
-            # calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
-            #                    cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
-            #                    shear_by_gcm_dir=shear_by_gcm_dir)
-            #aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
-            #              gwl, shapefile_path, reanalysis, suffix_shp='v1')
+    for _, row in df_to_process.iterrows():
+        GCM = row['GCM']
+        run = row['run']
+        print(f"\n--- Processing {GCM} {run} ---")
+        for gwl in gwl_list:
+            if not row[gwl]:
+                print(f"  Skipping {gwl} (file not available)")
+                continue
+            print(f"  Processing {gwl}")
+            calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
+                               cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
+                               shear_by_gcm_dir=shear_by_gcm_dir)
+            aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
+                         gwl, shapefile_path, reanalysis, suffix_shp='v1')
