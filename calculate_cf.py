@@ -520,36 +520,36 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             )
         )
 
-        # Align fut onto the reference period. MBCn was trained with a
-        # single block spanning the whole ref/hist series (group="time"),
-        # so it requires sim to have exactly the same number of time steps
-        # as hist -- calendar-based label matching (shifting by a constant
-        # offset, then selecting matching dates) is unreliable here because
-        # dfut went through a noleap->standard conversion and can drift out
-        # of exact day-for-day alignment with ref/hist over a multi-year
-        # window. Instead, take the last n steps of dfut positionally (n =
-        # len(common_times)) and stamp them with ref/hist's own time labels,
-        # which guarantees an exact-length match.
-        common_times = np.intersect1d(ref.time.values, hist.time.values)
-        dref_t = dref.sel(time=common_times)
-
-        n = len(common_times)
+        # MBCn was trained on ref/hist at exactly this length (group="time"
+        # builds a single block spanning the whole series, purely
+        # positional -- it does not use calendar labels), so sim must match
+        # that length positionally. ref.sizes['time'] is the authoritative
+        # number: `ref`/`hist` keep their full length through the NaN-mask
+        # step above (`.where(...)` doesn't drop rows). A calendar-label
+        # intersection (np.intersect1d on ref.time/hist.time) is NOT the
+        # same number -- ref and hist come from different source calendars
+        # and only get a constant-offset shift, so their labels drift out
+        # of exact agreement over a multi-year window even though both
+        # arrays are still length ref.sizes['time']. Using that smaller
+        # intersection count here previously caused
+        # "IndexError: ... size 7295" (5 short of the 7300 MBCn trained on).
+        n = ref.sizes['time']
         if dfut.sizes['time'] < n:
             raise ValueError(
                 f"GWL {gwl}: future window has only {dfut.sizes['time']} "
                 f"time steps, need at least {n} to match the training period."
             )
-        dfut = dfut.isel(time=slice(-n, None))
-        dfut = dfut.assign_coords(time=common_times)
 
-        # Align on the location dimension
-        dref_t, dfut = xr.align(dref_t, dfut, join="inner", copy=False)
+        # Match locations only (independent of the time-length fix above);
+        # dref/dfut can have different surviving locations after masking.
+        _, dfut = xr.align(dref.isel(time=0, drop=True), dfut, join="inner", copy=False)
+
+        dfut = dfut.isel(time=slice(-n, None))
+        real_future_times = dfut.time.values  # restore onto adj before saving
+        dfut = dfut.assign_coords(time=ref.time.values)
 
         dfut = dfut.drop_vars(['lat', 'lon', 'location'], errors='ignore')
         fut  = sdba.processing.stack_variables(dfut)
-
-        # Shift fut time axis onto the reference period (required by MBCn)
-        fut = fut.assign_coords(time=fut.time - fut.time.values[-1] + ref.time.values[-1])
         fut = fut.chunk({'time': -1, 'location': chunk_loc})
 
         adj = ADJ.adjust(
@@ -561,6 +561,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         )
 
         adj = sdba.unstack_variables(adj).compute()
+        adj = adj.assign_coords(time=real_future_times)
         adj = adj.assign(
             rsds=sdba.processing.from_additive_space(adj.rsds),
             sfcWind=sdba.processing.from_additive_space(adj.sfcWind)
