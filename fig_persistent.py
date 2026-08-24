@@ -331,57 +331,6 @@ def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
     return float(np.nanmean(slopes)), float(np.nanmean(intercepts)), low, up
 
 
-def _stationary_bootstrap_indices(n, n_boot, block_size):
-    """(n_boot, n) matrix of stationary-bootstrap resample indices into an axis of length n."""
-    p = 1.0 / block_size
-    idx = np.empty((n_boot, n), dtype=int)
-    for b in range(n_boot):
-        idx_parts, total = [], 0
-        while total < n:
-            L = np.random.geometric(p)
-            s = np.random.randint(0, n)
-            take = min(L, n - total)
-            idx_parts.append((s + np.arange(take)) % n)
-            total += take
-        idx[b] = np.concatenate(idx_parts)[:n]
-    return idx
-
-
-def stationary_bootstrap_diff_significance(hist_vals, comp_vals, n_boot=1000, block_size=5,
-                                            ci=95, lat_chunk_size=40):
-    """
-    Per-pixel block-bootstrap CI of the mean difference (comp - hist) across
-    the year axis (axis 0) of `hist_vals`/`comp_vals`, each (year, lat, lon).
-    The same bootstrap time-index draws are reused across every pixel (only
-    the resampled values differ), so the whole thing stays vectorized;
-    latitude is processed in chunks to bound memory on global-resolution
-    grids. Returns (diff, low, high, significant) as (lat, lon) arrays,
-    where `significant` marks pixels whose CI excludes zero.
-    """
-    n_h, nlat, nlon = hist_vals.shape
-    n_c = comp_vals.shape[0]
-    diff = np.nanmean(comp_vals, axis=0) - np.nanmean(hist_vals, axis=0)
-    low = np.full((nlat, nlon), np.nan)
-    high = np.full((nlat, nlon), np.nan)
-    alpha = (100.0 - ci) / 2.0
-
-    idx_h = _stationary_bootstrap_indices(n_h, n_boot, block_size)
-    idx_c = _stationary_bootstrap_indices(n_c, n_boot, block_size)
-
-    for lat0 in range(0, nlat, lat_chunk_size):
-        lat1 = min(lat0 + lat_chunk_size, nlat)
-        h_chunk = hist_vals[:, lat0:lat1, :].astype(np.float32)
-        c_chunk = comp_vals[:, lat0:lat1, :].astype(np.float32)
-        h_boot = np.nanmean(h_chunk[idx_h], axis=1)   # (n_boot, chunk_lat, nlon)
-        c_boot = np.nanmean(c_chunk[idx_c], axis=1)
-        diff_boot = c_boot - h_boot
-        low[lat0:lat1, :] = np.nanpercentile(diff_boot, alpha, axis=0)
-        high[lat0:lat1, :] = np.nanpercentile(diff_boot, 100.0 - alpha, axis=0)
-
-    significant = (low > 0) | (high < 0)
-    return diff, low, high, significant
-
-
 # =============================================================================
 # Figure: Value-by-alpha map + regional time series (persistent events)
 # =============================================================================
@@ -589,15 +538,13 @@ def plot_freq_by_duration_change_persistent(
     thresholds=(2, 3, 5, 7),
     period_hist=(1980, 1999), period_comp=(2000, 2019),
     lat_min=-60, lat_max=72,
-    n_boot=1000, block_size=5, ci=95,
     cmap="RdBu_r",
 ):
     """
     2x2 panel figure: absolute change (recent-period mean minus
     historical-period mean) in the annual number of persistent compound
     WSE-drought events lasting more than `thresholds[i]` days, for each of
-    the 4 thresholds. Pixels where a per-pixel stationary block-bootstrap
-    CI of that difference spans zero are hatched as not significant.
+    the 4 thresholds.
     """
     shp = gpd.read_file(shapefile_path)
     y0, y1 = period_hist
@@ -624,12 +571,10 @@ def plot_freq_by_duration_change_persistent(
         da_thr = da_full.sel(duration_threshold=thr)
         hist_vals = da_thr.sel(year=slice(y0, y1)).values
         comp_vals = da_thr.sel(year=slice(y2, y3)).values
-        diff, low, high, sig = stationary_bootstrap_diff_significance(
-            hist_vals, comp_vals, n_boot=n_boot, block_size=block_size, ci=ci,
-        )
-        results.append((diff, sig))
+        diff = np.nanmean(comp_vals, axis=0) - np.nanmean(hist_vals, axis=0)
+        results.append(diff)
 
-    vabs = max(np.nanmax(np.abs(d)) for d, _ in results if np.isfinite(d).any())
+    vabs = max(np.nanmax(np.abs(d)) for d in results if np.isfinite(d).any())
     vabs = vabs if np.isfinite(vabs) and vabs > 0 else 1.0
 
     fig_width_in = FIG_WIDTH_IN * 1.6
@@ -640,7 +585,7 @@ def plot_freq_by_duration_change_persistent(
     panellabels = list(ascii_lowercase[:len(thresholds)])
 
     for i, (thr, ax) in enumerate(zip(thresholds, axes_flat)):
-        diff, sig = results[i]
+        diff = results[i]
         ax.set_global()
         ax.coastlines(resolution="50m", linewidth=0.15, color="black")
         ax.contourf(
@@ -652,11 +597,6 @@ def plot_freq_by_duration_change_persistent(
             lon_vals, lat_vals, diff,
             transform=ccrs.PlateCarree(), cmap=cmap,
             vmin=-vabs, vmax=vabs, rasterized=True, zorder=3,
-        )
-        ax.contourf(
-            lon_vals, lat_vals, (~sig).astype(float),
-            levels=[0.5, 1], hatches=["....."], colors="none",
-            transform=ccrs.PlateCarree(), zorder=4,
         )
         shp.boundary.plot(ax=ax, color="black", linewidth=0.1,
                            transform=ccrs.PlateCarree(), zorder=6)
@@ -675,8 +615,7 @@ def plot_freq_by_duration_change_persistent(
 
     fig.suptitle(
         f"Change in annual number of persistent compound WSE-drought events\n"
-        f"({period_comp[0]}-{period_comp[1]} minus {period_hist[0]}-{period_hist[1]} mean); "
-        f"hatched = not significant (bootstrap {ci}% CI)",
+        f"({period_comp[0]}-{period_comp[1]} minus {period_hist[0]}-{period_hist[1]} mean)",
         fontsize=6,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.92])
@@ -789,50 +728,62 @@ def plot_reference_persistent_drought(
 
 
 # =============================================================================
-# Global mean change + bootstrap CI
+# Global mean change + bootstrap CI (by duration threshold)
 # =============================================================================
 
-def compute_global_change_stats(ds_final, mask, period_hist=(1980, 1999),
-                                 period_comp=(2000, 2019), n_bootstrap=1000, block_size=10):
-    ds = ds_final.where(mask == 1)
-    ds["annual_severity"] = ds["frequency"] * ds["severity"] * ds["duration"]
-    early = ds["annual_severity"].sel(year=slice(*period_hist)).mean(dim="year")
-    late = ds["annual_severity"].sel(year=slice(*period_comp)).mean(dim="year")
+def compute_global_duration_change_stats(ds_final, mask, thresholds=(2, 3, 5, 7),
+                                          period_hist=(1980, 1999), period_comp=(2000, 2019),
+                                          n_bootstrap=1000, block_size=10):
+    """
+    Global area-weighted mean absolute change (recent-period mean minus
+    historical-period mean) in annual persistent-drought event count, for
+    each duration threshold, with a spatial block-bootstrap 95% CI (blocks
+    of `block_size` degrees resampled with replacement over lat/lon).
+    Returns {threshold: (abs_change, ci_lower, ci_upper)}.
+    """
+    ds = ds_final["n_events_gt_duration"].where(mask == 1)
     weights = np.cos(np.deg2rad(ds.lat))
     weights.name = "weights"
-    global_early = early.weighted(weights).mean(dim=["lat", "lon"]).values
-    global_late = late.weighted(weights).mean(dim=["lat", "lon"]).values
-    global_rel_change = (global_late - global_early) / global_early * 100
 
-    data = (late - early).values
-    lats = early.lat.values
-    lons = early.lon.values
-    weight_array = weights.values
-    lat_blocks = np.arange(lats.min(), lats.max(), block_size)
-    lon_blocks = np.arange(lons.min(), lons.max(), block_size)
+    results = {}
+    for thr in thresholds:
+        da_thr = ds.sel(duration_threshold=thr)
+        early = da_thr.sel(year=slice(*period_hist)).mean(dim="year")
+        late = da_thr.sel(year=slice(*period_comp)).mean(dim="year")
+        global_early = early.weighted(weights).mean(dim=["lat", "lon"]).values
+        global_late = late.weighted(weights).mean(dim=["lat", "lon"]).values
+        global_abs_change = global_late - global_early
 
-    bootstrap_means = []
-    for _ in range(n_bootstrap):
-        s_lat = np.random.choice(lat_blocks, size=len(lat_blocks), replace=True)
-        s_lon = np.random.choice(lon_blocks, size=len(lon_blocks), replace=True)
-        sample, sw = [], []
-        for lb in s_lat:
-            for lo in s_lon:
-                li_mask = (lats >= lb) & (lats < lb + block_size)
-                lo_mask = (lons >= lo) & (lons < lo + block_size)
-                if np.any(li_mask) and np.any(lo_mask):
-                    for li in np.where(li_mask)[0]:
-                        for loi in np.where(lo_mask)[0]:
-                            if not np.isnan(data[li, loi]):
-                                sample.append(data[li, loi])
-                                sw.append(weight_array[li])
-        if sample:
-            sample, sw = np.array(sample), np.array(sw)
-            bootstrap_means.append(np.sum(sample * sw) / np.sum(sw))
+        data = (late - early).values
+        lats = early.lat.values
+        lons = early.lon.values
+        weight_array = weights.values
+        lat_blocks = np.arange(lats.min(), lats.max(), block_size)
+        lon_blocks = np.arange(lons.min(), lons.max(), block_size)
 
-    ci_lower_rel = np.percentile(bootstrap_means, 2.5) / global_early * 100
-    ci_upper_rel = np.percentile(bootstrap_means, 97.5) / global_early * 100
-    return global_rel_change, ci_lower_rel, ci_upper_rel
+        bootstrap_means = []
+        for _ in range(n_bootstrap):
+            s_lat = np.random.choice(lat_blocks, size=len(lat_blocks), replace=True)
+            s_lon = np.random.choice(lon_blocks, size=len(lon_blocks), replace=True)
+            sample, sw = [], []
+            for lb in s_lat:
+                for lo in s_lon:
+                    li_mask = (lats >= lb) & (lats < lb + block_size)
+                    lo_mask = (lons >= lo) & (lons < lo + block_size)
+                    if np.any(li_mask) and np.any(lo_mask):
+                        for li in np.where(li_mask)[0]:
+                            for loi in np.where(lo_mask)[0]:
+                                if not np.isnan(data[li, loi]):
+                                    sample.append(data[li, loi])
+                                    sw.append(weight_array[li])
+            if sample:
+                sample, sw = np.array(sample), np.array(sw)
+                bootstrap_means.append(np.sum(sample * sw) / np.sum(sw))
+
+        ci_lower = np.percentile(bootstrap_means, 2.5)
+        ci_upper = np.percentile(bootstrap_means, 97.5)
+        results[thr] = (float(global_abs_change), float(ci_lower), float(ci_upper))
+    return results
 
 
 # =============================================================================
@@ -882,7 +833,6 @@ def main():
         thresholds=(2, 3, 5, 7),
         period_hist=(1980, 1999), period_comp=(2000, 2019),
         lat_min=-60, lat_max=75,
-        n_boot=args.n_boot,
     )
     out_dur = os.path.join(
         args.output_dir, "main",
@@ -910,13 +860,14 @@ def main():
     plt.close(fig_ref)
     print(f"Saved {out_ref}")
 
-    print("Computing global change statistics")
-    global_rel_change, ci_lower_rel, ci_upper_rel = compute_global_change_stats(
-        ds_final, mask, period_hist=(1980, 1999), period_comp=(2000, 2019), n_bootstrap=1000)
+    print("Computing global duration-threshold change statistics")
+    duration_change_stats = compute_global_duration_change_stats(
+        ds_final, mask, thresholds=(2, 3, 5, 7),
+        period_hist=(1980, 1999), period_comp=(2000, 2019), n_bootstrap=1000)
     print("\nResults:")
-    print(f"  Global change: {global_rel_change:.2f}%")
-    print(f"  95% CI: [{ci_lower_rel:.2f}%, {ci_upper_rel:.2f}%]")
-    print(f"  CI width: {ci_upper_rel - ci_lower_rel:.2f}%")
+    for thr, (abs_change, ci_lower, ci_upper) in duration_change_stats.items():
+        print(f"  Events/yr lasting > {thr} d -- global change: {abs_change:+.3f}")
+        print(f"    95% CI: [{ci_lower:+.3f}, {ci_upper:+.3f}]")
     print("\nDone.")
 
 
