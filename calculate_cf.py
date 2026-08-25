@@ -1683,20 +1683,20 @@ if __name__ == "__main__":
     GCM, run = 'CanESM5', 'r10i1p2f1'
 
     
-    calculate_ds_cf_reanalysis(
-        path_folder,
-        path_preprocessed,
-        era5_file_pattern,
-        reanalysis='ERA5',
-        shapefile_path=shapefile_path,
-        cfg=cfg,
-        pv_cfg=pv_cfg,
-        shear_ref_period=shear_ref_period
-    )
+    # calculate_ds_cf_reanalysis(
+    #     path_folder,
+    #     path_preprocessed,
+    #     era5_file_pattern,
+    #     reanalysis='ERA5',
+    #     shapefile_path=shapefile_path,
+    #     cfg=cfg,
+    #     pv_cfg=pv_cfg,
+    #     shear_ref_period=shear_ref_period
+    # )
 
   
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
+    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
+    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
 
     unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
                 path_folder, gwl_list, reanalysis)
