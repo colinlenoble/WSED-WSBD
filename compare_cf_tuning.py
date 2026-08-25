@@ -34,6 +34,7 @@ from dataclasses import replace
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patheffects import withStroke
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -52,7 +53,28 @@ from compare_wind_methods import (
     local_shear_alpha_path, compute_severity, r2_score,
 )
 
+try:
+    import geopandas as gpd
+    _HAS_GPD = True
+except ImportError:
+    _HAS_GPD = False
+
 REFERENCE = "default"
+
+# =============================================================================
+# Graphical config for the discrepancy maps -- mirrors fig45.py's
+# FIG_WIDTH_IN / font sizes / panel-letter and shared-colorbar layout
+# (fig45.plot_supp_demand_sensitivity), so these supplementary maps sit
+# visually alongside the paper's other supp figures.
+# =============================================================================
+FIG_WIDTH_IN = 5.15          # LaTeX single-column width, matches fig45.FIG_WIDTH_IN
+MAP_TITLE_FONTSIZE = 5.5
+MAP_LETTER_FONTSIZE = 5.5
+MAP_LETTER_COLOR = "#2c3e50"  # fig45.ALT_COLOR
+SUPTITLE_FONTSIZE = 8
+SUBTITLE_FONTSIZE = 6
+CBAR_LABEL_FONTSIZE = 6
+CBAR_TICK_FONTSIZE = 5
 
 WIND_TUNING_CONFIGS = {
     "default"      : DEFAULT_DS_CF_CONFIG,
@@ -152,6 +174,60 @@ def _grid_axes(n, ncols=3, figsize_per=(4.2, 3.6), **subplot_kw):
     return fig, axes_flat[:n]
 
 
+def _map_grid_figure(n, ncols=3, suptitle=None, subtitle=None):
+    """
+    Compact map grid at fig45.plot_supp_demand_sensitivity's fixed
+    FIG_WIDTH_IN width/font sizes/gridspec proportions, so the discrepancy
+    maps read as one system with the rest of the supplementary figures.
+    """
+    ncols = min(ncols, n)
+    nrows = int(np.ceil(n / ncols))
+    fig_w = FIG_WIDTH_IN
+    fig_h = fig_w * ((5.5 * nrows + 1.2) / (8 * 3)) * 1.05
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(nrows, ncols, hspace=0.20, wspace=0.04,
+                          left=0.01, right=0.99, top=0.90, bottom=0.07)
+    axes = [fig.add_subplot(gs[divmod(i, ncols)]) for i in range(n)]
+    for extra in range(n, nrows * ncols):
+        fig.add_subplot(gs[divmod(extra, ncols)]).set_visible(False)
+    if suptitle:
+        fig.text(0.5, 0.962, suptitle, ha="center", va="bottom",
+                 fontsize=SUPTITLE_FONTSIZE, fontweight="bold")
+    if subtitle:
+        fig.text(0.5, 0.933, subtitle, ha="center", va="bottom",
+                 fontsize=SUBTITLE_FONTSIZE, color="#555555")
+    return fig, axes
+
+
+def _style_map_panel(ax, name, idx):
+    """Panel title + top-left bold letter, fig45 style (fontsize/position)."""
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(name, fontsize=MAP_TITLE_FONTSIZE, color=MAP_LETTER_COLOR, pad=2)
+    ax.annotate(
+        f"$\\mathbf{{{chr(97 + idx)}.}}$",
+        xy=(0.02, 1.02), xycoords="axes fraction",
+        ha="left", va="bottom", fontsize=MAP_LETTER_FONTSIZE, color=MAP_LETTER_COLOR,
+        path_effects=[withStroke(linewidth=1.5, foreground="white")], clip_on=False,
+    )
+
+
+def _overlay_shapefile(ax, shapefile_gdf):
+    """Thin admin-boundary overlay from shp_re -- plain lon/lat, no cartopy
+    reprojection needed since the regridded ERA5 archive is already on the
+    W5E5 (-180..180) grid, same as load_region_mask's masking."""
+    if shapefile_gdf is not None:
+        shapefile_gdf.boundary.plot(ax=ax, color="black", linewidth=0.2, zorder=3)
+
+
+def load_shapefile_gdf(shapefile_path):
+    if _HAS_GPD and shapefile_path and os.path.exists(shapefile_path):
+        return gpd.read_file(shapefile_path)
+    if shapefile_path and not _HAS_GPD:
+        print("geopandas unavailable -- discrepancy maps won't overlay the shapefile.")
+    return None
+
+
 def plot_r2_scatter(mean_severity, other_names, reference, out_path):
     """R2 (reference as ground truth) of long-term per-pixel mean severity."""
     fig, axes = _grid_axes(len(other_names))
@@ -175,45 +251,51 @@ def plot_r2_scatter(mean_severity, other_names, reference, out_path):
     return r2_results
 
 
-def plot_discrepancy_maps(mean_severity, other_names, reference, out_path, axis_thr=1e-6):
+def plot_discrepancy_maps(mean_severity, other_names, reference, out_path,
+                          shapefile_gdf=None, vmin=-5e-3, vmax=5e-3, axis_thr=1e-6):
     """
-    (config - default) mean-severity maps, with pixels where one side is
-    ~0 severity and the other isn't marked explicitly (axis mismatches).
+    (config - default) mean-severity maps, one shared colorbar fixed to
+    [vmin, vmax] across every panel so magnitudes are comparable
+    config-to-config. Axis-mismatch pixels (one side ~0 severity, the
+    other isn't) are still counted for the summary CSV but no longer
+    marked on the map.
     """
     ref = mean_severity[reference]
     lat, lon = ref["latitude"].values, ref["longitude"].values
     ref_vals = ref.values
-    lon2d, lat2d = np.meshgrid(lon, lat)
 
-    fig, axes = _grid_axes(len(other_names), figsize_per=(4.6, 3.8))
+    fig, axes = _map_grid_figure(
+        len(other_names),
+        suptitle="Mean-severity discrepancy vs default (absolute)",
+        subtitle=f"shared scale, fixed to [{vmin:g}, {vmax:g}]",
+    )
     counts = {}
-    for ax, name in zip(axes, other_names):
+    im = None
+    for idx, (ax, name) in enumerate(zip(axes, other_names)):
         method_vals = mean_severity[name].values
         diff = method_vals - ref_vals
-
-        vmax = np.nanpercentile(np.abs(diff), 99)
-        vmax = vmax if vmax > 0 else 1e-6
-        im = ax.pcolormesh(lon, lat, diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
 
         axis_x = (ref_vals <= axis_thr) & (method_vals > axis_thr)
         axis_y = (ref_vals > axis_thr) & (method_vals <= axis_thr)
         counts[name] = (int(np.nansum(axis_x)), int(np.nansum(axis_y)))
-        ax.scatter(lon2d[axis_x], lat2d[axis_x], s=6, facecolor="none", edgecolor="crimson", linewidth=0.6, marker="o")
-        ax.scatter(lon2d[axis_y], lat2d[axis_y], s=6, facecolor="none", edgecolor="lime", linewidth=0.6, marker="s")
 
-        ax.set_title(f"{name} - {reference}", fontsize=8)
-        ax.tick_params(labelsize=6)
-        cb = fig.colorbar(im, ax=ax, orientation="horizontal", pad=0.12, shrink=0.85, label="severity diff")
-        cb.ax.tick_params(labelsize=6)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+        im = ax.pcolormesh(lon, lat, diff, cmap="RdBu_r", vmin=vmin, vmax=vmax, shading="auto")
+        _overlay_shapefile(ax, shapefile_gdf)
+        _style_map_panel(ax, name, idx)
+
+    cbar_ax = fig.add_axes([0.18, 0.025, 0.64, 0.020])
+    cb = fig.colorbar(im, cax=cbar_ax, orientation="horizontal", extend="both")
+    cb.set_label("severity diff", fontsize=CBAR_LABEL_FONTSIZE)
+    cb.ax.tick_params(labelsize=CBAR_TICK_FONTSIZE)
+
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print("Wrote", out_path)
     return counts
 
 
 def plot_relative_discrepancy_maps(mean_severity, other_names, reference, out_path,
-                                   zero_thr=1e-6, pct_clip=99):
+                                   shapefile_gdf=None, zero_thr=1e-6, pct_clip=99):
     """(config - default) / default mean-severity maps, one shared colorbar."""
     ref = mean_severity[reference]
     lat, lon = ref["latitude"].values, ref["longitude"].values
@@ -230,15 +312,23 @@ def plot_relative_discrepancy_maps(mean_severity, other_names, reference, out_pa
     vmax = np.nanpercentile(np.abs(pooled), pct_clip) if pooled.size else 1.0
     vmax = vmax if vmax > 0 else 1.0
 
-    fig, axes = _grid_axes(len(other_names), figsize_per=(4.6, 3.8))
+    fig, axes = _map_grid_figure(
+        len(other_names),
+        suptitle="Mean-severity discrepancy vs default (relative)",
+        subtitle=f"shared scale, clipped at pct{pct_clip}=+-{vmax:.0f}%",
+    )
     im = None
-    for ax, name in zip(axes, other_names):
+    for idx, (ax, name) in enumerate(zip(axes, other_names)):
         im = ax.pcolormesh(lon, lat, rel_diff[name], cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
-        ax.set_title(f"{name} vs {reference}", fontsize=8)
-        ax.tick_params(labelsize=6)
-    fig.colorbar(im, ax=list(axes), orientation="horizontal", pad=0.12, shrink=0.5,
-                label=f"relative diff (%), shared scale clipped at pct{pct_clip}=+-{vmax:.0f}%")
-    fig.savefig(out_path, dpi=150)
+        _overlay_shapefile(ax, shapefile_gdf)
+        _style_map_panel(ax, name, idx)
+
+    cbar_ax = fig.add_axes([0.18, 0.025, 0.64, 0.020])
+    cb = fig.colorbar(im, cax=cbar_ax, orientation="horizontal", extend="both")
+    cb.set_label("relative diff (%)", fontsize=CBAR_LABEL_FONTSIZE)
+    cb.ax.tick_params(labelsize=CBAR_TICK_FONTSIZE)
+
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print("Wrote", out_path)
     return rel_diff
@@ -272,7 +362,7 @@ def plot_spearman_scatter(rel_change, other_names, reference, out_path):
 # Per-family analysis (mirrors compare_wind_methods.main()'s body)
 # =============================================================================
 
-def analyze_family(family, ds, alpha, ref_period, quantile, out_dir):
+def analyze_family(family, ds, alpha, ref_period, quantile, out_dir, shapefile_gdf=None):
     severities = compute_family_severity(family, ds, alpha, ref_period, quantile)
     other_names = [n for n in severities if n != REFERENCE]
     mean_severity = {n: s.mean(dim="year") for n, s in severities.items()}
@@ -283,14 +373,16 @@ def analyze_family(family, ds, alpha, ref_period, quantile, out_dir):
 
     axis_counts = plot_discrepancy_maps(
         mean_severity, other_names, REFERENCE,
-        os.path.join(out_dir, f"{family}_severity_discrepancy_map.png"))
+        os.path.join(out_dir, f"{family}_severity_discrepancy_map.png"),
+        shapefile_gdf=shapefile_gdf)
     for name, (n_x, n_y) in axis_counts.items():
         print(f"{name}: {n_x} pixels with {name}>0/{REFERENCE}~0, "
               f"{n_y} pixels with {REFERENCE}>0/{name}~0")
 
     plot_relative_discrepancy_maps(
         mean_severity, other_names, REFERENCE,
-        os.path.join(out_dir, f"{family}_severity_relative_discrepancy_map.png"))
+        os.path.join(out_dir, f"{family}_severity_relative_discrepancy_map.png"),
+        shapefile_gdf=shapefile_gdf)
 
     ref_start_year = int(pd.Timestamp(ref_period[0]).year)
     ref_end_year = int(pd.Timestamp(ref_period[1]).year)
@@ -363,10 +455,13 @@ def main():
     alpha = alpha.reindex(latitude=ds["latitude"], longitude=ds["longitude"],
                           method="nearest", tolerance=1e-6)
 
+    shapefile_gdf = load_shapefile_gdf(args.shapefile)
+
     families = ["wind", "solar"] if args.family == "both" else [args.family]
     for family in families:
         print(f"\n=== {family} CF tuning comparison ===")
-        analyze_family(family, ds, alpha, ref_period, args.quantile, args.out_dir)
+        analyze_family(family, ds, alpha, ref_period, args.quantile, args.out_dir,
+                       shapefile_gdf=shapefile_gdf)
 
 
 if __name__ == "__main__":
