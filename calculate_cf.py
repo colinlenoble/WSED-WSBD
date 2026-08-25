@@ -419,8 +419,19 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dref = dref.dropna(dim='location', how='all')
     print("Remaining locations:", dref.location.shape[0])
 
-    dhist = dhist.sel(location=dref.location).sortby('location')
-    dref = dref.sortby('location')
+    # dref's own constant/all-NaN scrub above says nothing about dhist: a
+    # location can have real variance in the reanalysis but be constant or
+    # all-NaN in the GCM historical run (e.g. after masking/regridding).
+    # MBCn's per-location energy-score training (ref vs. hist) divides by
+    # zero on such a location, so dhist needs the same scrub, and both
+    # sides must be re-intersected on the result.
+    dhist_matched = dhist.sel(location=dref.location).sortby('location')
+    dhist_matched = remove_constant_locations(dhist_matched)
+    dhist_matched = dhist_matched.dropna(dim='location', how='all')
+
+    dref = dref.sel(location=dhist_matched.location).sortby('location')
+    dhist = dhist_matched
+    print("Remaining locations after dhist scrub:", dref.location.shape[0])
 
     for ds_name, ds_obj in [('dref', dref), ('dhist', dhist)]:
         ds_obj = ds_obj.assign(
@@ -451,8 +462,24 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     # Align historical time axis onto the reference period
     hist = hist.assign_coords(time=hist.time - hist.time.values[-1] + ref.time.values[-1])
     common_times = np.intersect1d(ref.time.values, hist.time.values)
+    print(f"[Diag] ref.time size={ref.time.size}, hist.time size={hist.time.size}, "
+          f"common_times={common_times.size} "
+          f"(ref-only={ref.time.size - common_times.size}, "
+          f"hist-only={hist.time.size - common_times.size})")
     hist = hist.where(hist.time.isin(common_times))
     ref  = ref.where(ref.time.isin(common_times))
+
+    # .where() masks non-matching steps to NaN rather than dropping them, so
+    # a calendar-label mismatch between ref/hist shows up as NaNs scattered
+    # across time for every location, not as fully-NaN/constant locations
+    # (which is all remove_constant_locations can catch). Quantify that here.
+    for name, da in [('ref', ref), ('hist', hist)]:
+        nan_frac = float(da.isnull().mean().compute())
+        nan_per_loc = da.isnull().any('multivar').sum('time').compute()
+        print(f"[Diag] {name}: overall NaN fraction={nan_frac:.4%}, "
+              f"locations with >=1 NaN time step={int((nan_per_loc > 0).sum())} "
+              f"(out of {da.sizes['location']}), "
+              f"max NaN time steps at one location={int(nan_per_loc.max())}")
 
     ref  = ref.chunk({'time': -1, 'location': chunk_loc})
     hist = hist.chunk({'time': -1, 'location': chunk_loc})
