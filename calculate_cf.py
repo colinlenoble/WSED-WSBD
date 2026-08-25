@@ -533,10 +533,21 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     # rebuild it as a bare dict inside the delayed tasks, dropping .adjust().
     ADJ = delayed(ADJ, traverse=False)
 
-    # Load all future datasets eagerly so they are available inside delayed tasks
-    dfut_datasets = {
-        gwl: load_ds(GCM, ssp, run, path_folder, gwl) for gwl in gwl_unbias
-    }
+    # Load all future datasets eagerly so they are available inside delayed
+    # tasks. A GWL can be legitimately absent for a given GCM (e.g. a
+    # low-sensitivity model never reaches GWL3 under this ssp) -- skip it
+    # rather than aborting the whole GCM/ssp/run.
+    dfut_datasets = {}
+    for gwl in gwl_unbias:
+        try:
+            dfut_datasets[gwl] = load_ds(GCM, ssp, run, path_folder, gwl)
+        except FileNotFoundError as e:
+            print(f"Skipping {gwl} for {GCM}/{ssp}/{run}: {e}")
+    gwl_unbias = list(dfut_datasets)
+
+    if not gwl_unbias:
+        print("No future GWL data available for this GCM/ssp/run. Exiting function.")
+        return
 
     # ------------------------------------------------------------------
     # 2. Process each future GWL as a *true* Dask delayed task
@@ -1681,7 +1692,7 @@ if __name__ == "__main__":
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
     GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
-    GCM, run = 'CanESM5', 'r10i1p2f1'
+    # GCM, run = 'CanESM5', 'r10i1p2f1'
     
     # calculate_ds_cf_reanalysis(
     #     path_folder,
