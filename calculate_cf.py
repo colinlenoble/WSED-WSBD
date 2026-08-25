@@ -1680,7 +1680,7 @@ if __name__ == "__main__":
     cfg = DEFAULT_DS_CF_CONFIG
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
-    GCM, run = 'CanESM5', 'r10i1p1f1'
+    GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
 
     
     calculate_ds_cf_reanalysis(
