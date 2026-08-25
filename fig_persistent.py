@@ -81,7 +81,8 @@ def parse_args():
     parser.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
     parser.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
     parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
-    parser.add_argument("--output_dir", default="../final_figs")
+    parser.add_argument("--output_dir",
+                         default=os.path.join(config.SUMMARY_FIGS_DIR, "persistance"))
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--n_boot", type=int, default=2000)
     parser.add_argument("--save_nc", action="store_true", default=False)

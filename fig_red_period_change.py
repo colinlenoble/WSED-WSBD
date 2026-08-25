@@ -30,6 +30,8 @@ import rasterio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.colors import LogNorm, Normalize, BoundaryNorm, ListedColormap
 from matplotlib.patheffects import withStroke
 from string import ascii_lowercase
 
@@ -69,7 +71,8 @@ def parse_args():
     parser.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
     parser.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
     parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
-    parser.add_argument("--output_dir", default="../final_figs")
+    parser.add_argument("--output_dir",
+                         default=os.path.join(config.SUMMARY_FIGS_DIR, "persistance"))
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--save_nc", action="store_true", default=False)
     parser.add_argument("--save_events", action="store_true", default=False)
@@ -91,6 +94,36 @@ def compute_longest_event_duration(df_events_dedup, template_da, period):
     da_max = sub.groupby(["lat", "lon"])["duration"].max().to_xarray()
     da_max = da_max.reindex(lat=template_da.lat, lon=template_da.lon, fill_value=0).fillna(0)
     return da_max
+
+
+# =============================================================================
+# Discrete-classification helpers
+# =============================================================================
+
+def _sequential_discrete_edges(vmax, n_bins=5):
+    """
+    Bin edges for a >=0 quantity, front-loaded near zero (edges follow a
+    squared curve) so low-count regions are still told apart from each
+    other, not just lumped below the handful of high-count outliers.
+    """
+    vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
+    edges = np.linspace(0.0, vmax, n_bins + 1) ** 2 / vmax
+    edges[0] = 0.0
+    return edges
+
+
+def _diverging_discrete_edges(vmax):
+    """Symmetric +/- bin edges scaled to the observed extreme (same relative
+    breakpoints as the value-by-alpha change classification elsewhere)."""
+    vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
+    frac_edges = np.array([-1.0, -0.25, -0.1, 0.1, 0.25, 1.0])
+    return frac_edges * vmax
+
+
+def _discrete_cmap_norm(edges, base_cmap):
+    n_bins = len(edges) - 1
+    colors = base_cmap(np.linspace(0, 1, n_bins))
+    return ListedColormap(colors), BoundaryNorm(edges, n_bins)
 
 
 # =============================================================================
@@ -130,20 +163,21 @@ def plot_red_period_change(
     longest_comp = longest_comp.where(mask == 1)
     longest_diff = longest_comp - longest_hist
 
-    # --- Rows 1-2: annual event count above each duration threshold ---
+    # --- Rows 1-2: event count per decade above each duration threshold ---
     freq_rows = []
     for thr in duration_thresholds:
         da_thr = ds_final["n_events_gt_duration"].sel(duration_threshold=thr).where(mask == 1)
-        f_hist = da_thr.sel(year=slice(y0, y1)).mean("year")
-        f_comp = da_thr.sel(year=slice(y2, y3)).mean("year")
+        f_hist = da_thr.sel(year=slice(y0, y1)).mean("year") * 10.0
+        f_comp = da_thr.sel(year=slice(y2, y3)).mean("year") * 10.0
         freq_rows.append((f_hist, f_comp, f_comp - f_hist))
 
     row_data = [(longest_hist, longest_comp, longest_diff)] + freq_rows
     row_labels = (
         ["Longest RED event (days)"]
-        + [f"RED events/yr lasting > {thr} d" for thr in duration_thresholds]
+        + [f"RED events/decade lasting > {thr} d" for thr in duration_thresholds]
     )
     row_cmaps = [cmo.cm.matter, cmo.cm.solar.reversed(), cmo.cm.solar.reversed()]
+    diverging_cmap = cm.get_cmap("RdBu_r")
     col_titles = [f"{y0}-{y1}", f"{y2}-{y3}", "Difference"]
     panellabels = list(ascii_lowercase[:9])
 
@@ -153,17 +187,36 @@ def plot_red_period_change(
                               subplot_kw={"projection": ccrs.Robinson()})
 
     for r, (hist_da, comp_da, diff_da) in enumerate(row_data):
-        vmax_period = np.nanmax([np.nanmax(hist_da.values), np.nanmax(comp_da.values)])
-        vmax_period = vmax_period if np.isfinite(vmax_period) and vmax_period > 0 else 1.0
-        vabs_diff = np.nanmax(np.abs(diff_da.values))
-        vabs_diff = vabs_diff if np.isfinite(vabs_diff) and vabs_diff > 0 else 1.0
+        if r == 0:
+            # Longest event: log scale (duration spans orders of magnitude,
+            # from single-week events to multi-month ones) and a diff scale
+            # fixed to +/-5 d so typical changes aren't swamped by a few
+            # extreme pixels.
+            vmax_period = np.nanmax([np.nanmax(hist_da.values), np.nanmax(comp_da.values)])
+            vmax_period = vmax_period if np.isfinite(vmax_period) and vmax_period > 1 else 2.0
+            log_norm = LogNorm(vmin=1.0, vmax=vmax_period)
+            panel_specs = [
+                (hist_da.where(hist_da > 0), row_cmaps[r], log_norm, None),
+                (comp_da.where(comp_da > 0), row_cmaps[r], log_norm, None),
+                (diff_da, diverging_cmap, Normalize(vmin=-5.0, vmax=5.0), [-5, -2.5, 0, 2.5, 5]),
+            ]
+        else:
+            # Event counts: discrete classes so low- vs high-frequency
+            # regions are told apart at a glance, rather than blended along
+            # a continuous gradient.
+            vmax_period = np.nanmax([np.nanmax(hist_da.values), np.nanmax(comp_da.values)])
+            seq_edges = _sequential_discrete_edges(vmax_period)
+            seq_cmap, seq_norm = _discrete_cmap_norm(seq_edges, row_cmaps[r])
+            vabs_diff = np.nanmax(np.abs(diff_da.values))
+            div_edges = _diverging_discrete_edges(vabs_diff)
+            div_cmap, div_norm = _discrete_cmap_norm(div_edges, diverging_cmap)
+            panel_specs = [
+                (hist_da, seq_cmap, seq_norm, seq_edges),
+                (comp_da, seq_cmap, seq_norm, seq_edges),
+                (diff_da, div_cmap, div_norm, div_edges),
+            ]
 
-        panels = [
-            (hist_da, row_cmaps[r], 0.0, vmax_period),
-            (comp_da, row_cmaps[r], 0.0, vmax_period),
-            (diff_da, "RdBu_r", -vabs_diff, vabs_diff),
-        ]
-        for c, (da, cmap, vmin, vmax) in enumerate(panels):
+        for c, (da, cmap, norm, ticks) in enumerate(panel_specs):
             ax = axes[r, c]
             ax.set_global()
             ax.coastlines(resolution="50m", linewidth=0.15, color="black")
@@ -174,12 +227,17 @@ def plot_red_period_change(
             )
             mesh = ax.pcolormesh(
                 da.lon, da.lat, da.values,
-                transform=ccrs.PlateCarree(), cmap=cmap,
-                vmin=vmin, vmax=vmax, rasterized=True, zorder=3,
+                transform=ccrs.PlateCarree(), cmap=cmap, norm=norm,
+                rasterized=True, zorder=3,
             )
             shp.boundary.plot(ax=ax, color="black", linewidth=0.1,
                                transform=ccrs.PlateCarree(), zorder=6)
-            cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", shrink=0.7, pad=0.05)
+            if ticks is not None:
+                cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", shrink=0.7,
+                                     pad=0.05, ticks=ticks)
+                cbar.ax.set_xticklabels([f"{t:.1f}" for t in ticks], fontsize=4, rotation=45)
+            else:
+                cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", shrink=0.7, pad=0.05)
             cbar.ax.tick_params(labelsize=5)
             if c == 0:
                 cbar.set_label(row_labels[r], fontsize=5)
