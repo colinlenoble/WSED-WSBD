@@ -12,7 +12,11 @@ from xclim import sdba
 from dask import delayed, compute
 import geopandas as gpd
 import xagg as xa
+import rioxarray as rxr
 from rasterio.features import geometry_mask
+from rasterio.warp import reproject
+from rasterio.transform import from_bounds
+from rasterio.enums import Resampling
 import rasterio
 
 # Zarr/NetCDF-agnostic file lookup, opener, and atomic-write helpers
@@ -190,10 +194,14 @@ def get_gcm_shear_exponent(GCM, shear_by_gcm_dir, target_grid,
     already NaN (masked with shp_re.shp at fit time).
 
     No interpolation needed here -- unlike get_local_shear_exponent, the
-    cached alpha already sits on target_grid's exact lat/lon grid; this
-    just checks the shapes agree and reuses target_grid's own coordinate
-    values so downstream alignment (compute_wind_potential's xr.where) is
-    exact rather than relying on a float round-trip match.
+    cached alpha sits on GCM's native grid at the same resolution as
+    target_grid, just possibly over a wider lat/lon extent (e.g. the shear
+    cache was fit once on a looser domain crop than whatever shapefile-
+    cropped grid is in use now). Select target_grid's lat/lon out of the
+    cache (nearest, with a tight tolerance for float round-trip noise)
+    rather than requiring an exact shape match, and reuse target_grid's own
+    coordinate values so downstream alignment (compute_wind_potential's
+    xr.where) is exact.
     """
     path = os.path.join(shear_by_gcm_dir, f"shear_exponent_{GCM}_{ref_period[0]}_{ref_period[1]}.nc")
     if not os.path.exists(path):
@@ -202,11 +210,25 @@ def get_gcm_shear_exponent(GCM, shear_by_gcm_dir, target_grid,
             "Run shear_by_gcm/compute_shear_by_gcm.py first."
         )
     alpha = xr.open_dataset(path)['alpha']
-    expected_shape = (target_grid.sizes['lat'], target_grid.sizes['lon'])
-    if alpha.shape != expected_shape:
+
+    # tolerance must be applied per-dimension via separate .sel() calls --
+    # passing a single .sel(lat=..., lon=..., tolerance=(lat_tol, lon_tol))
+    # does NOT apply lat_tol/lon_tol per axis (verified: it raises KeyError
+    # even for points within each axis's own tolerance).
+    lat_res = float(np.median(np.abs(np.diff(alpha['lat'].values))))
+    lon_res = float(np.median(np.abs(np.diff(alpha['lon'].values))))
+    try:
+        alpha = alpha.sel(lat=target_grid['lat'], method='nearest', tolerance=lat_res / 4)
+        alpha = alpha.sel(lon=target_grid['lon'], method='nearest', tolerance=lon_res / 4)
+    except KeyError:
         raise ValueError(
-            f"Cached shear exponent grid {alpha.shape} for {GCM} does not match "
-            f"the target grid {expected_shape} -- refit with compute_shear_by_gcm.py."
+            f"Cached shear exponent grid for {GCM} "
+            f"(lat {alpha['lat'].values.min():.3f}..{alpha['lat'].values.max():.3f}, "
+            f"lon {alpha['lon'].values.min():.3f}..{alpha['lon'].values.max():.3f}) "
+            "does not cover the target grid "
+            f"(lat {target_grid['lat'].values.min():.3f}..{target_grid['lat'].values.max():.3f}, "
+            f"lon {target_grid['lon'].values.min():.3f}..{target_grid['lon'].values.max():.3f}) "
+            "-- refit with compute_shear_by_gcm.py."
         )
     return alpha.assign_coords(lat=target_grid['lat'], lon=target_grid['lon'])
 
@@ -1133,6 +1155,85 @@ def calculate_ds_cf_reanalysis(
 
 
 # -------------------------
+# Population-weighted temperature aggregation
+# -------------------------
+def align_pop_to_GCM_sum(pop_path, GCM, run, ssp, gwl, reanalysis, path_preprocessed, temp_folder):
+    """Reproject population raster onto the GCM grid (sum resampling)."""
+    da_path = get_output_filename(path_preprocessed, GCM, ssp, run, gwl, reanalysis)
+    tas = xr.open_dataset(da_path)["tas"]
+
+    pop = rxr.open_rasterio(pop_path, masked=True).squeeze("band", drop=True)
+
+    lat = tas["lat"].values
+    lon = tas["lon"].values
+    lat_asc = lat if lat[0] < lat[-1] else lat[::-1]
+    lon_asc = lon if lon[0] < lon[-1] else lon[::-1]
+
+    dlat = float(np.median(np.diff(lat_asc)))
+    dlon = float(np.median(np.diff(lon_asc)))
+    dst_transform = from_bounds(
+        lon_asc[0] - dlon / 2, lat_asc[0] - dlat / 2,
+        lon_asc[-1] + dlon / 2, lat_asc[-1] + dlat / 2,
+        len(lon_asc), len(lat_asc),
+    )
+
+    dst = np.zeros((len(lat_asc), len(lon_asc)), dtype=np.float64)
+    reproject(
+        source=np.asarray(pop.data, dtype=np.float64),
+        destination=dst,
+        src_transform=pop.rio.transform(),
+        src_crs=pop.rio.crs,
+        dst_transform=dst_transform,
+        dst_crs="EPSG:4326",
+        resampling=Resampling.sum,
+        src_nodata=np.nan,
+        dst_nodata=np.nan,
+    )
+
+    if lat[0] > lat[-1]:
+        dst = dst[::-1, :]
+    if lon[0] > lon[-1]:
+        dst = dst[:, ::-1]
+
+    pop_on_GCM = xr.DataArray(
+        dst,
+        coords={"lat": tas["lat"], "lon": tas["lon"]},
+        dims=("lat", "lon"),
+        name="pop",
+        attrs={"long_name": "Population aggregated on GCM grid", "aggregation": "sum"},
+    )
+    pop_on_GCM['lat'] = -pop_on_GCM['lat']
+    pop_on_GCM.to_netcdf(f"{temp_folder}{GCM}/pop_on_{GCM}.nc")
+    return pop_on_GCM
+
+
+def aggregate_tas(GCM, run, ssp, gwl, path_preprocessed, temp_folder, shapefile_path,
+                  reanalysis='W5E5', weight=True, suffix_shp=''):
+    tas = xr.open_dataset(
+        get_output_filename(path_preprocessed, GCM, ssp, run, gwl, reanalysis)
+    )['tas']
+
+    shapefile = gpd.read_file(shapefile_path)
+    if weight:
+        pop_gcm = xr.open_dataset(f"{temp_folder}{GCM}/pop_on_{GCM}.nc")['pop']
+        weight_map = xa.pixel_overlaps(tas, shapefile, weights=pop_gcm)
+    else:
+        weight_map = xa.pixel_overlaps(tas, shapefile)
+
+    agg_tas = xa.aggregate(tas.load(), weight_map).to_dataset()
+    agg_tas.attrs.update({
+        'units': 'dimensionless',
+        'long_name': 'Temperature by country/region',
+        'SOURCE': 'calculate_cf.py: aggregate_tas',
+        'AUTHOR': 'Colin Lenoble',
+    })
+    tag = 'tas_pop_agg' if weight else 'tas_agg'
+    agg_tas.to_netcdf(
+        f"{path_preprocessed}{GCM}/{tag}_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_{suffix_shp}.nc"
+    )
+
+
+# -------------------------
 # Spatial aggregation
 # -------------------------
 def aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder, gwl, shapefile_path,
@@ -1470,6 +1571,7 @@ if __name__ == "__main__":
     temp_folder       = config.TEMP_FOLDER
     era5_file_pattern = config.ERA5_WIND_PATTERN  # used by calculate_ds_cf_reanalysis only
     shear_by_gcm_dir  = config.SHEAR_BY_GCM_DIR    # used by the *_GCM functions below
+    pop_path          = config.POP_PATH            # used by align_pop_to_GCM_sum below
 
     ssp             = config.SSP
     gwl_list        = config.GWL_LIST
@@ -1533,3 +1635,16 @@ if __name__ == "__main__":
                                shear_by_gcm_dir=shear_by_gcm_dir)
             aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
                          gwl, shapefile_path, reanalysis, suffix_shp='v1')
+
+            if not os.path.exists(f"{temp_folder}{GCM}/pop_on_{GCM}.nc"):
+                print("  Aligning population to GCM grid...")
+                align_pop_to_GCM_sum(pop_path, GCM, run, ssp, gwl, reanalysis,
+                                     path_preprocessed, temp_folder)
+
+            tas_pop_agg_path = (f"{path_preprocessed}{GCM}/tas_pop_agg_"
+                               f"{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_v1.nc")
+            if not os.path.exists(tas_pop_agg_path):
+                print("  Aggregating population-weighted temperature...")
+                aggregate_tas(GCM, run, ssp, gwl, path_preprocessed, temp_folder,
+                             shapefile_path, reanalysis=reanalysis, weight=True,
+                             suffix_shp='v1')

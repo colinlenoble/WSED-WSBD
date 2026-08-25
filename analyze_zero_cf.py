@@ -449,7 +449,7 @@ def parse_args():
     ap.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
     ap.add_argument("--no_mask", action="store_true", help="skip the land/region shapefile mask")
     ap.add_argument("--no_plots", action="store_true", help="skip PNG quicklooks")
-    ap.add_argument("--out_dir", default="./zero_cf_diag")
+    ap.add_argument("--out_dir", default="../test/zero_cf_diag")
     return ap.parse_args()
 
 

@@ -30,6 +30,7 @@ SHAPEFILE_PATH_LIGHT = "/gpfs/workdir/shared/juicce/RE_Colin/shapefile_data/ne_m
 TEMP_FOLDER = "/gpfs/workdir/shared/juicce/RE_Colin/temp/"
 AGREEMENT_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/temp/trend_validation_masked.nc"
 SHARE_RENEWABLE_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/share_renewable.csv"
+POP_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ppp_2020_1km_Aggregated.tif"
 SUMMARY_FIGS_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures/"
 
 # Glob pattern for the reanalysis daily 10 m/100 m wind files (u10/v10/u100/v100,
