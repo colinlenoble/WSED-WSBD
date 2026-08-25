@@ -1,195 +1,220 @@
 # -*- coding: cp1252 -*-
 """
-Diagnostic script for the WSED/WSBD pipeline (build_ds_final in fig1.py).
+Standalone diagnostic for the ZeroDivisionError seen in unbias_GCM's MBCn
+training (xclim's _escore dividing by zero).
 
-Loads the raw wcf/scf zarr stores the same way fig1.py does and prints
-sanity-check stats at every stage (raw data -> thresholds -> compound flag
--> severity -> duration/frequency -> masked compound index), to find where
-huge/garbage values (e.g. ~1e12 in annual severity) are entering the
-pipeline.
+Reconstructs dref/dhist through exactly the same masking/regridding/unit
+steps as unbias_GCM (calculate_cf.py, up to just before the jitter /
+additive-space transform), then prints, per variable and per location, how
+many time steps are NaN. This is meant to answer one question concretely:
+is the NaN problem "a little bit of NaN spread across every location"
+(harmless) or "a subset of locations that are entirely NaN in one
+variable" (fatal for the multivariate MBCn training)?
 
-Run on the HPC (needs access to config.PATH_PREPROCESSED). By default it
-restricts the expensive duration/frequency step to a single small region
-(Western U.S., matching one of fig1's region boxes) so it runs fast; pass
---full to run duration_xr on the whole global grid instead.
-
-Usage:
-    python test.py
-    python test.py --reanalysis ERA5 --full
-    python test.py --lat 35 50 --lon -125 -105
+Run this on the server, in the same environment as calculate_cf.py.
 """
-import argparse
-import os
-
-import config
-os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
-os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
-
 import numpy as np
 import xarray as xr
+import xesmf as xe
+import geopandas as gpd
+import rasterio
 
-from io_utils import match_files, open_dataset_any
-from fig1 import (
-    compute_severity, duration_xr, build_land_mask_from_grid, build_land_mask,
+import config
+from calculate_cf import (
+    load_ds, filter_domain, set_variable_units, rasterize_shapefile,
+    _standardize_reanalysis_names,
+)
+from io_utils import match_files as _match_files, open_mfdataset_any
+
+GCM, run, ssp = 'CanESM5', 'r10i1p1f1', config.SSP
+path_folder = config.PATH_FOLDER
+shapefile_path = config.SHAPEFILE_PATH
+reanalysis = config.REANALYSIS
+
+print(f"Reconstructing dref/dhist for GCM={GCM}, run={run}, ssp={ssp}, reanalysis={reanalysis}")
+
+# ------------------------------------------------------------------
+# Same steps as unbias_GCM up to the point ref/hist locations are fixed
+# (calculate_cf.py, unbias_GCM, roughly lines 312-398)
+# ------------------------------------------------------------------
+dhist = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
+
+files_ref, _ = _match_files(__import__('os').path.join(path_folder, reanalysis, f"*{reanalysis}*"))
+if not files_ref:
+    raise FileNotFoundError(f"No reanalysis files found in {path_folder}{reanalysis}")
+dref = open_mfdataset_any(files_ref)
+dref = _standardize_reanalysis_names(dref)
+
+if 'sfcWind' not in dref:
+    print("Computing sfcWind from u10/v10")
+    dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
+
+dref = dref.sortby('lat').sortby('lon').sortby('time')
+dhist = dhist.sortby('lat').sortby('lon').sortby('time')
+dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
+
+lat_range = (dref.lat.values[0], dref.lat.values[-1])
+lon_range = (dref.lon.values[0], dref.lon.values[-1])
+dhist = filter_domain(dhist, lat_range, lon_range)
+dhist = dhist.chunk({'time': -1, 'lat': 20, 'lon': 20})
+
+mask_template = dref.tas.isel(time=0).load()
+shapefile = gpd.read_file(shapefile_path)
+lons, lats = np.meshgrid(mask_template.lon, mask_template.lat)
+coords = np.array([lons.flatten(), lats.flatten()]).T
+transform = rasterio.transform.from_bounds(
+    mask_template.lon.min().item(), mask_template.lat.min().item(),
+    mask_template.lon.max().item(), mask_template.lat.max().item(),
+    len(mask_template.lon), len(mask_template.lat)
+)
+mask = rasterize_shapefile(shapefile, coords, mask_template.shape, transform)
+mask = mask[::-1, :]
+
+dref = dref.where(mask == 1, np.nan)
+
+regridder = xe.Regridder(dref, dhist, method='conservative_normed')
+dref = regridder(dref, output_chunks={'lat': 50, 'lon': 50})
+dref = dref.convert_calendar('noleap').convert_calendar('standard')
+dhist = dhist.convert_calendar('noleap').convert_calendar('standard')
+
+ref_grid = dref.tas.isel(time=0)
+
+
+def create_mask_from_shapefile(grid, shapefile):
+    transform = rasterio.transform.from_bounds(
+        grid.lon.min().item(), grid.lat.min().item(),
+        grid.lon.max().item(), grid.lat.max().item(),
+        len(grid.lon), len(grid.lat)
+    )
+    from rasterio.features import geometry_mask
+    shape = (len(grid.lat), len(grid.lon))
+    mask = geometry_mask(
+        geometries=shapefile.geometry, all_touched=True,
+        out_shape=shape, transform=transform, invert=True
+    )
+    return xr.DataArray(
+        mask[::-1, :], dims=("lat", "lon"),
+        coords={"lat": grid.lat, "lon": grid.lon}
+    )
+
+
+mask_array = create_mask_from_shapefile(ref_grid, shapefile)
+
+var_units = {'sfcWind': 'm s-1', 'tas': 'K', 'rsds': 'W m-2'}
+dref = dref.where(mask_array)
+dhist = dhist.where(mask_array)
+dref = set_variable_units(dref, var_units)
+dhist = set_variable_units(dhist, var_units)
+
+dref = dref.sel(time=slice('1982-01-01', '2001-12-31'))
+dref = dref[['sfcWind', 'tas', 'rsds']]
+
+dref = dref.stack(location=("lat", "lon"))
+dhist = dhist.stack(location=("lat", "lon"))
+
+# ------------------------------------------------------------------
+# Diagnostics: is NaN spread thin, or concentrated in dead locations?
+# ------------------------------------------------------------------
+n_time_ref = dref.sizes['time']
+n_time_hist = dhist.sizes['time']
+print(f"\ndref time steps={n_time_ref}, dhist time steps={n_time_hist}\n")
+
+for name, ds in [('dref', dref), ('dhist', dhist)]:
+    print(f"--- {name} ---")
+    for v in ['tas', 'rsds', 'sfcWind']:
+        nan_per_loc = ds[v].isnull().sum('time').compute()
+        n_loc = nan_per_loc.sizes['location']
+        n_time = n_time_ref if name == 'dref' else n_time_hist
+
+        n_zero = int((nan_per_loc == 0).sum())
+        n_full = int((nan_per_loc == n_time).sum())
+        n_partial = n_loc - n_zero - n_full
+
+        print(f"  {v}: {n_loc} locations total")
+        print(f"    - fully valid (0 NaN steps):      {n_zero}")
+        print(f"    - fully NaN (all {n_time} steps):  {n_full}"
+              f"  <-- these poison the multivariate MBCn sample entirely")
+        print(f"    - partially NaN (some but not all): {n_partial}")
+        if n_partial > 0:
+            partial_counts = nan_per_loc.values[
+                (nan_per_loc.values > 0) & (nan_per_loc.values < n_time)
+            ]
+            print(f"      partial-NaN counts: min={partial_counts.min()}, "
+                  f"median={int(np.median(partial_counts))}, "
+                  f"max={partial_counts.max()} (out of {n_time})")
+
+        # zero-variance among the fully-valid locations (what
+        # remove_constant_locations's std==0 check actually catches)
+        std = ds[v].std(dim='time').compute()
+        n_const = int(((std == 0) & (nan_per_loc == 0)).sum())
+        print(f"    - constant but not NaN (std==0):    {n_const}")
+    print()
+
+print(
+    "Interpretation:\n"
+    "  'fully NaN' locations are invisible to a std==0 check (NaN std != 0)\n"
+    "  and survive dropna(how='all') if only ONE variable is dead there\n"
+    "  while the others are fine. Those are the ones that blow up xclim's\n"
+    "  _escore (n=0 samples -> division by zero). 'partially NaN' locations\n"
+    "  with only a handful of NaN steps (e.g. from the ref/hist calendar-\n"
+    "  label mismatch) are harmless by comparison."
 )
 
+# ------------------------------------------------------------------
+# Map the fully-NaN locations (headless server -> save PNG, no display)
+# ------------------------------------------------------------------
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import os
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Diagnose the WSED/WSBD pipeline for garbage values.")
-    p.add_argument("--path_preprocessed", default=config.PATH_PREPROCESSED)
-    p.add_argument("--reanalysis", default=config.REANALYSIS)
-    p.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
-    p.add_argument("--threshold", type=float, default=0.1)
-    p.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
-    p.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
-    p.add_argument("--lat", type=float, nargs=2, default=[35, 50],
-                    help="lat_lo lat_hi for the region subset used in the fast path")
-    p.add_argument("--lon", type=float, nargs=2, default=[-125, -105],
-                    help="lon_lo lon_hi for the region subset used in the fast path")
-    p.add_argument("--sane_bound", type=float, default=5.0,
-                    help="abs value beyond which raw wcf/scf are flagged as suspicious")
-    p.add_argument("--full", action="store_true", default=False,
-                    help="run duration_xr on the whole grid instead of a region subset")
-    return p.parse_args()
+out_dir = getattr(config, 'TEMP_FOLDER', os.getcwd())
+os.makedirs(out_dir, exist_ok=True)
 
+datasets = [('dref', dref, n_time_ref), ('dhist', dhist, n_time_hist)]
+variables = ['tas', 'rsds', 'sfcWind']
 
-def describe(da, name, top_n=5):
-    """Print min/max/mean/#nan/#inf and the top-N most extreme finite cells."""
-    vals = da.compute() if hasattr(da.data, "chunks") else da
-    v = vals.values
-    finite = np.isfinite(v)
-    n_total = v.size
-    n_nan = int(np.isnan(v).sum())
-    n_inf = int(np.isinf(v).sum())
-    print(f"\n--- {name} ---")
-    print(f"  shape={v.shape} dtype={v.dtype} total={n_total} nan={n_nan} inf={n_inf}")
-    if not finite.any():
-        print("  all values are NaN/inf -- nothing finite to summarize")
-        return
-    vf = v[finite]
-    print(f"  min={vf.min():.6g} max={vf.max():.6g} mean={vf.mean():.6g} std={vf.std():.6g}")
+fig, axes = plt.subplots(len(datasets), len(variables),
+                          figsize=(5 * len(variables), 5 * len(datasets)),
+                          squeeze=False)
 
-    flat = vals.values
-    order = np.argsort(-np.abs(np.where(np.isfinite(flat), flat, 0)).ravel())[:top_n]
-    idx_tuples = np.unravel_index(order, flat.shape)
-    print(f"  top {top_n} |value| cells:")
-    for k in range(len(order)):
-        coord_idx = tuple(int(idx_tuples[d][k]) for d in range(len(idx_tuples)))
-        sel = {dim: coord_idx[d] for d, dim in enumerate(vals.dims)}
-        cell = vals.isel(**sel)
-        coord_str = ", ".join(f"{d}={float(cell[d].values):.3f}" for d in vals.dims if d in cell.coords)
-        print(f"    value={float(cell.values):.6g}  ({coord_str})")
+for row, (name, ds, n_time) in enumerate(datasets):
+    lat_vals = ds.location.lat.values
+    lon_vals = ds.location.lon.values
+    for col, v in enumerate(variables):
+        ax = axes[row][col]
+        nan_per_loc = ds[v].isnull().sum('time').compute().values
+        is_full_nan = nan_per_loc == n_time
+        is_valid = nan_per_loc == 0
 
+        shapefile.boundary.plot(ax=ax, color='black', linewidth=0.5)
+        ax.scatter(lon_vals[is_valid], lat_vals[is_valid],
+                   s=6, c='lightgray', label=f'valid (n={int(is_valid.sum())})')
+        ax.scatter(lon_vals[~is_valid & ~is_full_nan], lat_vals[~is_valid & ~is_full_nan],
+                   s=6, c='orange', label=f'partial NaN (n={int((~is_valid & ~is_full_nan).sum())})')
+        ax.scatter(lon_vals[is_full_nan], lat_vals[is_full_nan],
+                   s=10, c='red', label=f'fully NaN (n={int(is_full_nan.sum())})')
 
-def main():
-    args = parse_args()
+        ax.set_title(f"{name}.{v}")
+        ax.set_xlabel('lon')
+        ax.set_ylabel('lat')
+        ax.legend(fontsize=7, loc='upper right', markerscale=2)
 
-    print(f"Loading wcf/scf for reanalysis={args.reanalysis}")
-    wcf_files, wfmt = match_files(os.path.join(args.path_preprocessed, args.reanalysis, "wcf_day_*"))
-    scf_files, sfmt = match_files(os.path.join(args.path_preprocessed, args.reanalysis, "scf_day_*"))
-    if not wcf_files:
-        raise FileNotFoundError(f"No wcf_day_* file found under {os.path.join(args.path_preprocessed, args.reanalysis)}")
-    if not scf_files:
-        raise FileNotFoundError(f"No scf_day_* file found under {os.path.join(args.path_preprocessed, args.reanalysis)}")
-    print(f"  wcf: {wcf_files[0]} ({wfmt})")
-    print(f"  scf: {scf_files[0]} ({sfmt})")
+fig.tight_layout()
+out_path = os.path.join(out_dir, 'nan_locations_diagnostic.png')
+fig.savefig(out_path, dpi=150)
+print(f"\nSaved NaN-location map to: {out_path}")
 
-    chunks = {"time": 1000, "lat": -1, "lon": -1}
-    wcf = open_dataset_any(wcf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
-    scf = open_dataset_any(scf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
-    wcf = wcf.convert_calendar("standard")
-    scf = scf.convert_calendar("standard")
-
-    print("\nEncoding (check for an un-decoded _FillValue/missing_value):")
-    print(f"  wcf.wcf.encoding: {wcf.wcf.encoding}")
-    print(f"  scf.scf.encoding: {scf.scf.encoding}")
-
-    # --- 1. Raw data sanity ---------------------------------------------------
-    describe(wcf.wcf, "raw wcf.wcf")
-    describe(scf.scf, "raw scf.scf")
-
-    n_wcf_extreme = int((np.abs(wcf.wcf) > args.sane_bound).sum().compute())
-    n_scf_extreme = int((np.abs(scf.scf) > args.sane_bound).sum().compute())
-    print(f"\nCells with |wcf.wcf| > {args.sane_bound}: {n_wcf_extreme}")
-    print(f"Cells with |scf.scf| > {args.sane_bound}: {n_scf_extreme}")
-    if n_wcf_extreme or n_scf_extreme:
-        print("  -> raw data has out-of-range values; this is the likely source of the")
-        print("     ~1e12 severity blow-up (unmasked fill/sentinel values surviving arithmetic).")
-
-    # --- 2. Thresholds ----------------------------------------------------------
-    print(f"\nComputing thresholds (quantile={args.threshold}, ref={args.ref_start}-{args.ref_end})")
-    wcf_ref = wcf.sel(time=slice(args.ref_start, args.ref_end))
-    scf_ref = scf.sel(time=slice(args.ref_start, args.ref_end))
-    wcf_thr = wcf_ref.wcf.where(wcf_ref.wcf > 0).quantile(args.threshold, dim="time")
-    scf_thr = scf_ref.scf.where(scf_ref.scf > 0).quantile(args.threshold, dim="time")
-    describe(wcf_thr, "wcf_thr")
-    describe(scf_thr, "scf_thr")
-
-    # --- 3. Compound flag direction / frequency ---------------------------------
-    print("\nDetecting compound events")
-    wcf["low_wind"] = xr.where(wcf.wcf <= wcf_thr, 1, 0)
-    scf["low_solar"] = xr.where(scf.scf <= scf_thr, 1, 0)
-    frac_low_wind = float(wcf["low_wind"].mean().compute())
-    frac_low_solar = float(scf["low_solar"].mean().compute())
-    print(f"  fraction of (day,pixel) flagged low_wind:  {frac_low_wind:.3f}")
-    print(f"  fraction of (day,pixel) flagged low_solar: {frac_low_solar:.3f}")
-    if frac_low_wind > 0.5 or frac_low_solar > 0.5:
-        print("  -> with threshold=quantile(0.1), a 'low' flag should fire on ~10% of days,")
-        print("     not the majority. Check the comparison direction (`>=` vs `<=`) against")
-        print("     wcf_thr/scf_thr in fig1.py's build_ds_final.")
-
-    compound = (wcf.low_wind * scf.low_solar).to_dataset(name="start_cooc")
-    frac_compound = float(compound.start_cooc.mean().compute())
-    print(f"  fraction of (day,pixel) flagged compound (start_cooc==1): {frac_compound:.3f}")
-
-    land_mask = build_land_mask_from_grid(compound.lat.values, compound.lon.values, args.shapefile)
-    land_mask_da = xr.DataArray(land_mask, dims=("lat", "lon"),
-                                coords={"lat": compound.lat, "lon": compound.lon})
-    compound["start_cooc"] = compound["start_cooc"].where(land_mask_da)
-
-    # --- 4. Severity --------------------------------------------------------
-    print("\nComputing severity")
-    severity_da = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr)
-    severity_da["time"] = severity_da.time.dt.year
-    severity_da = severity_da.rename({"time": "year"})
-    describe(severity_da, "severity (annual)")
-
-    # --- 5. Duration / frequency (region subset by default, --full for global) --
-    if args.full:
-        print("\nComputing duration and frequency (FULL GRID)")
-        da_for_duration = compound.start_cooc
-    else:
-        lat_lo, lat_hi = args.lat
-        lon_lo, lon_hi = args.lon
-        print(f"\nComputing duration and frequency (region subset lat={args.lat} lon={args.lon}; pass --full for the whole grid)")
-        da_for_duration = compound.start_cooc.sel(
-            lat=slice(min(lat_lo, lat_hi), max(lat_lo, lat_hi)),
-            lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)),
-        )
-        severity_da = severity_da.sel(
-            lat=slice(min(lat_lo, lat_hi), max(lat_lo, lat_hi)),
-            lon=slice(min(lon_lo, lon_hi), max(lon_lo, lon_hi)),
-        )
-
-    ds_dur, ds_freq = duration_xr(da_for_duration)
-    describe(ds_dur.duration, "duration")
-    describe(ds_freq.frequency, "frequency")
-
-    # --- 6. Assemble ds_final + land mask, exactly like build_ds_final ----------
-    ds_final = ds_dur.copy()
-    ds_final["frequency"] = ds_freq.frequency
-    ds_final["severity"] = severity_da
-    mask = build_land_mask(ds_final, args.shapefile)
-
-    da_index = (ds_final.frequency.where(mask == 1)
-                * ds_final.severity.where(mask == 1)
-                * ds_final.duration.where(mask == 1))
-    describe(da_index, "compound index (frequency * severity * duration), masked")
-
-    ts = da_index.mean(("lat", "lon"), skipna=True)
-    print("\nRegion-mean annual compound index (this is what the timeseries subplot draws):")
-    print(ts.to_series())
-
-
-if __name__ == "__main__":
-    main()
+# Also dump the fully-NaN dref locations (the ones that matter) to CSV
+for v in variables:
+    nan_per_loc = dref[v].isnull().sum('time').compute().values
+    is_full_nan = nan_per_loc == n_time_ref
+    if is_full_nan.any():
+        import pandas as pd
+        df_out = pd.DataFrame({
+            'lat': dref.location.lat.values[is_full_nan],
+            'lon': dref.location.lon.values[is_full_nan],
+        })
+        csv_path = os.path.join(out_dir, f'fully_nan_locations_dref_{v}.csv')
+        df_out.to_csv(csv_path, index=False)
+        print(f"Saved {len(df_out)} fully-NaN dref.{v} locations to: {csv_path}")

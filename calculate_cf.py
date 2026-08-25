@@ -352,9 +352,14 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dref['mask'] = xr.where(~np.isnan(dref.isel(time=0).tas), 1, 0)
     print("dref mask coverage:", float(dref['mask'].sum() / dref['mask'].count()))
 
-    # Regrid reference to dhist grid
+    # Regrid reference to dhist grid. skipna=True matters specifically for
+    # ssrd: it comes from ERA5-Land (ocean masked as NaN, native coverage
+    # only down to -57.1 S), unlike tas/sfcWind which come from full-globe
+    # ERA5. Without skipna, xesmf NaNs out any target cell that overlaps
+    # even one ocean source pixel, wiping out coastal land cells that do
+    # have valid ssrd data, not just genuinely NaN open-ocean cells.
     regridder = xe.Regridder(dref, dhist, method='conservative_normed')
-    dref = regridder(dref, output_chunks={'lat': 50, 'lon': 50})
+    dref = regridder(dref, skipna=True, output_chunks={'lat': 50, 'lon': 50})
     dref = dref.convert_calendar('noleap').convert_calendar('standard')
     dhist = dhist.convert_calendar('noleap').convert_calendar('standard')
 

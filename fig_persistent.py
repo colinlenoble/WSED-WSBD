@@ -202,7 +202,7 @@ def compute_severity_persistent(scf_roll, wcf_roll, scf_threshold, wcf_threshold
 
 def build_ds_final_persistent(
     path_preprocessed, reanalysis, threshold, ref_start, ref_end,
-    roll_window=7,
+    roll_window=7, duration_thresholds=(2, 3, 5, 7), return_events=False,
 ):
     print(f"  Loading wcf/scf for reanalysis={reanalysis}")
     wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
@@ -241,10 +241,11 @@ def build_ds_final_persistent(
     ds_dur, ds_freq = events_stats_from_table(
         df_events, compound,
     )
+    df_events_dedup = df_events.drop_duplicates(["event_id", "lat", "lon"])
 
-    print("  Computing event counts by duration threshold (>2, >3, >5, >7 days)")
+    print(f"  Computing event counts by duration threshold ({duration_thresholds})")
     ds_freq_by_dur = compute_freq_by_duration_thresholds(
-        df_events, compound, thresholds=(2, 3, 5, 7),
+        df_events, compound, thresholds=duration_thresholds,
     )
 
     print("  Computing severity of persistent compound events")
@@ -269,7 +270,10 @@ def build_ds_final_persistent(
 
     del wcf, scf, wcf_roll, scf_roll, low_wind, low_solar, compound
     gc.collect()
-    return ds_final.load()
+    ds_final = ds_final.load()
+    if return_events:
+        return ds_final, df_events_dedup
+    return ds_final
 
 
 # =============================================================================
