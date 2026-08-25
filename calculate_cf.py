@@ -724,10 +724,15 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         print("DS_CF ref files already exist, skipping.")
         return
 
-    # 1. Load GCM grid template
+    # 1. Load GCM grid template. Uses dadjusted_* (unbias_GCM's output) rather
+    # than wcf_day_* (calculate_ds_cf_GCM's output, derived from dadjusted_*)
+    # because only the lat/lon grid is needed here, and calculate_ds_cf_GCM
+    # -- which produces wcf_day_* -- runs later in the pipeline than this
+    # function; requiring wcf_day_* here would make GWL0-61 a circular
+    # dependency for any GCM/run seen for the first time.
     gcm_file_base = os.path.join(
         path_preprocessed, GCM,
-        f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}"
+        f"dadjusted_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}"
     )
     gcm_files, _ = _match_files(gcm_file_base)
     if not gcm_files:
