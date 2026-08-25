@@ -193,9 +193,9 @@ def _map_grid_figure(n, ncols=3, suptitle=None, subtitle=None):
     if suptitle:
         fig.text(0.5, 0.962, suptitle, ha="center", va="bottom",
                  fontsize=SUPTITLE_FONTSIZE, fontweight="bold")
-    if subtitle:
-        fig.text(0.5, 0.933, subtitle, ha="center", va="bottom",
-                 fontsize=SUBTITLE_FONTSIZE, color="#555555")
+    # if subtitle:
+    #     fig.text(0.5, 0.933, subtitle, ha="center", va="bottom",
+    #              fontsize=SUBTITLE_FONTSIZE, color="#555555")
     return fig, axes
 
 

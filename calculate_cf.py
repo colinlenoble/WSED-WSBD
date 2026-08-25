@@ -1236,6 +1236,119 @@ def aggregate_tas(GCM, run, ssp, gwl, path_preprocessed, temp_folder, shapefile_
 # -------------------------
 # Spatial aggregation
 # -------------------------
+def aggregate_ds_cf_ref_GCM(GCM, path_preprocessed, temp_folder, shapefile_path,
+                            reanalysis='ERA5', suffix_shp='v1',
+                            cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG):
+    """
+    Aggregate the GCM-grid reference wcf_ref/scf_ref (calculate_ds_cf_reanalysis_grid_GCM's
+    output) by region -- independent of any per-GWL wcf_day/scf_day file, so
+    it can run right after calculate_ds_cf_reanalysis_grid_GCM instead of
+    being tied to the per-GWL aggregate_ds_cf loop.
+
+    wcf_ref/scf_ref are already masked to shapefile_path *before* being
+    regridded onto the GCM grid (see calculate_ds_cf_reanalysis_grid_GCM,
+    step 3 runs before step 4) -- this function only aggregates that
+    already-masked-and-regridded data, it does not mask or regrid again.
+
+    suffix_shp controls the weighting scheme (see aggregate_ds_cf):
+      'v1' : weighted by climate reference capacity factors
+      'v2' : weighted by grid-cell area only
+    """
+    if suffix_shp not in ('v1', 'v2'):
+        raise ValueError(
+            f"Unknown suffix_shp {suffix_shp!r}. "
+            "Expected 'v1' (capacity-factor weighted) or 'v2' (area weighted)."
+        )
+
+    scf_ref_agg_path = f"{path_preprocessed}{GCM}/scf_agg_ref_{GCM}_{reanalysis}_{suffix_shp}.nc"
+    wcf_ref_agg_path = f"{path_preprocessed}{GCM}/wcf_agg_ref_{GCM}_{reanalysis}_{suffix_shp}.nc"
+    if os.path.exists(scf_ref_agg_path) and os.path.exists(wcf_ref_agg_path):
+        print("Reference aggregation files already exist, skipping:",
+              scf_ref_agg_path, wcf_ref_agg_path)
+        return
+
+    wcf_suffix = '' if cfg.wind_method == 'shear_local' else f'_{cfg.wind_method}'
+    wcf_ref_files, _ = _match_files(f"{path_preprocessed}{GCM}/wcf_ref_{GCM}_{reanalysis}{wcf_suffix}")
+    scf_ref_files, _ = _match_files(f"{path_preprocessed}{GCM}/scf_ref_{GCM}_{reanalysis}")
+    if not wcf_ref_files:
+        raise FileNotFoundError(
+            f"No wcf_ref file found for {GCM}/{reanalysis}. "
+            "Run calculate_ds_cf_reanalysis_grid_GCM first."
+        )
+    if not scf_ref_files:
+        raise FileNotFoundError(
+            f"No scf_ref file found for {GCM}/{reanalysis}. "
+            "Run calculate_ds_cf_reanalysis_grid_GCM first."
+        )
+    wcf_ref = open_dataset_any(wcf_ref_files[0]).sel(time=slice('1982-01-01', '2001-12-31'))
+    scf_ref = open_dataset_any(scf_ref_files[0]).sel(time=slice('1982-01-01', '2001-12-31'))
+
+    shapefile = gpd.read_file(shapefile_path)
+    os.makedirs(f"{temp_folder}{GCM}/", exist_ok=True)
+
+    # Weight map filenames match aggregate_ds_cf's -- whichever of the two
+    # functions runs first builds the cache, the other reuses it.
+    scf_wm_path = f"{temp_folder}{GCM}/{GCM}_weightmap_scf_{suffix_shp}"
+    wcf_wm_path = f"{temp_folder}{GCM}/{GCM}_weightmap_wcf_{suffix_shp}"
+
+    if suffix_shp == 'v1':
+        if not os.path.exists(scf_wm_path):
+            scf_weight_map = xa.pixel_overlaps(scf_ref, shapefile,
+                                               weights=scf_ref.scf.mean(dim='time'))
+            scf_weight_map.to_file(scf_wm_path)
+        else:
+            scf_weight_map = xa.read_wm(scf_wm_path)
+
+        if not os.path.exists(wcf_wm_path):
+            wcf_weight_map = xa.pixel_overlaps(wcf_ref, shapefile,
+                                               weights=wcf_ref.wcf.mean(dim='time'))
+            wcf_weight_map.to_file(wcf_wm_path)
+        else:
+            wcf_weight_map = xa.read_wm(wcf_wm_path)
+    else:
+        if not os.path.exists(scf_wm_path):
+            scf_weight_map = xa.pixel_overlaps(scf_ref, shapefile)
+            scf_weight_map.to_file(scf_wm_path)
+        else:
+            scf_weight_map = xa.read_wm(scf_wm_path)
+
+        if not os.path.exists(wcf_wm_path):
+            wcf_weight_map = xa.pixel_overlaps(wcf_ref, shapefile)
+            wcf_weight_map.to_file(wcf_wm_path)
+        else:
+            wcf_weight_map = xa.read_wm(wcf_wm_path)
+
+    weighting_desc = (
+        'weighted by mean solar/wind capacity factor over reference period 1982-2001'
+        if suffix_shp == 'v1' else
+        'weighted by grid-cell area only (no capacity factor)'
+    )
+
+    if not os.path.exists(scf_ref_agg_path):
+        agg_solar_ref = xa.aggregate(scf_ref.load(), scf_weight_map).to_dataset()
+        agg_solar_ref.attrs.update({
+            'units': 'dimensionless',
+            'long_name': 'PVtot potential by country/region (reference)',
+            'weighting': weighting_desc,
+            'SOURCE': 'aggregate_ds_cf_ref_GCM',
+            'AUTHOR': 'Colin Lenoble',
+        })
+        agg_solar_ref.to_netcdf(scf_ref_agg_path)
+        print("Written", scf_ref_agg_path)
+
+    if not os.path.exists(wcf_ref_agg_path):
+        agg_wind_ref = xa.aggregate(wcf_ref.load(), wcf_weight_map).to_dataset()
+        agg_wind_ref.attrs.update({
+            'units': 'dimensionless',
+            'long_name': 'Wind potential by country/region (reference)',
+            'weighting': weighting_desc,
+            'SOURCE': 'aggregate_ds_cf_ref_GCM',
+            'AUTHOR': 'Colin Lenoble',
+        })
+        agg_wind_ref.to_netcdf(wcf_ref_agg_path)
+        print("Written", wcf_ref_agg_path)
+
+
 def aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder, gwl, shapefile_path,
                   reanalysis='ERA5', suffix_shp='v1'):
     """
@@ -1343,20 +1456,6 @@ def aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder, gwl, shapefil
     agg_solar.to_netcdf(
         f"{path_preprocessed}{GCM}/scf_agg_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_{suffix_shp}.nc")
 
-    # Reference aggregation  v1 only
-    if suffix_shp == 'v1':
-        scf_ref_agg_path = f"{path_preprocessed}{GCM}/scf_agg_ref_{GCM}_{reanalysis}.nc"
-        if not os.path.exists(scf_ref_agg_path):
-            agg_solar_ref = xa.aggregate(scf_ref.load(), scf_weight_map).to_dataset()
-            agg_solar_ref.attrs.update({
-                'units': 'dimensionless',
-                'long_name': 'PVtot potential by country/region (reference)',
-                'weighting': weighting_desc,
-                'SOURCE': 'aggregate_ds_cf',
-                'AUTHOR': 'Colin Lenoble',
-            })
-            agg_solar_ref.to_netcdf(scf_ref_agg_path)
-
     # ------------------------------------------------------------------
     # Wind aggregation
     # ------------------------------------------------------------------
@@ -1370,20 +1469,6 @@ def aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder, gwl, shapefil
     })
     agg_wind.to_netcdf(
         f"{path_preprocessed}{GCM}/wcf_agg_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_{suffix_shp}.nc")
-
-    # Reference aggregation v1 only
-    if suffix_shp == 'v1':
-        wcf_ref_agg_path = f"{path_preprocessed}{GCM}/wcf_agg_ref_{GCM}_{reanalysis}.nc"
-        if not os.path.exists(wcf_ref_agg_path):
-            agg_wind_ref = xa.aggregate(wcf_ref.load(), wcf_weight_map).to_dataset()
-            agg_wind_ref.attrs.update({
-                'units': 'dimensionless',
-                'long_name': 'Wind potential by country/region (reference)',
-                'weighting': weighting_desc,
-                'SOURCE': 'aggregate_ds_cf',
-                'AUTHOR': 'Colin Lenoble',
-            })
-            agg_wind_ref.to_netcdf(wcf_ref_agg_path)
 
 
 def aggregate_ds_cf_reanalysis(
@@ -1598,20 +1683,20 @@ if __name__ == "__main__":
     GCM, run = 'CanESM5', 'r10i1p1f1'
 
     
-    # calculate_ds_cf_reanalysis(
-    #     path_folder,
-    #     path_preprocessed,
-    #     era5_file_pattern,
-    #     reanalysis='ERA5',
-    #     shapefile_path=shapefile_path,
-    #     cfg=cfg,
-    #     pv_cfg=pv_cfg,
-    #     shear_ref_period=shear_ref_period
-    # )
+    calculate_ds_cf_reanalysis(
+        path_folder,
+        path_preprocessed,
+        era5_file_pattern,
+        reanalysis='ERA5',
+        shapefile_path=shapefile_path,
+        cfg=cfg,
+        pv_cfg=pv_cfg,
+        shear_ref_period=shear_ref_period
+    )
 
   
-    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
-    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
+    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
+    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
 
     unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
                 path_folder, gwl_list, reanalysis)
@@ -1620,31 +1705,38 @@ if __name__ == "__main__":
                                        shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
                                        shear_ref_period=shear_ref_period,
                                        shear_by_gcm_dir=shear_by_gcm_dir)
-    # --- Loop over GCM-run pairs, skip GWLs that don't exist ---
-    for _, row in df_to_process.iterrows():
-        GCM = row['GCM']
-        run = row['run']
-        print(f"\n--- Processing {GCM} {run} ---")
-        for gwl in gwl_list:
-            if not row[gwl]:
-                print(f"  Skipping {gwl} (file not available)")
-                continue
-            print(f"  Processing {gwl}")
-            calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
-                               cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
-                               shear_by_gcm_dir=shear_by_gcm_dir)
-            aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
-                         gwl, shapefile_path, reanalysis, suffix_shp='v1')
+    aggregate_ds_cf_ref_GCM(GCM, path_preprocessed, temp_folder, shapefile_path,
+                            reanalysis=reanalysis, suffix_shp='v1', cfg=cfg)
+    # --- Loop over gwl_list for the GCM/run just unbiased above, gated on
+    # dadjusted_* existence rather than df_to_process/row[gwl]. df_to_process
+    # is a wcf_day_* inventory snapshot taken at the very start of __main__,
+    # before unbias_GCM produced anything -- so a GCM/run processed for the
+    # first time in this same script run is never in it (see the earlier
+    # "Empty DataFrame" case), and gating on it would skip every GWL just
+    # unbiased. dadjusted_* is unbias_GCM's own direct output, so it's
+    # authoritative regardless of when this run started. ---
+    print(f"\n--- Processing {GCM} {run} ---")
+    for gwl in gwl_list:
+        dadj_path = get_output_filename(path_preprocessed, GCM, ssp, run, gwl, reanalysis)
+        if not os.path.exists(dadj_path):
+            print(f"  Skipping {gwl} (dadjusted file not available)")
+            continue
+        print(f"  Processing {gwl}")
+        calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
+                           cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
+                           shear_by_gcm_dir=shear_by_gcm_dir)
+        aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
+                     gwl, shapefile_path, reanalysis, suffix_shp='v1')
 
-            if not os.path.exists(f"{temp_folder}{GCM}/pop_on_{GCM}.nc"):
-                print("  Aligning population to GCM grid...")
-                align_pop_to_GCM_sum(pop_path, GCM, run, ssp, gwl, reanalysis,
-                                     path_preprocessed, temp_folder)
+        if not os.path.exists(f"{temp_folder}{GCM}/pop_on_{GCM}.nc"):
+            print("  Aligning population to GCM grid...")
+            align_pop_to_GCM_sum(pop_path, GCM, run, ssp, gwl, reanalysis,
+                                 path_preprocessed, temp_folder)
 
-            tas_pop_agg_path = (f"{path_preprocessed}{GCM}/tas_pop_agg_"
-                               f"{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_v1.nc")
-            if not os.path.exists(tas_pop_agg_path):
-                print("  Aggregating population-weighted temperature...")
-                aggregate_tas(GCM, run, ssp, gwl, path_preprocessed, temp_folder,
-                             shapefile_path, reanalysis=reanalysis, weight=True,
-                             suffix_shp='v1')
+        tas_pop_agg_path = (f"{path_preprocessed}{GCM}/tas_pop_agg_"
+                           f"{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_v1.nc")
+        if not os.path.exists(tas_pop_agg_path):
+            print("  Aggregating population-weighted temperature...")
+            aggregate_tas(GCM, run, ssp, gwl, path_preprocessed, temp_folder,
+                         shapefile_path, reanalysis=reanalysis, weight=True,
+                         suffix_shp='v1')

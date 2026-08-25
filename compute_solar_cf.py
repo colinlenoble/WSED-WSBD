@@ -42,6 +42,15 @@ class PVGISCoefficients:
     compute_solar_cf) purely so a user-supplied 7-parameter coefficient set
     can be plugged in; it defaults to 0, which reduces to the standard
     PVGIS formula above.
+
+    eff_rel is a polynomial fit over PVGIS's normal operating range of G'
+    (roughly 0.03-1.2); it is not valid as G' -> 0. The ln(G')**2 / T'*ln(G')**2
+    terms diverge there, and since k1/k2/k5 vary a lot by technology (e.g.
+    cdte's |k1|,|k2| are ~3x csi's), that divergence shows up as large,
+    technology-dependent spurious capacity factors -- worst at high
+    latitude, where many days have a tiny but nonzero daily-mean irradiance
+    (long dawn/dusk, near-polar-night) instead of a clean zero. g_min_wm2
+    floors this the same way wind speeds below cut-in are floored to 0.
     """
     k1: float = 0.0
     k2: float = 0.0
@@ -52,6 +61,7 @@ class PVGISCoefficients:
     k7: float = 0.0
     u0: float = 26.9
     u1: float = 6.2
+    g_min_wm2: float = 20.0
 
 
 # Relative-efficiency coefficient sets from the PVGIS "Data sources and
@@ -110,13 +120,14 @@ def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_
     rsds    : surface irradiance (W/m2)
     sfcwind : wind speed at module height (m/s)
     """
-    G = xr.where(rsds > 0, rsds, 0.0)
+    above_floor = rsds > cfg.g_min_wm2
+    G = xr.where(above_floor, rsds, 0.0)
     G_prime = G / 1000.0
 
     Tm = tas + G / (cfg.u0 + cfg.u1 * sfcwind)
     T_prime = Tm - 25.0
 
-    ln_G = xr.where(G_prime > 0, np.log(xr.where(G_prime > 0, G_prime, 1.0)), 0.0)
+    ln_G = xr.where(above_floor, np.log(xr.where(above_floor, G_prime, 1.0)), 0.0)
 
     eff_rel = (1
               + cfg.k1 * ln_G
@@ -127,5 +138,8 @@ def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_
               + cfg.k6 * T_prime**2
               + cfg.k7 * ln_G**3)
 
-    cf = xr.where(G_prime > 0, G_prime * eff_rel, 0.0)
+    # Below g_min_wm2, eff_rel is extrapolating the log-polynomial outside
+    # its fitted range and can diverge (see PVGISCoefficients docstring) --
+    # treat those steps as producing 0, same as a below-cut-in wind day.
+    cf = xr.where(above_floor, G_prime * eff_rel, 0.0)
     return cf
