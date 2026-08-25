@@ -402,13 +402,20 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     wind_low = 1e-6
 
     def remove_constant_locations(da, dim='time'):
+        """Drop locations where any single variable is constant or entirely
+        NaN across `dim`. An all-NaN slice has std == NaN, which `std == 0`
+        alone does not catch (NaN == 0 is False), so it's checked explicitly
+        -- otherwise a location with just one dead variable (e.g. rsds NaN
+        everywhere while tas/sfcWind are fine) silently survives and poisons
+        the multivariate (stacked) sample used downstream."""
         for v in da.data_vars:
             if dim in da[v].dims:
                 std = da[v].std(dim=dim)
-                is_const = (std == 0).compute()
+                is_allnan = da[v].isnull().all(dim=dim)
+                is_const = ((std == 0) | is_allnan).compute()
                 if is_const.any():
                     idx_to_remove = da.location[is_const]
-                    print(f"Variable '{v}': removing {len(idx_to_remove)} constant locations.")
+                    print(f"Variable '{v}': removing {len(idx_to_remove)} constant/all-NaN locations.")
                     da = da.drop_sel(location=idx_to_remove)
         return da
 
