@@ -180,6 +180,64 @@ def compute_freq_by_duration_thresholds(df, template_da, thresholds=(2, 3, 5, 7)
     return xr.concat(counts, dim=pd.Index(list(thresholds), name="duration_threshold"))
 
 
+def build_duration_class_mask(df, template_da, duration_class, time_dim="time"):
+    """
+    Boolean (time, lat, lon) mask, same shape as `template_da`, reconstructed
+    from the event table: True on days belonging to an event whose total
+    duration matches `duration_class`, a (op, value) pair with op in
+    {'eq', 'ge'} (e.g. ('eq', 1) for single-day events, ('ge', 3) for events
+    lasting 3 days or more). Vectorized via index lookup rather than
+    re-walking the runs.
+    """
+    op, val = duration_class
+    if op == "eq":
+        sub = df[df["duration"] == val]
+    elif op == "ge":
+        sub = df[df["duration"] >= val]
+    else:
+        raise ValueError(f"Unknown duration_class op: {op!r}")
+
+    times = template_da[time_dim].values
+    lats = template_da.lat.values
+    lons = template_da.lon.values
+    mask = np.zeros((len(times), len(lats), len(lons)), dtype=bool)
+    if not sub.empty:
+        t_idx = pd.Index(times).get_indexer(sub["time"].values)
+        lat_idx = pd.Index(lats).get_indexer(sub["lat"].values)
+        lon_idx = pd.Index(lons).get_indexer(sub["lon"].values)
+        mask[t_idx, lat_idx, lon_idx] = True
+    return xr.DataArray(mask, dims=(time_dim, "lat", "lon"),
+                         coords={time_dim: times, "lat": lats, "lon": lons})
+
+
+def compute_annual_stats_for_duration_class(df_events_dedup, template_da, duration_class,
+                                             time_dim="time"):
+    """
+    Annual (year, lat, lon) event frequency (count) and mean duration for
+    events matching `duration_class` (see build_duration_class_mask for the
+    (op, value) convention). Reindexed onto template_da's full grid/year
+    range, 0-filled where no qualifying event occurred that year.
+    """
+    op, val = duration_class
+    if op == "eq":
+        sub = df_events_dedup[df_events_dedup["duration"] == val]
+    elif op == "ge":
+        sub = df_events_dedup[df_events_dedup["duration"] >= val]
+    else:
+        raise ValueError(f"Unknown duration_class op: {op!r}")
+
+    full_years = np.unique(pd.DatetimeIndex(template_da[time_dim].values).year)
+    freq = (sub.groupby(["year", "lat", "lon"]).size()
+            .rename("frequency").to_xarray())
+    dur = (sub.groupby(["year", "lat", "lon"])["duration"].mean()
+           .rename("duration").to_xarray())
+    freq = freq.reindex(year=full_years, lat=template_da.lat, lon=template_da.lon,
+                         fill_value=0).fillna(0)
+    dur = dur.reindex(year=full_years, lat=template_da.lat, lon=template_da.lon,
+                       fill_value=0).fillna(0)
+    return freq, dur
+
+
 def compute_severity_persistent(scf_roll, wcf_roll, scf_threshold, wcf_threshold):
     """
     Expected shortfall on persistent compound-drought days: mean positive
@@ -201,10 +259,15 @@ def compute_severity_persistent(scf_roll, wcf_roll, scf_threshold, wcf_threshold
 # Dataset computation
 # =============================================================================
 
-def build_ds_final_persistent(
-    path_preprocessed, reanalysis, threshold, ref_start, ref_end,
-    roll_window=7, duration_thresholds=(2, 3, 5, 7), return_events=False,
-):
+def build_persistent_pipeline(path_preprocessed, reanalysis, threshold, ref_start, ref_end,
+                               roll_window=7):
+    """
+    Shared first stage of the persistent-event pipeline: loads wcf/scf,
+    applies the roll_window-day rolling mean, defines low-week thresholds
+    from the reference period, and flags compound (wind AND solar)
+    low-production days. Returns (wcf, scf, wcf_roll, scf_roll, wcf_thr,
+    scf_thr, compound) -- everything downstream computations need.
+    """
     print(f"  Loading wcf/scf for reanalysis={reanalysis}")
     wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
     scf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "scf_day_*"))
@@ -236,6 +299,17 @@ def build_ds_final_persistent(
 
     print("  Combining into compound (wind AND solar) low-production days")
     compound = (low_wind & low_solar).astype(int)
+
+    return wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound
+
+
+def build_ds_final_persistent(
+    path_preprocessed, reanalysis, threshold, ref_start, ref_end,
+    roll_window=7, duration_thresholds=(2, 3, 5, 7), return_events=False,
+):
+    wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound = build_persistent_pipeline(
+        path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window,
+    )
 
     print("  Building event table of compound low-production spells")
     df_events = compute_event_table(compound)
@@ -269,12 +343,71 @@ def build_ds_final_persistent(
     ds_final["wcf_ref_mean"] = wcf_roll_ref_mean
     ds_final["scf_ref_mean"] = scf_roll_ref_mean
 
-    del wcf, scf, wcf_roll, scf_roll, low_wind, low_solar, compound
+    del wcf, scf, wcf_roll, scf_roll, compound
     gc.collect()
     ds_final = ds_final.load()
     if return_events:
         return ds_final, df_events_dedup
     return ds_final
+
+
+# Event-duration classes used by the value-by-alpha decomposition: label ->
+# (op, value) as understood by build_duration_class_mask /
+# compute_annual_stats_for_duration_class. "all" == ("ge", 1) since every
+# event lasts at least 1 day by construction, so it is mathematically the
+# unrestricted index -- kept as a class like any other rather than special-cased.
+DECOMPOSITION_DURATION_CLASSES = [
+    ("all", ("ge", 1)),
+    ("eq1", ("eq", 1)),
+    ("eq2", ("eq", 2)),
+    ("ge3", ("ge", 3)),
+]
+DECOMPOSITION_CLASS_LABELS = ["All events", "Exactly 1 day", "Exactly 2 days", "3+ days"]
+
+
+def build_duration_decomposition_persistent(
+    path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window=7,
+    duration_classes=DECOMPOSITION_DURATION_CLASSES,
+):
+    """
+    Annual (year, lat, lon) persistent-drought severity index
+    (frequency * mean duration * severity), decomposed by event-duration
+    class -- e.g. only single-day events, only 2-day events, events lasting
+    3+ days, and (as just another class) all events combined. Returns
+    ({label: annual_index_DataArray}, resource_valid).
+    """
+    wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound = build_persistent_pipeline(
+        path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window,
+    )
+
+    print("  Building event table of compound low-production spells")
+    df_events = compute_event_table(compound)
+    df_events_dedup = df_events.drop_duplicates(["event_id", "lat", "lon"])
+
+    print("  Building resource/land validity mask (reference-period non-NaN wcf & scf)")
+    wcf_ref_mean = wcf.wcf.sel(time=slice(ref_start, ref_end)).mean("time")
+    scf_ref_mean = scf.scf.sel(time=slice(ref_start, ref_end)).mean("time")
+    resource_valid = (wcf_ref_mean.notnull() & scf_ref_mean.notnull()).astype("int8").load()
+
+    deficit_scf = -(scf_roll - scf_thr)
+    deficit_wcf = -(wcf_roll - wcf_thr)
+    daily_deficit = deficit_scf + deficit_wcf
+
+    indices = {}
+    for label, duration_class in duration_classes:
+        print(f"  Computing decomposed annual index for class '{label}'")
+        class_mask = build_duration_class_mask(df_events, compound, duration_class)
+        freq, dur = compute_annual_stats_for_duration_class(
+            df_events_dedup, compound, duration_class,
+        )
+        severity = xr.where(class_mask, daily_deficit, np.nan).resample(time="YE").mean()
+        severity["time"] = severity.time.dt.year
+        severity = severity.rename({"time": "year"}).fillna(0.0)
+        indices[label] = (freq * dur * severity).load()
+
+    del wcf, scf, wcf_roll, scf_roll, compound, daily_deficit
+    gc.collect()
+    return indices, resource_valid
 
 
 # =============================================================================
@@ -337,6 +470,54 @@ def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
 
 
 # =============================================================================
+# Value-by-alpha discrete classification (colour = relative change,
+# opacity = historical-period baseline magnitude)
+# =============================================================================
+
+def compute_valuebyalpha_rgba(da, period_hist, period_comp, n_bins_change=5, n_bins_sev=5):
+    """
+    From an already masked/lat-clipped (year, lat, lon) severity-like index,
+    build the value-by-alpha RGBA array: colour encodes relative change
+    between period_comp and period_hist, opacity encodes the period_hist
+    baseline magnitude. Returns (rgba_map, sev, dChange, color_levels,
+    alpha_levels) -- the last two are the legend key for rgba_map.
+    """
+    y0, y1 = period_hist
+    y2, y3 = period_comp
+    da_hist = da.sel(year=slice(y0, y1)).mean("year", skipna=True)
+    da_comp = da.sel(year=slice(y2, y3)).mean("year", skipna=True)
+    rel_change = 100.0 * (da_comp - da_hist) / da_hist
+    rel_change = rel_change.where(np.isfinite(rel_change))
+    sev = da_hist
+    dChange = rel_change
+
+    # --- Discrete colour bins ---
+    change_edges = [-100, -25, -10, 10, 25, 100]
+    change_bin = np.digitize(dChange.values, change_edges[1:-1])
+    base_cmap = cm.get_cmap("coolwarm")
+    color_levels = base_cmap(np.linspace(0, 1, n_bins_change))
+
+    # --- Discrete alpha bins ---
+    max_sev = float(np.nanmax(sev.values)) if np.isfinite(sev.values).any() else 1.0
+    max_sev = max_sev if max_sev > 0 else 1.0
+    sev_edges = np.linspace(0, max_sev, n_bins_sev + 1) ** 2 / max_sev
+    sev_bin = np.digitize(sev.values, sev_edges[1:-1])
+    alpha_min, alpha_max = 0.4, 1.0
+    alpha_levels = np.linspace(alpha_min, alpha_max, n_bins_sev)
+
+    # --- RGBA assembly ---
+    nlat, nlon = dChange.shape
+    valid_mask = np.isfinite(dChange.values) & np.isfinite(sev.values)
+    rgba_map = np.zeros((nlat, nlon, 4), dtype=float)
+    cb = np.clip(change_bin, 0, n_bins_change - 1)
+    sb = np.clip(sev_bin, 0, n_bins_sev - 1)
+    rgba_map[valid_mask, :3] = color_levels[cb[valid_mask], :3]
+    rgba_map[valid_mask, 3] = alpha_levels[sb[valid_mask]]
+
+    return rgba_map, sev, dChange, color_levels, alpha_levels
+
+
+# =============================================================================
 # Figure: Value-by-alpha map + regional time series (persistent events)
 # =============================================================================
 
@@ -356,38 +537,12 @@ def plot_valuebyalpha_persistent(
     da = da.sel(lat=slice(-60, 68))
     da = da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
 
-    y0, y1 = period_hist
-    y2, y3 = period_comp
+    y0, y3 = period_hist[0], period_comp[1]
     years_all = da.sel(year=slice(y0, y3)).year.values.astype(float)
-    da_hist = da.sel(year=slice(y0, y1)).mean("year", skipna=True)
-    da_comp = da.sel(year=slice(y2, y3)).mean("year", skipna=True)
-    rel_change = 100.0 * (da_comp - da_hist) / da_hist
-    rel_change = rel_change.where(np.isfinite(rel_change))
-    sev = da.sel(year=slice(y0, y1)).mean("year", skipna=True)
-    dChange = rel_change
 
-    # --- 2. Discrete colour bins ---
-    change_edges = [-100, -25, -10, 10, 25, 100]
-    change_bin = np.digitize(dChange.values, change_edges[1:-1])
-    base_cmap = cm.get_cmap("coolwarm")
-    color_levels = base_cmap(np.linspace(0, 1, n_bins_change))
-
-    # --- 3. Discrete alpha bins ---
-    max_sev = float(np.nanmax(sev.values)) if np.isfinite(sev.values).any() else 1.0
-    max_sev = max_sev if max_sev > 0 else 1.0
-    sev_edges = np.linspace(0, max_sev, n_bins_sev + 1) ** 2 / max_sev
-    sev_bin = np.digitize(sev.values, sev_edges[1:-1])
-    alpha_min, alpha_max = 0.4, 1.0
-    alpha_levels = np.linspace(alpha_min, alpha_max, n_bins_sev)
-
-    # --- 4. RGBA assembly ---
-    nlat, nlon = dChange.shape
-    valid_mask = np.isfinite(dChange.values) & np.isfinite(sev.values)
-    rgba_map = np.zeros((nlat, nlon, 4), dtype=float)
-    cb = np.clip(change_bin, 0, n_bins_change - 1)
-    sb = np.clip(sev_bin, 0, n_bins_sev - 1)
-    rgba_map[valid_mask, :3] = color_levels[cb[valid_mask], :3]
-    rgba_map[valid_mask, 3] = alpha_levels[sb[valid_mask]]
+    rgba_map, sev, _, color_levels, alpha_levels = compute_valuebyalpha_rgba(
+        da, period_hist, period_comp, n_bins_change=n_bins_change, n_bins_sev=n_bins_sev,
+    )
 
     # --- 5. Region definitions ---
     if regions is None:
@@ -531,6 +686,102 @@ def plot_valuebyalpha_persistent(
     ax_map.spines["geo"].set_visible(False)
     ax_map.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
     plt.tight_layout()
+    return fig
+
+
+# =============================================================================
+# Figure: Value-by-alpha decomposition by event-duration class
+# =============================================================================
+
+def plot_valuebyalpha_decomposition_persistent(
+    indices, mask, shapefile_path,
+    period_hist=(1982, 2001), period_comp=(2002, 2021),
+    lat_min=-60, lat_max=72,
+    class_labels=DECOMPOSITION_CLASS_LABELS,
+    suptitle="Persistent compound WSE drought decomposition by event duration (ERA5)",
+    n_bins_change=5, n_bins_sev=5,
+):
+    """
+    2x2 grid of value-by-alpha maps (colour = relative change, opacity =
+    historical-period baseline severity): panel (a) uses the unrestricted
+    persistent-drought index (all events); panels (b)-(d) use the same
+    index restricted to a single event-duration class. `indices` is an
+    ordered mapping {label: (year, lat, lon) DataArray} in the same order
+    as `class_labels` (see build_duration_decomposition_persistent).
+    """
+    shp = gpd.read_file(shapefile_path)
+    panellabels = list(ascii_lowercase[:len(class_labels)])
+
+    fig_width_in = FIG_WIDTH_IN * 1.6
+    fig_height_in = fig_width_in * 0.95
+    fig, axes = plt.subplots(2, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
+                              subplot_kw={"projection": ccrs.Robinson()})
+    axes_flat = axes.flatten()
+
+    for i, (da_full, label) in enumerate(zip(indices.values(), class_labels)):
+        ax = axes_flat[i]
+        da = da_full.where(mask == 1)
+        da = da.sel(lat=slice(-60, 68))
+        da = da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
+
+        rgba_map, sev, _, color_levels, alpha_levels = compute_valuebyalpha_rgba(
+            da, period_hist, period_comp, n_bins_change=n_bins_change, n_bins_sev=n_bins_sev,
+        )
+
+        da_mask_ref = da.isel(year=0)
+        t_mask = rasterio.transform.from_bounds(
+            da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
+            da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
+            len(da_mask_ref.lon), len(da_mask_ref.lat),
+        )
+        land_mask = rasterize_shapefile(shp, da_mask_ref.shape, t_mask)[::-1, :]
+        ocean_mask = land_mask & (mask == 0)
+
+        ax.set_global()
+        ax.imshow(
+            rgba_map,
+            extent=[sev.lon.min().item(), sev.lon.max().item(),
+                    sev.lat.min().item(), sev.lat.max().item()],
+            origin="lower", transform=ccrs.PlateCarree(),
+            interpolation="nearest", rasterized=True,
+        )
+        ax.contourf(
+            da_mask_ref.lon, da_mask_ref.lat, ocean_mask.astype(float),
+            levels=[0.5, 1], colors=["gray"],
+            transform=ccrs.PlateCarree(), zorder=5,
+        )
+        shp.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                           transform=ccrs.PlateCarree(), zorder=10)
+        ax.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
+        ax.annotate(
+            f"$\\mathbf{{{panellabels[i]}}}$",
+            xy=(0.02, 1.02), xycoords="axes fraction",
+            ha="left", va="bottom", fontsize=7,
+            path_effects=[withStroke(linewidth=1.5, foreground="white")],
+        )
+        ax.set_title(label, fontsize=7, pad=6)
+        ax.set_extent([-180, 180, lat_min, lat_max], crs=ccrs.PlateCarree())
+        ax.spines["geo"].set_visible(False)
+
+        legend_rgba = np.zeros((n_bins_change, n_bins_sev, 4))
+        for ic in range(n_bins_change):
+            legend_rgba[ic, :, :3] = color_levels[ic, :3]
+            legend_rgba[ic, :, 3] = alpha_levels
+        legend_ax = ax.inset_axes([0.02, 0.02, 0.22, 0.22])
+        legend_ax.imshow(legend_rgba, origin="lower", aspect="equal")
+        legend_ax.set_xticks([0, n_bins_sev // 2, n_bins_sev - 1])
+        legend_ax.set_xticklabels(["low", "mid", "high"], fontsize=4, ha="center")
+        legend_ax.set_yticks([0.5, 1.5, 2.5, 3.5])
+        legend_ax.set_yticklabels(["-25%", "-10%", "10%", "25%"], fontsize=4, va="center")
+        legend_ax.tick_params(axis="both", which="both", length=0)
+
+    fig.suptitle(
+        f"{suptitle}\n"
+        f"Colour: relative change ({period_comp[0]}-{period_comp[1]} vs "
+        f"{period_hist[0]}-{period_hist[1]}); opacity: historical baseline severity",
+        fontsize=7,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
     return fig
 
 

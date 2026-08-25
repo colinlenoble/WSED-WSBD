@@ -3,13 +3,16 @@
 Compare wind / solar capacity-factor *tuning* choices against the default
 model on real ERA5 data, reusing compare_wind_methods.py's compound
 low-wind/low-solar "severity" metric (expected shortfall on compound-event
-days) and comparison methodology -- R2 scatter of long-term mean severity,
+days) and comparison methodology -- R2 and MAE of long-term mean severity,
 discrepancy/relative-discrepancy maps, and Spearman rank correlation of the
 reference-period -> rest-of-record relative change -- but generalized from
 the 3 wind_method extrapolation strategies to a broader set of tuning
 choices: the wind turbine power curve (cut-in/rated/cut-out speed) plus the
-3 wind_method options, and the PVGIS solar technology/mounting presets
-(compute_solar_cf.PVGIS_K_PRESETS / PVGIS_U_PRESETS).
+3 wind_method options, the PVGIS solar technology/mounting presets
+(compute_solar_cf.PVGIS_K_PRESETS / PVGIS_U_PRESETS), and (folded in from
+the former analyze_zero_cf.py) the wind low-event threshold's zero-handling
+("raw_threshold": the naive `wcf_ref.quantile(q)` with zeros included,
+compared against the pipeline default `wcf_ref.where(wcf_ref>0).quantile(q)`).
 
 For each family ("wind" or "solar"), "default" is the reference every other
 tuning config is compared against (unlike compare_wind_methods.py, which
@@ -17,15 +20,40 @@ uses wind100 as reference); the *other* CF model (solar when sweeping wind,
 wind when sweeping solar) stays fixed at its own default throughout, so
 each family's comparison isolates that one model's tuning choice.
 
+Zero-inflation background (why "raw_threshold" exists): every
+threshold-fitting step in this pipeline computes the "low wind"/"low solar"
+event threshold as the q-th quantile of *non-zero* CF values only
+(`x_ref.where(x_ref > 0).quantile(q)`). Solar is zero every night by
+construction, so filtering zeros there just keeps the threshold meaningful
+over daylight hours. Wind is zero whenever wind speed is below the
+turbine's cut-in speed; a pixel where wind speed is *always* below cut-in
+has wcf == 0 on every day of the reference period, so `.where(wcf_ref>0)`
+turns the whole slice to NaN and the quantile comes out NaN -- `wcf <=
+wcf_thr` is then False every day, and the pixel silently contributes 0 to
+frequency/severity instead of being flagged high-risk. The "wind" family's
+zero-fraction diagnostics (printed before the severity sweep) and the
+"raw_threshold" config quantify how much this default zero-filtering
+choice matters.
+
 Source data / dependencies: identical to compare_wind_methods.py (see its
 docstring) -- config.ERA5_REGRID_ZARR2_DIR, dependency-light imports
 (wind_potential.py / compute_solar_cf.py only, no xesmf/xclim/xagg), plain
 lat/lon pcolormesh maps (no cartopy).
 
+Outputs (under --out_dir), per family:
+  {family}_severity_r2_scatter.png
+  {family}_severity_discrepancy_map.png
+  {family}_severity_relative_discrepancy_map.png
+  {family}_severity_relchange_spearman_scatter.png
+  {family}_tuning_comparison_summary.csv   -- R2, MAE, Spearman rho/p-value,
+                                               n_pixels, axis-mismatch counts,
+                                               one row per non-default config
+
 Usage:
     python compare_cf_tuning.py
     python compare_cf_tuning.py --family wind
     python compare_cf_tuning.py --family solar --limit 48   # quick test
+    python compare_cf_tuning.py --family wind --skip_zero_diagnostics
 """
 import argparse
 import os
@@ -102,17 +130,86 @@ _FAMILY_CONFIGS = {"wind": WIND_TUNING_CONFIGS, "solar": SOLAR_TUNING_CONFIGS}
 
 
 # =============================================================================
+# Zero-inflation diagnostics (folded in from the former analyze_zero_cf.py).
+# Wind-only: wind speed below a turbine's cut-in speed makes wcf exactly 0,
+# and a pixel that's always below cut-in over the reference period turns the
+# default `.where(wcf_ref>0).quantile(q)` threshold into NaN there (see
+# module docstring). These are printed diagnostics only, run once before the
+# wind severity sweep -- the "raw_threshold" config below is what actually
+# quantifies the effect on severity (R2/MAE/Spearman, alongside every other
+# tuning config, in the summary CSV).
+# =============================================================================
+
+def zero_fraction(da, dim="time"):
+    """Fraction of exactly-zero steps along `dim`, out of the non-NaN steps."""
+    valid = da.notnull().sum(dim)
+    n_zero = (da == 0).sum(dim)
+    return xr.where(valid > 0, n_zero / valid, np.nan)
+
+
+def summarize_zero_fraction(frac, label):
+    """Print a distribution of per-pixel zero-fraction (NaNs, e.g. outside
+    the region mask, excluded)."""
+    vals = frac.values
+    valid = np.isfinite(vals)
+    n_valid = int(valid.sum())
+    print(f"\n--- Zero-fraction summary: {label} ({n_valid} valid pixels) ---")
+    if n_valid == 0:
+        return
+    bins = [(-1e-9, 1e-9, "== 0%  (never zero)"),
+            (1e-9, 0.01, "0-1%"),
+            (0.01, 0.10, "1-10%"),
+            (0.10, 0.50, "10-50%"),
+            (0.50, 0.90, "50-90%"),
+            (0.90, 0.999, "90-99.9%"),
+            (0.999, 1.0 + 1e-9, ">=99.9% (essentially always zero)")]
+    for lo, hi, name in bins:
+        n = int(np.sum(valid & (vals > lo) & (vals <= hi)))
+        pct = 100.0 * n / n_valid
+        print(f"  {name:35s}: {n:8d} pixels ({pct:5.1f}%)")
+    print(f"  mean zero-fraction = {np.nanmean(vals):.4f}, median = {np.nanmedian(vals):.4f}")
+
+
+def report_removal_cutoffs(frac_wcf_ref):
+    """Show how many pixels get flagged as 'always-zero wind' at several
+    candidate cutoffs, to make the removal criterion's sensitivity explicit."""
+    vals = frac_wcf_ref.values
+    n_valid = int(np.isfinite(vals).sum())
+    print(f"\n--- 'Always-zero wind' pixel counts by cutoff ({n_valid} valid pixels) ---")
+    for cutoff in (1.0, 0.99, 0.95, 0.90):
+        n = int(np.nansum(vals >= cutoff))
+        pct = 100.0 * n / n_valid if n_valid else np.nan
+        print(f"  zero-fraction >= {cutoff:5.2f}: {n:6d} pixels ({pct:5.2f}% of land)")
+    print("  These pixels have wind speed permanently (or almost permanently) below "
+          "cut-in over the reference period: 'wcf_ref.where(wcf_ref>0).quantile(q)' sees "
+          "an all-NaN slice there, returns NaN, and the resulting 'low_wind' flag is False "
+          "every day -- i.e. they silently drop out of frequency/severity instead of being "
+          "counted as high-risk. See the 'raw_threshold' row in the wind summary CSV for "
+          "how much this shifts R2/MAE/Spearman of mean severity.")
+
+
+def report_zero_diagnostics(wcf_default, ref_period):
+    frac_full = zero_fraction(wcf_default).load()
+    frac_ref = zero_fraction(wcf_default.sel(time=slice(*ref_period))).load()
+    summarize_zero_fraction(frac_full, "wind_full_record")
+    summarize_zero_fraction(frac_ref, "wind_reference_period")
+    report_removal_cutoffs(frac_ref)
+
+
+# =============================================================================
 # Severity (reproduces compare_wind_methods.yearly_severity_for_method,
 # split so wcf/scf can be supplied independently -- that version always
 # recomputes wcf from cfg and takes scf as a fixed input, which only fits
 # the wind sweep; here either side can be the one held fixed.)
 # =============================================================================
 
-def _yearly_severity(wcf, scf, ref_period, quantile):
+def _yearly_severity(wcf, scf, ref_period, quantile, filter_zero_wind=True, filter_zero_solar=True):
     wcf_ref = wcf.sel(time=slice(*ref_period))
     scf_ref = scf.sel(time=slice(*ref_period))
-    wcf_thr = wcf_ref.where(wcf_ref > 0).quantile(quantile, dim="time")
-    scf_thr = scf_ref.where(scf_ref > 0).quantile(quantile, dim="time")
+    wcf_src = wcf_ref.where(wcf_ref > 0) if filter_zero_wind else wcf_ref
+    scf_src = scf_ref.where(scf_ref > 0) if filter_zero_solar else scf_ref
+    wcf_thr = wcf_src.quantile(quantile, dim="time")
+    scf_thr = scf_src.quantile(quantile, dim="time")
 
     low_wind = xr.where(wcf <= wcf_thr, 1, 0)
     low_solar = xr.where(scf <= scf_thr, 1, 0)
@@ -123,11 +220,16 @@ def _yearly_severity(wcf, scf, ref_period, quantile):
     return severity.rename({"time": "year"}).compute()
 
 
-def compute_family_severity(family, ds, alpha, ref_period, quantile):
+def compute_family_severity(family, ds, alpha, ref_period, quantile, skip_zero_diagnostics=False):
     """
     Yearly per-pixel severity for every tuning config in `family`. The
     non-swept CF model (solar when family='wind', wind when family='solar')
     is held at its own default throughout, computed once and reused.
+
+    For family='wind', an extra "raw_threshold" config is appended: same
+    wcf/scf as "default", but the low-wind threshold is fit on the raw
+    (zero-inclusive) quantile instead of the pipeline's zero-filtered one --
+    see the module docstring and report_zero_diagnostics.
     """
     configs = _FAMILY_CONFIGS[family]
 
@@ -135,6 +237,9 @@ def compute_family_severity(family, ds, alpha, ref_period, quantile):
     wcf_default = compute_wind_potential_from_hub_wind(wind_hub_default, DEFAULT_DS_CF_CONFIG).persist()
     scf_default = compute_solar_cf(ds["tas"], ds["rsds"], ds["sfcWind"],
                                    cfg=DEFAULT_PVGIS_COEFFICIENTS).persist()
+
+    if family == "wind" and not skip_zero_diagnostics:
+        report_zero_diagnostics(wcf_default, ref_period)
 
     severities = {}
     for name, cfg in configs.items():
@@ -154,6 +259,14 @@ def compute_family_severity(family, ds, alpha, ref_period, quantile):
 
         severities[name] = _yearly_severity(wcf, scf, ref_period, quantile)
         print(f"  done ({severities[name].sizes['year']} years).")
+
+    if family == "wind":
+        print("Computing wind severity for tuning config: 'raw_threshold' "
+              "(zero-inclusive low-wind quantile threshold)...")
+        severities["raw_threshold"] = _yearly_severity(
+            wcf_default, scf_default, ref_period, quantile, filter_zero_wind=False)
+        print(f"  done ({severities['raw_threshold'].sizes['year']} years).")
+
     return severities
 
 
@@ -228,27 +341,37 @@ def load_shapefile_gdf(shapefile_path):
     return None
 
 
+def _mae(y_true, y_pred):
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not valid.any():
+        return np.nan
+    return float(np.mean(np.abs(y_true[valid] - y_pred[valid])))
+
+
 def plot_r2_scatter(mean_severity, other_names, reference, out_path):
-    """R2 (reference as ground truth) of long-term per-pixel mean severity."""
+    """R2 and MAE (reference as ground truth) of long-term per-pixel mean severity."""
     fig, axes = _grid_axes(len(other_names))
     y_true = mean_severity[reference].values.ravel()
     r2_results = {}
+    mae_results = {}
     for ax, name in zip(axes, other_names):
         y_pred = mean_severity[name].values.ravel()
         r2, n = r2_score(y_true, y_pred)
+        mae = _mae(y_true, y_pred)
         r2_results[name] = r2
+        mae_results[name] = mae
         ax.scatter(y_true, y_pred, s=4, alpha=0.3)
         lims = [0, np.nanmax([np.nanmax(y_true), np.nanmax(y_pred)])]
         ax.plot(lims, lims, "k--", lw=1, label="1:1")
         ax.set_xlabel(f"Mean severity ({reference})", fontsize=7)
         ax.set_ylabel(f"Mean severity ({name})", fontsize=7)
-        ax.set_title(f"{name}\nR2={r2:.3f}, n={n}", fontsize=8)
+        ax.set_title(f"{name}\nR2={r2:.3f}, MAE={mae:.3g}, n={n}", fontsize=8)
         ax.legend(fontsize=6)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print("Wrote", out_path)
-    return r2_results
+    return r2_results, mae_results
 
 
 def plot_discrepancy_maps(mean_severity, other_names, reference, out_path,
@@ -362,12 +485,14 @@ def plot_spearman_scatter(rel_change, other_names, reference, out_path):
 # Per-family analysis (mirrors compare_wind_methods.main()'s body)
 # =============================================================================
 
-def analyze_family(family, ds, alpha, ref_period, quantile, out_dir, shapefile_gdf=None):
-    severities = compute_family_severity(family, ds, alpha, ref_period, quantile)
+def analyze_family(family, ds, alpha, ref_period, quantile, out_dir, shapefile_gdf=None,
+                   skip_zero_diagnostics=False):
+    severities = compute_family_severity(family, ds, alpha, ref_period, quantile,
+                                         skip_zero_diagnostics=skip_zero_diagnostics)
     other_names = [n for n in severities if n != REFERENCE]
     mean_severity = {n: s.mean(dim="year") for n, s in severities.items()}
 
-    r2_results = plot_r2_scatter(
+    r2_results, mae_results = plot_r2_scatter(
         mean_severity, other_names, REFERENCE,
         os.path.join(out_dir, f"{family}_severity_r2_scatter.png"))
 
@@ -399,6 +524,7 @@ def analyze_family(family, ds, alpha, ref_period, quantile, out_dir, shapefile_g
     summary = pd.DataFrame({
         "config": other_names,
         "R2_mean_severity_vs_default": [r2_results[n] for n in other_names],
+        "MAE_mean_severity_vs_default": [mae_results[n] for n in other_names],
         "spearman_rho_relchange_vs_default": [spearman_results[n][0] for n in other_names],
         "spearman_pvalue": [spearman_results[n][1] for n in other_names],
         "n_pixels": [spearman_results[n][2] for n in other_names],
@@ -435,6 +561,8 @@ def main():
     ap.add_argument("--quantile", type=float, default=0.1, help="low-wind/low-solar event threshold (fraction)")
     ap.add_argument("--limit", type=int, default=None, help="only load the first N monthly stores (for testing)")
     ap.add_argument("--no_mask", action="store_true", help="skip the land/region shapefile mask")
+    ap.add_argument("--skip_zero_diagnostics", action="store_true",
+                    help="skip the wind zero-fraction diagnostic report (printed by default)")
     args = ap.parse_args()
     ref_period = (args.ref_start, args.ref_end)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -461,7 +589,8 @@ def main():
     for family in families:
         print(f"\n=== {family} CF tuning comparison ===")
         analyze_family(family, ds, alpha, ref_period, args.quantile, args.out_dir,
-                       shapefile_gdf=shapefile_gdf)
+                       shapefile_gdf=shapefile_gdf,
+                       skip_zero_diagnostics=args.skip_zero_diagnostics)
 
 
 if __name__ == "__main__":
