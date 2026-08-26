@@ -1,25 +1,28 @@
 # -*- coding: cp1252 -*-
 """
-Persistent compound wind-solar Renewable Energy Drought (RED): value-by-alpha
+Compound wind-solar Renewable Energy Drought (RED): value-by-alpha
 decomposition by event-duration class.
 
-Produces two 2x2 figures (colour = relative change between period_comp and
-period_hist, opacity = period_hist baseline severity), each decomposing the
-persistent-drought severity index (frequency * mean duration * severity)
-into:
+Produces a 2x2 figure (colour = relative change between period_comp and
+period_hist, opacity = period_hist baseline severity) decomposing the
+annual drought-severity index (frequency * mean duration * severity) into:
   (a) all events combined (the unrestricted index)
   (b) events lasting exactly 1 day
   (c) events lasting exactly 2 days
   (d) events lasting 3 days or more
+-- to diagnose which event-duration class is driving the change in the
+overall index.
 
-Figure 1 uses the standard weekly-rolling-mean-smoothed wcf/scf with the
-1st-percentile low-week threshold (quantile=0.01). Figure 2 redoes the same
-duration decomposition on raw (unsmoothed) daily wcf/scf -- no rolling
-mean -- with the low-week threshold relaxed to the 10th percentile
-(quantile=0.10, "q10"), matching the classic daily coincidence-below-
-threshold definition instead of the persistent/rolling one.
+Uses fig1.py's own event-detection pipeline (raw, un-smoothed daily wcf/scf;
+default --threshold 0.01, the classic per-day coincidence-below-threshold
+definition) -- i.e. this decomposes fig1.py's own headline severity index
+(build_ds_final / plot_reanalysis_disagg_timeseries_valuebyalpha_discrete),
+telling us whether fig1's reported change is mostly a single-day-coincidence
+effect or is driven by longer (2+ day) spells.
 
-Reuses the event-detection pipeline from fig_persistent.py.
+Reuses the generic event-table / duration-class machinery
+(duration_decomposition.py) and fig_persistent.py's value-by-alpha plotting
+(plot_valuebyalpha_decomposition).
 """
 import os
 import config
@@ -34,10 +37,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from fig_persistent import (
-    build_duration_decomposition_persistent, build_land_mask,
-    plot_valuebyalpha_decomposition_persistent,
-)
+from fig_persistent import build_land_mask, plot_valuebyalpha_decomposition
+from fig1 import build_duration_decomposition_daily
 
 PERIOD_HIST = (1982, 2001)
 PERIOD_COMP = (2002, 2021)
@@ -49,20 +50,14 @@ PERIOD_COMP = (2002, 2021)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Value-by-alpha decomposition of persistent compound WSE droughts "
-                     "by event-duration class, at two low-week thresholds.",
+        description="Value-by-alpha decomposition of compound WSE droughts by "
+                     "event-duration class (fig1.py's raw daily wcf/scf pipeline).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--path_preprocessed", default=config.PATH_PREPROCESSED)
     parser.add_argument("--reanalysis", default=config.REANALYSIS)
-    parser.add_argument("--threshold", type=float, default=0.01,
-                         help="Low-week quantile threshold for figure 1 (default: 0.01).")
-    parser.add_argument("--threshold_q10", type=float, default=0.10,
-                         help="Low-week quantile threshold for figure 2 (default: 0.10).")
-    parser.add_argument("--roll_window", type=int, default=7,
-                         help="Rolling-mean window (days) applied to daily wcf/scf before "
-                              "thresholding for figure 1 (default: 7, i.e. weekly). Figure 2 "
-                              "always uses raw daily data (roll_window=1, i.e. no averaging).")
+    parser.add_argument("--threshold", type=float, default=0.1,
+                         help="Low-day quantile threshold (default: 0.1).")
     parser.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
     parser.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
     parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
@@ -73,44 +68,43 @@ def parse_args():
 
 
 # =============================================================================
-# Main
+# Classic daily-coincidence decomposition (fig1.py's own pipeline)
 # =============================================================================
 
-def _run_decomposition(args, threshold, roll_window, out_suffix, suptitle,
-                        replicate_fig1_mask=False):
-    thr_str = str(threshold).replace(".", "")
-    print(f"Computing duration-class decomposition (threshold={threshold}, "
-          f"roll_window={roll_window})")
-    indices, resource_valid, freq_all = build_duration_decomposition_persistent(
+def run_daily_decomposition(args):
+    print(f"Duration-class decomposition (threshold={args.threshold})")
+    indices, resource_valid, freq_all = build_duration_decomposition_daily(
         path_preprocessed=args.path_preprocessed,
         reanalysis=args.reanalysis,
-        threshold=threshold,
+        threshold=args.threshold,
         ref_start=args.ref_start,
         ref_end=args.ref_end,
-        roll_window=roll_window,
     )
+
+    thr_str = str(args.threshold).replace(".", "")
 
     print("Building land/resource mask")
     ds_for_mask = xr.Dataset({"resource_valid": resource_valid})
     mask = build_land_mask(ds_for_mask, args.shapefile)
-    if replicate_fig1_mask:
-        # Match fig1.py's build_land_mask convention: also exclude pixels
-        # with zero events in the first on-record year (fig1.py checks
-        # duration.isnull() there; frequency/duration are 0-filled here
-        # rather than NaN, so the equivalent check is == 0).
-        no_event_year0 = (freq_all.isel(year=0) == 0).values
-        mask = mask & ~no_event_year0
+    # Match fig1.py's build_land_mask convention: also exclude pixels with
+    # zero events in the first on-record year (fig1.py checks
+    # duration.isnull() there; frequency/duration are 0-filled here rather
+    # than NaN, so the equivalent check is == 0).
+    no_event_year0 = (freq_all.isel(year=0) == 0).values
+    mask = mask & ~no_event_year0
 
-    print(f"Plotting decomposition figure ({out_suffix})")
-    fig = plot_valuebyalpha_decomposition_persistent(
+    print("Plotting decomposition figure")
+    fig = plot_valuebyalpha_decomposition(
         indices=indices, mask=mask, shapefile_path=args.shapefile,
         period_hist=PERIOD_HIST, period_comp=PERIOD_COMP,
         lat_min=-60, lat_max=75,
-        suptitle=suptitle,
+        suptitle="Compound WSE drought decomposition by event duration (ERA5)\n"
+                 f"raw daily wcf/scf (no rolling mean, fig1.py pipeline), "
+                 f"low-day threshold = {args.threshold:.2f} quantile",
     )
     out_path = os.path.join(
         args.output_dir, "main",
-        f"fig_red_decomposition_{out_suffix}_q{thr_str}_roll{roll_window}.png",
+        f"fig_red_decomposition_daily_q{thr_str}.png",
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
@@ -118,21 +112,15 @@ def _run_decomposition(args, threshold, roll_window, out_suffix, suptitle,
     print(f"Saved {out_path}")
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    _run_decomposition(
-        args, threshold=args.threshold, roll_window=args.roll_window, out_suffix="hist",
-        suptitle="Persistent compound WSE drought decomposition by event duration (ERA5)",
-    )
-    _run_decomposition(
-        args, threshold=args.threshold_q10, roll_window=1, out_suffix="q10",
-        suptitle="Compound WSE drought decomposition by event duration (ERA5)\n"
-                 f"raw daily wcf/scf (no rolling mean), low-week threshold = "
-                 f"{args.threshold_q10:.2f} quantile",
-        replicate_fig1_mask=True,
-    )
+    run_daily_decomposition(args)
     print("Done.")
 
 

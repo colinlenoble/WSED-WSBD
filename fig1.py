@@ -21,6 +21,12 @@ from scipy import stats
 # (prefers a .zarr store when present, falls back to .nc).
 from io_utils import match_files, open_dataset_any
 
+# Generic event-duration-class decomposition, shared with fig_persistent.py's
+# rolling-mean pipeline (see duration_decomposition.py).
+from duration_decomposition import (
+    compute_duration_decomposition, DECOMPOSITION_DURATION_CLASSES,
+)
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -216,6 +222,89 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
     )
     gc.collect()
     return ds_final
+
+
+# =============================================================================
+# Value-by-alpha decomposition by event-duration class (classic daily
+# coincidence definition -- no rolling mean)
+# =============================================================================
+
+def build_daily_pipeline(path_preprocessed, reanalysis, threshold, ref_start, ref_end):
+    """
+    Raw-daily counterpart of fig_persistent.py's build_persistent_pipeline:
+    loads wcf/scf, defines the classic per-day coincidence threshold from the
+    reference period, and flags compound (wind AND solar) low-production
+    days -- with no rolling-mean smoothing. Returns (wcf, scf, wcf_thr,
+    scf_thr, compound), a plain 0/1 field left un-masked (land/ocean masking
+    happens downstream via mask==1, same convention as the persistent
+    pipeline), so it can feed compute_event_table directly.
+
+    This mirrors the compound-detection block inside build_ds_final, kept as
+    a separate function here because build_ds_final applies the land mask to
+    `compound` *before* the expensive duration_xr apply_ufunc (for memory --
+    see build_land_mask_from_grid), which compute_event_table cannot accept
+    (it requires an integer 0/1 field, not NaN-masked).
+    """
+    print(f"  Loading wcf/scf for reanalysis={reanalysis}")
+    wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
+    scf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "scf_day_*"))
+    if not wcf_files:
+        raise FileNotFoundError(
+            f"No wcf_day_* file found under {os.path.join(path_preprocessed, reanalysis)}")
+    if not scf_files:
+        raise FileNotFoundError(
+            f"No scf_day_* file found under {os.path.join(path_preprocessed, reanalysis)}")
+    chunks = {"time": 1000, "lat": -1, "lon": -1}
+    wcf = open_dataset_any(wcf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
+    scf = open_dataset_any(scf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
+    wcf = wcf.convert_calendar("standard")
+    scf = scf.convert_calendar("standard")
+
+    print(f"  Computing thresholds (quantile={threshold}, ref={ref_start}:{ref_end})")
+    wcf_ref = wcf.sel(time=slice(ref_start, ref_end))
+    scf_ref = scf.sel(time=slice(ref_start, ref_end))
+    wcf_thr = wcf_ref.wcf.where(wcf_ref.wcf > 0).quantile(threshold, dim="time")
+    scf_thr = scf_ref.scf.where(scf_ref.scf > 0).quantile(threshold, dim="time")
+
+    print("  Flagging low-production days (daily coincidence, no rolling mean)")
+    low_wind = (wcf.wcf <= wcf_thr)
+    low_solar = (scf.scf <= scf_thr)
+    compound = (low_wind & low_solar).astype(int)
+
+    return wcf, scf, wcf_thr, scf_thr, compound
+
+
+def build_duration_decomposition_daily(
+    path_preprocessed, reanalysis, threshold, ref_start, ref_end,
+    duration_classes=DECOMPOSITION_DURATION_CLASSES,
+):
+    """
+    Classic daily-coincidence half of the value-by-alpha duration-class
+    decomposition: builds the raw-daily compound-event pipeline (see
+    build_daily_pipeline, the same event definition as build_ds_final /
+    this file's headline severity index) and hands it off to the generic
+    compute_duration_decomposition (see duration_decomposition.py), shared
+    with fig_persistent.py's build_duration_decomposition_persistent. This
+    lets the value-by-alpha decomposition ask, for fig1's own main result,
+    "which event-duration class (1 day, 2 days, 3+ days) is driving the
+    change" -- rather than re-deriving an approximation of it from the
+    persistent (rolling-mean) pipeline.
+
+    Returns ({label: annual_index_DataArray}, resource_valid, freq_all) --
+    see compute_duration_decomposition for details.
+    """
+    wcf, scf, wcf_thr, scf_thr, compound = build_daily_pipeline(
+        path_preprocessed, reanalysis, threshold, ref_start, ref_end,
+    )
+    daily_deficit = (scf_thr - scf.scf) + (wcf_thr - wcf.wcf)
+
+    indices, resource_valid, freq_all = compute_duration_decomposition(
+        compound, daily_deficit, wcf.wcf, scf.scf, ref_start, ref_end, duration_classes,
+    )
+
+    del wcf, scf, compound, daily_deficit
+    gc.collect()
+    return indices, resource_valid, freq_all
 
 
 # =============================================================================

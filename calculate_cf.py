@@ -856,7 +856,7 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         print("Computing solar potential (scf)...")
         scf = compute_solar_cf(dref_rg['tas'], dref_rg['rsds'], dref_rg['sfcWind'], cfg=pv_cfg)
 
-        solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
+        solar_potential = scf.to_dataset(name='scf').convert_calendar('standard')
         solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
         solar_potential['scf'] = solar_potential['scf'].astype('f4')
         solar_potential.attrs.update({
@@ -948,13 +948,13 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
         return
 
     print('Calculating DS_CF')
-    ds = ds.convert_calendar('noleap')
+    ds = ds.convert_calendar('noleap').convert_calendar('standard')
     ds['tas'] = ds['tas'] - 273.15
 
     # Solar potential, PVGIS relative-efficiency + Faiman module-temperature model.
     solar_potential = compute_solar_cf(ds['tas'], ds['rsds'], ds['sfcWind'], cfg=pv_cfg)
 
-    solar_xr = solar_potential.to_dataset(name='scf').convert_calendar('noleap')
+    solar_xr = solar_potential.to_dataset(name='scf').convert_calendar('standard')
     solar_xr = solar_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
     solar_xr['scf'] = solar_xr['scf'].astype('f4')
     solar_xr.attrs.update({
@@ -1109,7 +1109,7 @@ def calculate_ds_cf_reanalysis(
         print("Computing solar potential (scf)...")
         scf = compute_solar_cf(dref['tas'], dref['rsds'], dref['sfcWind'], cfg=pv_cfg)
 
-        solar_potential = scf.to_dataset(name='scf').convert_calendar('noleap')
+        solar_potential = scf.to_dataset(name='scf').convert_calendar('standard')
         solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
         solar_potential['scf'] = solar_potential['scf'].astype('f4')
         solar_potential.attrs.update({
