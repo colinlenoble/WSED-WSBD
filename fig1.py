@@ -264,7 +264,11 @@ def build_land_mask(ds_final, shapefile_path):
     # the old `duration.isnull()` check.
     duration_y0 = ds_final.isel(year=0).duration if "year" in ds_final.dims else ds_final.duration
     mask = mask & (duration_y0 > 0).values
-    return mask
+    # Return as a (lat, lon)-named DataArray, not a bare ndarray: callers do
+    # `.where(mask == 1)` against 3D (lat, lon, year) data, and a plain
+    # ndarray broadcasts positionally (right-aligned), silently misaligning
+    # lon against year instead of matching by dimension name.
+    return xr.DataArray(mask, dims=("lat", "lon"), coords={"lat": da.lat, "lon": da.lon})
 
 
 def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
