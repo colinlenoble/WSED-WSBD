@@ -85,19 +85,26 @@ def _pixel_duration_frequency(x, times_year, out_years):
     """
     Run-length-encode one pixel's 0/1 daily series into per-year event
     duration (mean length of events starting that year) and frequency
-    (count of events starting that year). NaN where no event started in
-    that year at that pixel, matching the semantics of the original
-    event_id/groupby("year","lat","lon") approach (a pixel-year with zero
-    events simply had no row in that groupby, i.e. NaN after to_xarray).
-    Called once per pixel by duration_xr's apply_ufunc, so it only ever
-    sees a single (time,) series -- no global stack/dropna over the whole
-    cube.
+    (count of events starting that year). 0 where no event started that
+    year at a valid (non-masked) pixel -- a "no drought" year is real,
+    known data, not missing. NaN only where the pixel itself is entirely
+    masked (e.g. ocean, via the land_mask applied to start_cooc upstream),
+    so ocean-mask overlays elsewhere that test frequency/duration.isnull()
+    keep working. Called once per pixel by duration_xr's apply_ufunc, so
+    it only ever sees a single (time,) series -- no global stack/dropna
+    over the whole cube.
     """
     n_years = out_years.shape[0]
     dur_sum = np.zeros(n_years)
     count   = np.zeros(n_years)
     x = np.asarray(x)
-    if x.size and np.any(x > 0):
+    # A pixel masked out entirely (e.g. ocean, via the land_mask applied to
+    # start_cooc before this runs) arrives as all-NaN -- keep it NaN so the
+    # ocean-mask overlays elsewhere (which test frequency/duration.isnull())
+    # still work. A valid land pixel that simply had no event some year (or
+    # ever) is real, known data -- 0, not missing.
+    valid_pixel = bool(x.size) and not np.all(np.isnan(x))
+    if valid_pixel and np.any(x > 0):
         xb     = (x > 0).astype(np.int8)
         padded = np.concatenate(([0], xb, [0]))
         d      = np.diff(padded)
@@ -112,11 +119,15 @@ def _pixel_duration_frequency(x, times_year, out_years):
                             & (out_years[year_idx_c] == start_years))
             np.add.at(dur_sum, year_idx_c[valid], lengths[valid])
             np.add.at(count,   year_idx_c[valid], 1)
-    duration  = np.full(n_years, np.nan)
-    frequency = np.full(n_years, np.nan)
-    has_event = count > 0
-    duration[has_event]  = dur_sum[has_event] / count[has_event]
-    frequency[has_event] = count[has_event]
+    if valid_pixel:
+        duration  = np.zeros(n_years)
+        frequency = np.zeros(n_years)
+        has_event = count > 0
+        duration[has_event]  = dur_sum[has_event] / count[has_event]
+        frequency[has_event] = count[has_event]
+    else:
+        duration  = np.full(n_years, np.nan)
+        frequency = np.full(n_years, np.nan)
     return duration, frequency
 
 
@@ -192,6 +203,11 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
 
     print("  Computing duration and frequency  ")
     ds_dur, ds_freq = duration_xr(compound.start_cooc)
+    # A year with no compound day is 0 severity, not missing -- but only at
+    # pixels that have valid data at all (see _pixel_duration_frequency);
+    # re-mask by frequency's NaN (ocean-only, after that fix) so ocean stays NaN.
+    severity_ds = severity_ds.fillna(0.0).where(ds_freq.frequency.notnull())
+
     ds_final = ds_dur.copy()
     ds_final["frequency"] = ds_freq.frequency
     ds_final["severity"]  = severity_ds
@@ -242,8 +258,12 @@ def build_land_mask(ds_final, shapefile_path):
     )
     mask = rasterize_shapefile(shapefile, da.shape, transform)
     mask = mask[::-1, :]
-    mask_update = ds_final.isel(year=0).duration.isnull() if "year" in ds_final.dims else ds_final.duration.isnull()
-    mask = mask & (~mask_update)
+    # Exclude pixels with no event in year 0: duration there is NaN for a
+    # masked/ocean pixel or 0 for a valid pixel with no event that year --
+    # `> 0` catches both as "exclude", matching the pre-0-fill semantics of
+    # the old `duration.isnull()` check.
+    duration_y0 = ds_final.isel(year=0).duration if "year" in ds_final.dims else ds_final.duration
+    mask = mask & (duration_y0 > 0).values
     return mask
 
 
@@ -291,7 +311,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
     relchange_label="Relative change (2000-2019 vs 1980-1999) (%)",
     sev_label="Annual severity (1980-1999 mean)",
     lat_min=-60, lat_max=72,
-    period_hist=(1980, 1999), period_comp=(2000, 2019),
+    period_hist=(1982, 2001), period_comp=(2002, 2021),
     regions=None, n_boot=2000, n_bins_change=5, n_bins_sev=5,
 ):
     # --- 1. Compound index ---
@@ -309,7 +329,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
     da_comp    = da.sel(year=slice(y2, y3)).mean("year", skipna=True)
     rel_change = 100.0 * (da_comp - da_hist) / da_hist
     rel_change = rel_change.where(np.isfinite(rel_change))
-    sev        = da.sel(year=slice(1982, 2001)).mean("year", skipna=True)
+    sev        = da_hist
     dChange    = rel_change
 
     # --- 2. Discrete colour bins ---
@@ -649,7 +669,7 @@ def plot_mean_variables_6panel(
 
 def _compute_valuebyalpha_rgba(
     ds_final, mask,
-    period_hist=(1980, 1999), period_comp=(2000, 2019),
+    period_hist=(1982, 2001), period_comp=(2002, 2021),
     n_bins_change=5, n_bins_sev=5,
 ):
     da = (ds_final.frequency.where(mask == 1)
@@ -662,7 +682,7 @@ def _compute_valuebyalpha_rgba(
     da_comp    = da.sel(year=slice(y2, y3)).mean("year", skipna=True)
     rel_change = 100.0 * (da_comp - da_hist) / da_hist
     rel_change = rel_change.where(np.isfinite(rel_change))
-    sev        = da.sel(year=slice(1982, 2001)).mean("year", skipna=True)
+    sev        = da_hist
 
     change_edges = [-100, -25, -10, 10, 25, 100]
     change_bin   = np.digitize(rel_change.values, change_edges[1:-1])
@@ -685,7 +705,7 @@ def _compute_valuebyalpha_rgba(
 
 def plot_valuebyalpha_sensitivity(
     ds_005, mask_005, ds_02, mask_02, shapefile_path,
-    period_hist=(1980, 1999), period_comp=(2000, 2019),
+    period_hist=(1982, 2001), period_comp=(2002, 2021),
     n_bins_change=5, n_bins_sev=5,
 ):
     shapefile = gpd.read_file(shapefile_path)
@@ -791,7 +811,7 @@ def _load_wsbd_gwl2(csv_path, share_re="current", vmax=800):
 def plot_combined_threshold_sensitivity(
     ds_005, mask_005, ds_01, mask_01, ds_02, mask_02,
     shapefile_path, csv_thr95, csv_thr99, csv_thr995,
-    period_hist=(1980, 1999), period_comp=(2000, 2019),
+    period_hist=(1982, 2001), period_comp=(2002, 2021),
     n_bins_change=5, n_bins_sev=5, dpi=300,
 ):
     shapefile = gpd.read_file(shapefile_path)
@@ -995,6 +1015,7 @@ def compute_global_change_stats(ds_final, mask, n_bootstrap=1000, block_size=10)
     return global_rel_change, ci_lower_rel, ci_upper_rel
 
 
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1035,7 +1056,7 @@ def main():
         relchange_label="Relative change in\nannual WSED severity(%)",
         sev_label="Historical average\nannual WSED severity",
         lat_min=-60, lat_max=75,
-        period_hist=(1980, 1999), period_comp=(2000, 2019),
+        period_hist=(1982, 2001), period_comp=(2002, 2021),
         n_boot=args.n_boot,
     )
     out1 = os.path.join(args.output_dir, "main",

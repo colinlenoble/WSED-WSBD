@@ -374,7 +374,13 @@ def build_duration_decomposition_persistent(
     (frequency * mean duration * severity), decomposed by event-duration
     class -- e.g. only single-day events, only 2-day events, events lasting
     3+ days, and (as just another class) all events combined. Returns
-    ({label: annual_index_DataArray}, resource_valid).
+    ({label: annual_index_DataArray}, resource_valid, freq_all), where
+    freq_all is the "all events" class's annual event-count array -- exposed
+    so callers can replicate fig1.py's build_land_mask convention (exclude
+    pixels with zero events in the first on-record year) if needed; unlike
+    fig1.py's duration_xr, frequency/duration here are 0-filled rather than
+    NaN for no-event pixel-years, so that check has to be `== 0`, not
+    `.isnull()`.
     """
     wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound = build_persistent_pipeline(
         path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window,
@@ -394,6 +400,7 @@ def build_duration_decomposition_persistent(
     daily_deficit = deficit_scf + deficit_wcf
 
     indices = {}
+    freq_all = None
     for label, duration_class in duration_classes:
         print(f"  Computing decomposed annual index for class '{label}'")
         class_mask = build_duration_class_mask(df_events, compound, duration_class)
@@ -402,12 +409,18 @@ def build_duration_decomposition_persistent(
         )
         severity = xr.where(class_mask, daily_deficit, np.nan).resample(time="YE").mean()
         severity["time"] = severity.time.dt.year
+        # 0-fill (not NaN) for pixel-years with no qualifying event -- a
+        # "no drought" year is real, known data, matching fig1.py's
+        # convention (see _pixel_duration_frequency there) and the
+        # pre-existing behaviour of build_ds_final_persistent's severity.
         severity = severity.rename({"time": "year"}).fillna(0.0)
         indices[label] = (freq * dur * severity).load()
+        if duration_class == ("ge", 1):
+            freq_all = freq.load()
 
     del wcf, scf, wcf_roll, scf_roll, compound, daily_deficit
     gc.collect()
-    return indices, resource_valid
+    return indices, resource_valid, freq_all
 
 
 # =============================================================================

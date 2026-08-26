@@ -76,11 +76,12 @@ def parse_args():
 # Main
 # =============================================================================
 
-def _run_decomposition(args, threshold, roll_window, out_suffix, suptitle):
+def _run_decomposition(args, threshold, roll_window, out_suffix, suptitle,
+                        replicate_fig1_mask=False):
     thr_str = str(threshold).replace(".", "")
     print(f"Computing duration-class decomposition (threshold={threshold}, "
           f"roll_window={roll_window})")
-    indices, resource_valid = build_duration_decomposition_persistent(
+    indices, resource_valid, freq_all = build_duration_decomposition_persistent(
         path_preprocessed=args.path_preprocessed,
         reanalysis=args.reanalysis,
         threshold=threshold,
@@ -92,6 +93,13 @@ def _run_decomposition(args, threshold, roll_window, out_suffix, suptitle):
     print("Building land/resource mask")
     ds_for_mask = xr.Dataset({"resource_valid": resource_valid})
     mask = build_land_mask(ds_for_mask, args.shapefile)
+    if replicate_fig1_mask:
+        # Match fig1.py's build_land_mask convention: also exclude pixels
+        # with zero events in the first on-record year (fig1.py checks
+        # duration.isnull() there; frequency/duration are 0-filled here
+        # rather than NaN, so the equivalent check is == 0).
+        no_event_year0 = (freq_all.isel(year=0) == 0).values
+        mask = mask & ~no_event_year0
 
     print(f"Plotting decomposition figure ({out_suffix})")
     fig = plot_valuebyalpha_decomposition_persistent(
@@ -123,6 +131,7 @@ def main():
         suptitle="Compound WSE drought decomposition by event duration (ERA5)\n"
                  f"raw daily wcf/scf (no rolling mean), low-week threshold = "
                  f"{args.threshold_q10:.2f} quantile",
+        replicate_fig1_mask=True,
     )
     print("Done.")
 
