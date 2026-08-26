@@ -61,7 +61,7 @@ class PVGISCoefficients:
     k7: float = 0.0
     u0: float = 26.9
     u1: float = 6.2
-    g_min_wm2: float = 20.0
+    g_min_wm2: float = 10.0
 
 
 # Relative-efficiency coefficient sets from the PVGIS "Data sources and
@@ -111,7 +111,8 @@ def make_pvgis_coefficients(k_preset="csi_current", u_preset="csi_free", **overr
 DEFAULT_PVGIS_COEFFICIENTS = make_pvgis_coefficients()
 
 
-def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS):
+def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
+                      valid_mask=None):
     """
     Solar (PV) capacity factor (dimensionless, ~0-1) using the PVGIS
     relative-efficiency + Faiman module-temperature model.
@@ -119,8 +120,16 @@ def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_
     tas     : air temperature (degC)
     rsds    : surface irradiance (W/m2)
     sfcwind : wind speed at module height (m/s)
+    valid_mask : optional boolean DataArray/array, broadcastable against the
+        output. Pixels where it is False are forced to NaN in the output
+        regardless of tas/rsds/sfcwind -- use build_valid_mask to derive one
+        from the bias-correction reference's own coverage (e.g. ERA5-Land
+        ssrd is ocean-masked and can be too sparse near some coastlines --
+        see ERA5_REF_ISSUE.md) so those pixels are excluded here rather than
+        silently bias-corrected against inadequate reference data.
     """
-    above_floor = rsds > cfg.g_min_wm2
+    finite_inputs = np.isfinite(tas) & np.isfinite(rsds) & np.isfinite(sfcwind)
+    above_floor = finite_inputs & (rsds > cfg.g_min_wm2)
     G = xr.where(above_floor, rsds, 0.0)
     G_prime = G / 1000.0
 
@@ -142,4 +151,39 @@ def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_
     # its fitted range and can diverge (see PVGISCoefficients docstring) --
     # treat those steps as producing 0, same as a below-cut-in wind day.
     cf = xr.where(above_floor, G_prime * eff_rel, 0.0)
+    # A NaN input (e.g. a bias-adjusted pixel with no usable reference) must
+    # not fall through the above_floor=False branch and get silently zeroed
+    # -- that would fabricate a "0 capacity factor" reading instead of
+    # flagging the pixel as missing.
+    cf = xr.where(finite_inputs, cf, np.nan)
+    if valid_mask is not None:
+        cf = xr.where(valid_mask, cf, np.nan)
     return cf
+
+
+def build_valid_mask(reference, buffer_cells=1):
+    """
+    Boolean validity mask (True = usable), derived from a reference
+    DataArray with lat/lon dims by treating non-finite cells as unusable and
+    then eroding by `buffer_cells` so pixels *adjacent* to a bad reference
+    cell are excluded too, not just the bad cell itself -- guards against
+    borderline pixels whose reference neighborhood is only partially
+    supported (see the lat=68.37N ERA5-Land coastal/offshore gap this was
+    written for).
+
+    reference     : DataArray with 'lat'/'lon' dims (e.g. the regridded
+                    ERA5 ssrd used as the bias-correction reference).
+    buffer_cells  : erosion radius in grid cells; 0 disables the buffer and
+                    just masks non-finite cells directly.
+    """
+    valid = np.isfinite(reference)
+    if buffer_cells > 0:
+        window = 2 * buffer_cells + 1
+        # .construct() gives an explicit (lat, lon, lat_win, lon_win) view,
+        # NaN-padded at the domain edges; .min() over the window dims is
+        # then False (0) if the window is incomplete (edge) or contains any
+        # False cell, and NaN never survives thanks to fillna(0) below.
+        windowed = valid.rolling(lat=window, lon=window, center=True).construct(
+            lat="lat_win", lon="lon_win")
+        valid = windowed.min(dim=("lat_win", "lon_win")).fillna(0).astype(bool)
+    return valid

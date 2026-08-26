@@ -12,10 +12,12 @@ into:
   (c) events lasting exactly 2 days
   (d) events lasting 3 days or more
 
-Figure 1 uses the standard low-week threshold (default: 1st percentile,
-quantile=0.01). Figure 2 redoes the same decomposition on the same
-weekly-rolling-mean-smoothed wcf/scf, but with the low-week threshold
-relaxed to the 10th percentile (quantile=0.10, "q10").
+Figure 1 uses the standard weekly-rolling-mean-smoothed wcf/scf with the
+1st-percentile low-week threshold (quantile=0.01). Figure 2 redoes the same
+duration decomposition on raw (unsmoothed) daily wcf/scf -- no rolling
+mean -- with the low-week threshold relaxed to the 10th percentile
+(quantile=0.10, "q10"), matching the classic daily coincidence-below-
+threshold definition instead of the persistent/rolling one.
 
 Reuses the event-detection pipeline from fig_persistent.py.
 """
@@ -59,7 +61,8 @@ def parse_args():
                          help="Low-week quantile threshold for figure 2 (default: 0.10).")
     parser.add_argument("--roll_window", type=int, default=7,
                          help="Rolling-mean window (days) applied to daily wcf/scf before "
-                              "thresholding (default: 7, i.e. weekly).")
+                              "thresholding for figure 1 (default: 7, i.e. weekly). Figure 2 "
+                              "always uses raw daily data (roll_window=1, i.e. no averaging).")
     parser.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
     parser.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
     parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
@@ -73,16 +76,17 @@ def parse_args():
 # Main
 # =============================================================================
 
-def _run_decomposition(args, threshold, out_suffix, suptitle):
+def _run_decomposition(args, threshold, roll_window, out_suffix, suptitle):
     thr_str = str(threshold).replace(".", "")
-    print(f"Computing duration-class decomposition (threshold={threshold})")
+    print(f"Computing duration-class decomposition (threshold={threshold}, "
+          f"roll_window={roll_window})")
     indices, resource_valid = build_duration_decomposition_persistent(
         path_preprocessed=args.path_preprocessed,
         reanalysis=args.reanalysis,
         threshold=threshold,
         ref_start=args.ref_start,
         ref_end=args.ref_end,
-        roll_window=args.roll_window,
+        roll_window=roll_window,
     )
 
     print("Building land/resource mask")
@@ -98,7 +102,7 @@ def _run_decomposition(args, threshold, out_suffix, suptitle):
     )
     out_path = os.path.join(
         args.output_dir, "main",
-        f"fig_red_decomposition_{out_suffix}_q{thr_str}_roll{args.roll_window}.png",
+        f"fig_red_decomposition_{out_suffix}_q{thr_str}_roll{roll_window}.png",
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
@@ -111,13 +115,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     _run_decomposition(
-        args, threshold=args.threshold, out_suffix="hist",
+        args, threshold=args.threshold, roll_window=args.roll_window, out_suffix="hist",
         suptitle="Persistent compound WSE drought decomposition by event duration (ERA5)",
     )
     _run_decomposition(
-        args, threshold=args.threshold_q10, out_suffix="q10",
-        suptitle="Persistent compound WSE drought decomposition by event duration (ERA5)\n"
-                 f"7-day rolling-mean wcf/scf, low-week threshold = {args.threshold_q10:.2f} quantile",
+        args, threshold=args.threshold_q10, roll_window=1, out_suffix="q10",
+        suptitle="Compound WSE drought decomposition by event duration (ERA5)\n"
+                 f"raw daily wcf/scf (no rolling mean), low-week threshold = "
+                 f"{args.threshold_q10:.2f} quantile",
     )
     print("Done.")
 
