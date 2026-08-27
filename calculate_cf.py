@@ -39,6 +39,12 @@ from wind_potential import (
     compute_wind_potential_from_hub_wind, get_hub_height_wind, compute_wind_potential,
 )
 
+# Compound-event (duration/frequency/severity) helpers, reused as-is by the
+# bias-adjustment validation scores below (validate_bias_adjustment_compound)
+# so that validation uses the exact same event-detection logic as the
+# production pipeline instead of a second, drift-prone copy of it.
+from make_grid_files import compute_severity, duration_xr
+
 
 # -------------------------
 # Helper functions
@@ -326,6 +332,8 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     if not gwl_unbias:
         print("All files already exist. Exiting function.")
+        validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
+                                 shapefile_path, reanalysis=reanalysis)
         return
 
     # ------------------------------------------------------------------
@@ -547,6 +555,12 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     if not gwl_unbias:
         print("No future GWL data available for this GCM/ssp/run. Exiting function.")
+        # GWL0-61 (the historical/training period) may already have a
+        # dadjusted_* file from a previous run even though every GWL
+        # requested *this* run failed to load -- validate_bias_adjustment
+        # no-ops gracefully if it isn't there yet.
+        validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
+                                 shapefile_path, reanalysis=reanalysis)
         return
 
     # ------------------------------------------------------------------
@@ -684,6 +698,9 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     print(f"Submitting {len(tasks)} delayed task(s) to the Dask scheduler...")
     compute(*tasks)
     print("All GWL tasks completed.")
+
+    validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
+                             shapefile_path, reanalysis=reanalysis)
 
 
 # -------------------------
@@ -1163,6 +1180,482 @@ def calculate_ds_cf_reanalysis(
     dref.close()
     gc.collect()
     print("Reanalysis DS_CF files saved:", path_scf, path_wcf)
+
+
+# -------------------------
+# Bias-adjustment validation (per-pixel R2/RMSE vs ERA5)
+# -------------------------
+# Scores how much closer bias-adjusted GCM output tracks ERA5 than the raw
+# ("non-aligned", i.e. not bias-adjusted) GCM does, at four levels:
+#   - the three bias-adjusted variables themselves (tas, sfcWind, rsds)
+#   - the derived solar/wind capacity factors (scf, wcf)
+#   - the annual compound-event indices (freq, dur, int, sev -- see
+#     dunkelflaute_review.tex's "SWED indicators": int == daily deficit
+#     intensity averaged over event days ("severity" in make_grid_files.py),
+#     sev == freq*dur*int, the annual composite severity index)
+# Appended, one row per (GCM, run, bias_adjust, var), to VALIDATION_CSV.
+
+VALIDATION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'validation')
+VALIDATION_CSV = os.path.join(VALIDATION_DIR, 'score_bias_adjustment.csv')
+
+
+def _pixel_r2_rmse(pred, obs, dim='time'):
+    """
+    Per-pixel R2 and RMSE of `pred` against `obs` over `dim`. Pixels where
+    `obs` has zero variance over `dim` (ss_tot == 0, e.g. a constant or
+    all-but-one-NaN series) get R2 = NaN rather than +/-inf.
+    """
+    obs_mean = obs.mean(dim=dim, skipna=True)
+    resid = pred - obs
+    ss_res = (resid ** 2).sum(dim=dim, skipna=True)
+    ss_tot = ((obs - obs_mean) ** 2).sum(dim=dim, skipna=True)
+    n = resid.notnull().sum(dim=dim)
+    r2 = xr.where(ss_tot > 0, 1 - ss_res / ss_tot, np.nan)
+    rmse = np.sqrt(ss_res / n.where(n > 0))
+    return r2, rmse
+
+
+def _mean_score(da):
+    """Spatial mean of a per-pixel score DataArray, skipping NaN pixels."""
+    val = da.mean(skipna=True)
+    if hasattr(val, 'compute'):
+        val = val.compute()
+    return float(val)
+
+
+def _score_exists(GCM, run, bias_adjust, var, csv_path=VALIDATION_CSV):
+    """Whether a row for this exact (GCM, run, bias_adjust, var) is already recorded."""
+    if not os.path.exists(csv_path):
+        return False
+    existing = pd.read_csv(csv_path)
+    dup = ((existing['GCM'] == GCM) & (existing['run'] == run)
+           & (existing['bias_adjust'] == bias_adjust) & (existing['var'] == var))
+    return bool(dup.any())
+
+
+def _append_validation_score(GCM, run, bias_adjust, var, mean_r2, mean_rmse,
+                             csv_path=VALIDATION_CSV):
+    """
+    Append one row to the bias-adjustment validation CSV, creating it (with
+    a header) if it doesn't exist yet. Appends directly rather than reading
+    the whole file, rebuilding it, and rewriting it, so that several per-GCM
+    jobs writing to the same CSV concurrently (this pipeline is normally run
+    one job per GCM on the HPC cluster) don't race on a full-file rewrite;
+    _score_exists's read-before-write check is best-effort and can still
+    admit a duplicate row under a true concurrent race on the same
+    (GCM, run, bias_adjust, var), but that's a harmless, easily de-duplicated
+    outcome rather than a corrupted file.
+    """
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    write_header = not os.path.exists(csv_path)
+    row = pd.DataFrame([{
+        'GCM': GCM, 'run': run, 'bias_adjust': bias_adjust, 'var': var,
+        'mean R2': mean_r2, 'mean RMSE': mean_rmse,
+    }])
+    row.to_csv(csv_path, mode='a', header=write_header, index=False)
+    print(f"[validate_bias_adjustment] {GCM}/{run} bias_adjust={bias_adjust} {var}: "
+          f"mean R2={mean_r2:.4f}, mean RMSE={mean_rmse:.4f}")
+
+
+def _load_era5_on_grid(target_grid, path_folder, shapefile_path, reanalysis='ERA5'):
+    """
+    Load tas/rsds/sfcWind from the reanalysis and regrid onto target_grid's
+    (lat, lon) -- the same two-pass shapefile-masking + conservative_normed
+    regrid as unbias_GCM's own dref prep (coarse mask on the native
+    reanalysis grid so the area-weighted regrid doesn't blend ocean cells
+    into coastal land cells, then a finer mask rebuilt directly on the
+    regridded grid), kept separate from unbias_GCM's inline version so this
+    module's validation functions can call it standalone (e.g. when
+    unbias_GCM short-circuits because its own outputs already exist).
+    """
+    files_ref, _ = _match_files(os.path.join(path_folder, reanalysis, f"*{reanalysis}*"))
+    if not files_ref:
+        raise FileNotFoundError(
+            f"No reanalysis files found in {os.path.join(path_folder, reanalysis)}")
+    dref = open_mfdataset_any(files_ref)
+    dref = _standardize_reanalysis_names(dref)
+    if 'sfcWind' not in dref:
+        if not {'u10', 'v10'}.issubset(dref.data_vars):
+            raise KeyError("Need either 'sfcWind' or both 'u10' and 'v10' in reanalysis")
+        dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
+    dref = dref[['tas', 'rsds', 'sfcWind']]
+    dref = dref.sortby('lat').sortby('lon').sortby('time')
+    dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
+
+    shapefile = gpd.read_file(shapefile_path)
+    mask_template = dref.tas.isel(time=0).load()
+    lons, lats = np.meshgrid(mask_template.lon, mask_template.lat)
+    coords = np.array([lons.flatten(), lats.flatten()]).T
+    transform = rasterio.transform.from_bounds(
+        mask_template.lon.min().item(), mask_template.lat.min().item(),
+        mask_template.lon.max().item(), mask_template.lat.max().item(),
+        len(mask_template.lon), len(mask_template.lat)
+    )
+    mask = rasterize_shapefile(shapefile, coords, mask_template.shape, transform)
+    mask = mask[::-1, :]
+    dref = dref.where(mask == 1, np.nan)
+
+    regridder = xe.Regridder(dref, target_grid, method='conservative_normed')
+    dref_rg = regridder(dref, skipna=True, output_chunks={'lat': 50, 'lon': 50})
+    dref_rg = dref_rg.convert_calendar('noleap').convert_calendar('standard')
+
+    ref_grid = dref_rg.tas.isel(time=0)
+    transform2 = rasterio.transform.from_bounds(
+        ref_grid.lon.min().item(), ref_grid.lat.min().item(),
+        ref_grid.lon.max().item(), ref_grid.lat.max().item(),
+        len(ref_grid.lon), len(ref_grid.lat)
+    )
+    mask2 = geometry_mask(
+        geometries=shapefile.geometry, all_touched=True,
+        out_shape=(len(ref_grid.lat), len(ref_grid.lon)),
+        transform=transform2, invert=True,
+    )
+    mask2_da = xr.DataArray(mask2[::-1, :], dims=('lat', 'lon'),
+                            coords={'lat': ref_grid.lat, 'lon': ref_grid.lon})
+    return dref_rg.where(mask2_da)
+
+
+def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_folder,
+                                       shapefile_path, reanalysis='ERA5',
+                                       ref_period=('1982-01-01', '2001-12-31'),
+                                       csv_path=VALIDATION_CSV):
+    """
+    Per-pixel R2/RMSE (averaged over pixels) of tas/sfcWind/rsds against
+    ERA5 regridded to the GCM's grid, over ref_period, for both the raw
+    GCM historical (GWL0-61) run (bias_adjust=False) and its bias-adjusted
+    counterpart (bias_adjust=True, dadjusted_..._GWL0-61_*). Skips any
+    (var, bias_adjust) pair already recorded in csv_path.
+    """
+    variables = ['tas', 'sfcWind', 'rsds']
+    need_raw = any(not _score_exists(GCM, run, False, v, csv_path) for v in variables)
+    need_adj = any(not _score_exists(GCM, run, True, v, csv_path) for v in variables)
+    if not need_raw and not need_adj:
+        print(f"Variable-level validation scores already recorded for {GCM}/{run}.")
+        return
+
+    dhist = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
+    dhist = dhist.sel(time=slice(*ref_period))
+    dref = _load_era5_on_grid(dhist, path_folder, shapefile_path, reanalysis)
+    dref = dref.sel(time=slice(*ref_period))
+
+    if need_raw:
+        common_times = np.intersect1d(dhist.time.values, dref.time.values)
+        dhist_c = dhist.sel(time=common_times)
+        dref_c = dref.sel(time=common_times)
+        for var in variables:
+            if _score_exists(GCM, run, False, var, csv_path):
+                continue
+            r2, rmse = _pixel_r2_rmse(dhist_c[var], dref_c[var])
+            _append_validation_score(GCM, run, False, var, _mean_score(r2), _mean_score(rmse), csv_path)
+
+    if need_adj:
+        adj_path = get_output_filename(path_preprocessed, GCM, ssp, run, 'GWL0-61', reanalysis)
+        if not os.path.exists(adj_path):
+            print(f"No bias-adjusted GWL0-61 file for {GCM}/{run} at {adj_path}, "
+                  "skipping adjusted variable scores.")
+        else:
+            dadj = open_dataset_any(adj_path).sel(time=slice(*ref_period))
+            common_times = np.intersect1d(dadj.time.values, dref.time.values)
+            dadj_c = dadj.sel(time=common_times)
+            dref_c = dref.sel(time=common_times)
+            for var in variables:
+                if _score_exists(GCM, run, True, var, csv_path):
+                    continue
+                r2, rmse = _pixel_r2_rmse(dadj_c[var], dref_c[var])
+                _append_validation_score(GCM, run, True, var, _mean_score(r2), _mean_score(rmse), csv_path)
+
+
+def _raw_ds_cf_paths(GCM, run, ssp, path_preprocessed, reanalysis, cfg):
+    wcf_suffix = '' if cfg.wind_method == 'shear_local' else f'_{cfg.wind_method}'
+    scf_path = os.path.join(path_preprocessed, GCM,
+                            f"scf_raw_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}.zarr")
+    wcf_path = os.path.join(path_preprocessed, GCM,
+                            f"wcf_raw_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}{wcf_suffix}.zarr")
+    return scf_path, wcf_path
+
+
+def compute_raw_ds_cf(GCM, run, ssp, path_folder, path_preprocessed,
+                      reanalysis='ERA5', cfg=DEFAULT_DS_CF_CONFIG,
+                      pv_cfg=DEFAULT_PVGIS_COEFFICIENTS,
+                      shear_ref_period=('1982-01-01', '2001-12-31'),
+                      shear_by_gcm_dir=None):
+    """
+    Compute wcf/scf directly from the raw (not bias-adjusted) GCM historical
+    (GWL0-61) run, on the GCM's own native grid -- the "non-aligned"
+    counterpart to calculate_ds_cf_GCM's bias-adjusted wcf_day/scf_day,
+    needed only for the bias-adjustment validation scores below (this grid
+    is the same one calculate_ds_cf_GCM's dadjusted-derived output sits on,
+    since dadjusted_* is unbias_GCM's regrid of the raw GCM onto ERA5's
+    domain but at the raw GCM's own native resolution -- see load_ds).
+    Cached under scf_raw_day_*/wcf_raw_day_* (distinct from wcf_day_*/
+    scf_day_* so it's never picked up by the production glob patterns in
+    make_grid_files.py / build_available_df) so repeat validation runs don't
+    recompute it.
+    """
+    if shear_by_gcm_dir is None:
+        shear_by_gcm_dir = config.SHEAR_BY_GCM_DIR
+    scf_path, wcf_path = _raw_ds_cf_paths(GCM, run, ssp, path_preprocessed, reanalysis, cfg)
+
+    if os.path.exists(scf_path) and os.path.exists(wcf_path):
+        return scf_path, wcf_path
+
+    ds = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
+    ds = ds.convert_calendar('noleap').convert_calendar('standard')
+    ds['tas'] = ds['tas'] - 273.15
+
+    if not os.path.exists(scf_path):
+        solar_potential = compute_solar_cf(ds['tas'], ds['rsds'], ds['sfcWind'], cfg=pv_cfg)
+        solar_xr = solar_potential.to_dataset(name='scf').convert_calendar('standard')
+        solar_xr = solar_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
+        solar_xr['scf'] = solar_xr['scf'].astype('f4')
+        solar_xr.attrs.update({
+            'DESCRIPTION': f"{GCM} raw (non bias-adjusted) solar potential",
+            'units': 'dimensionless', 'long_name': 'PVtot potential',
+            'SOURCE': 'calculate_cf.py: compute_raw_ds_cf', 'AUTHOR': 'Colin Lenoble',
+            'corrected': 0,
+        })
+        safe_to_zarr(solar_xr, scf_path)
+        solar_xr.close()
+
+    if not os.path.exists(wcf_path):
+        if cfg.wind_method == 'shear_local':
+            alpha = get_gcm_shear_exponent(GCM, shear_by_gcm_dir, ds, shear_ref_period)
+        else:
+            alpha = None
+        wind_hub = get_hub_height_wind(ds, cfg, alpha=alpha)
+        wind_pot = compute_wind_potential_from_hub_wind(wind_hub, cfg)
+        wind_xr = wind_pot.to_dataset(name='wcf')
+        wind_xr = wind_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
+        wind_xr['wcf'] = wind_xr['wcf'].astype('f4')
+        wind_xr.attrs.update({
+            'DESCRIPTION': f"{GCM} raw (non bias-adjusted) wind potential",
+            'units': 'dimensionless', 'long_name': 'Wind potential',
+            'SOURCE': 'calculate_cf.py: compute_raw_ds_cf', 'AUTHOR': 'Colin Lenoble',
+            'corrected': 0, 'wind_method': cfg.wind_method,
+        })
+        safe_to_zarr(wind_xr, wcf_path)
+        wind_xr.close()
+
+    return scf_path, wcf_path
+
+
+def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder,
+                                   shapefile_path, reanalysis='ERA5',
+                                   cfg=DEFAULT_DS_CF_CONFIG, pv_cfg=DEFAULT_PVGIS_COEFFICIENTS,
+                                   shear_ref_period=('1982-01-01', '2001-12-31'),
+                                   shear_by_gcm_dir=None,
+                                   ref_period=('1982-01-01', '2001-12-31'),
+                                   csv_path=VALIDATION_CSV):
+    """
+    Per-pixel R2/RMSE (averaged over pixels) of scf/wcf against the ERA5
+    reference already regridded to the GCM grid (wcf_ref/scf_ref, produced
+    by calculate_ds_cf_reanalysis_grid_GCM), over ref_period, for both the
+    bias-adjusted GWL0-61 scf/wcf (bias_adjust=True) and the raw
+    "non-aligned" scf/wcf computed directly from the un-adjusted GCM run via
+    compute_raw_ds_cf (bias_adjust=False).
+    """
+    ds_vars = ['scf', 'wcf']
+    if all(_score_exists(GCM, run, ba, v, csv_path) for ba in (True, False) for v in ds_vars):
+        print(f"scf/wcf validation scores already recorded for {GCM}/{run}.")
+        return
+
+    calculate_ds_cf_reanalysis_grid_GCM(
+        GCM, run, ssp, path_preprocessed, path_folder, reanalysis,
+        shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
+        shear_ref_period=shear_ref_period, shear_by_gcm_dir=shear_by_gcm_dir,
+    )
+    wcf_suffix = '' if cfg.wind_method == 'shear_local' else f'_{cfg.wind_method}'
+    wcf_ref_files, _ = _match_files(
+        os.path.join(path_preprocessed, GCM, f"wcf_ref_{GCM}_{reanalysis}{wcf_suffix}"))
+    scf_ref_files, _ = _match_files(
+        os.path.join(path_preprocessed, GCM, f"scf_ref_{GCM}_{reanalysis}"))
+    if not wcf_ref_files or not scf_ref_files:
+        raise FileNotFoundError(f"No wcf_ref/scf_ref file found for {GCM}/{reanalysis}.")
+    wcf_ref = open_dataset_any(wcf_ref_files[0]).sel(time=slice(*ref_period))
+    scf_ref = open_dataset_any(scf_ref_files[0]).sel(time=slice(*ref_period))
+
+    def _score_ds_cf(bias_adjust, wcf_model, scf_model):
+        if not _score_exists(GCM, run, bias_adjust, 'wcf', csv_path):
+            common_t = np.intersect1d(wcf_model.time.values, wcf_ref.time.values)
+            r2, rmse = _pixel_r2_rmse(wcf_model.wcf.sel(time=common_t), wcf_ref.wcf.sel(time=common_t))
+            _append_validation_score(GCM, run, bias_adjust, 'wcf', _mean_score(r2), _mean_score(rmse), csv_path)
+        if not _score_exists(GCM, run, bias_adjust, 'scf', csv_path):
+            common_t = np.intersect1d(scf_model.time.values, scf_ref.time.values)
+            r2, rmse = _pixel_r2_rmse(scf_model.scf.sel(time=common_t), scf_ref.scf.sel(time=common_t))
+            _append_validation_score(GCM, run, bias_adjust, 'scf', _mean_score(r2), _mean_score(rmse), csv_path)
+
+    if any(not _score_exists(GCM, run, True, v, csv_path) for v in ds_vars):
+        calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, 'GWL0-61',
+                            reanalysis=reanalysis, cfg=cfg, pv_cfg=pv_cfg,
+                            shear_ref_period=shear_ref_period,
+                            shear_by_gcm_dir=shear_by_gcm_dir)
+        wcf_path = os.path.join(path_preprocessed, GCM,
+                                f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}{wcf_suffix}.zarr")
+        scf_path = os.path.join(path_preprocessed, GCM,
+                                f"scf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}.zarr")
+        wcf_adj = open_dataset_any(wcf_path).sel(time=slice(*ref_period))
+        scf_adj = open_dataset_any(scf_path).sel(time=slice(*ref_period))
+        _score_ds_cf(True, wcf_adj, scf_adj)
+
+    if any(not _score_exists(GCM, run, False, v, csv_path) for v in ds_vars):
+        scf_raw_path, wcf_raw_path = compute_raw_ds_cf(
+            GCM, run, ssp, path_folder, path_preprocessed, reanalysis=reanalysis,
+            cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
+            shear_by_gcm_dir=shear_by_gcm_dir,
+        )
+        wcf_raw = open_dataset_any(wcf_raw_path).sel(time=slice(*ref_period))
+        scf_raw = open_dataset_any(scf_raw_path).sel(time=slice(*ref_period))
+        _score_ds_cf(False, wcf_raw, scf_raw)
+
+
+def _compound_indices(wcf, scf, wcf_thr, scf_thr):
+    """
+    Annual (year, lat, lon) freq/dur/int/sev compound-event indices from
+    daily wcf/scf Datasets and their thresholds -- mirrors
+    make_grid_files.py's process_single_gcm event-detection exactly (same
+    compute_severity/duration_xr calls), just returned as separate
+    DataArrays instead of packed into one output Dataset. 'int' is the mean
+    daily capacity-factor deficit on event days (paper's "Intensity",
+    make_grid_files.py's "severity"); 'sev' is the annual composite
+    freq*dur*int (paper's "Annual Severity", make_grid_files.py's "pdd").
+    """
+    low_wind = xr.where(wcf.wcf <= wcf_thr, 1, 0)
+    low_solar = xr.where(scf.scf <= scf_thr, 1, 0)
+    compound = (low_wind * low_solar).convert_calendar('standard')
+    wcf_std = wcf.convert_calendar('standard')
+    scf_std = scf.convert_calendar('standard')
+
+    intensity = compute_severity(compound, scf_std, wcf_std, scf_thr, wcf_thr)
+    ds_dur, ds_freq = duration_xr(compound)
+    ds_dur = ds_dur.reindex(lat=compound.lat, lon=compound.lon)
+    ds_freq = ds_freq.reindex(lat=compound.lat, lon=compound.lon)
+
+    intensity['time'] = intensity.time.dt.year
+    intensity = intensity.rename({'time': 'year'})
+
+    freq = ds_freq.frequency
+    dur = ds_dur.duration
+    sev = freq * dur * intensity
+    return freq, dur, intensity, sev
+
+
+def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_folder,
+                                      shapefile_path, reanalysis='ERA5',
+                                      cfg=DEFAULT_DS_CF_CONFIG, pv_cfg=DEFAULT_PVGIS_COEFFICIENTS,
+                                      shear_ref_period=('1982-01-01', '2001-12-31'),
+                                      shear_by_gcm_dir=None,
+                                      ref_period=('1982-01-01', '2001-12-31'),
+                                      q=0.1, csv_path=VALIDATION_CSV):
+    """
+    Per-pixel R2/RMSE (averaged over pixels, over years) of the annual
+    compound-event indices freq/dur/int/sev against the same indices
+    computed from ERA5 regridded to the GCM grid (wcf_ref/scf_ref), over
+    ref_period. For each branch (bias_adjust True/False), the wcf/scf
+    threshold (10th percentile of the branch's own non-zero ref_period
+    values) is computed once and applied identically to both the GCM series
+    and the ERA5 series -- mirroring make_grid_files.py's process_single_gcm,
+    which pairs a GCM's compound-event series and its own regridded-ERA5
+    counterpart under the same threshold rather than a threshold shared
+    across branches.
+    """
+    compound_vars = ['freq', 'dur', 'int', 'sev']
+    if all(_score_exists(GCM, run, ba, v, csv_path) for ba in (True, False) for v in compound_vars):
+        print(f"Compound-index validation scores already recorded for {GCM}/{run}.")
+        return
+
+    wcf_suffix = '' if cfg.wind_method == 'shear_local' else f'_{cfg.wind_method}'
+    wcf_ref_files, _ = _match_files(
+        os.path.join(path_preprocessed, GCM, f"wcf_ref_{GCM}_{reanalysis}{wcf_suffix}"))
+    scf_ref_files, _ = _match_files(
+        os.path.join(path_preprocessed, GCM, f"scf_ref_{GCM}_{reanalysis}"))
+    if not wcf_ref_files or not scf_ref_files:
+        raise FileNotFoundError(
+            f"No wcf_ref/scf_ref file found for {GCM}/{reanalysis}. "
+            "Run validate_bias_adjustment_ds_cf (or calculate_ds_cf_reanalysis_grid_GCM) first."
+        )
+    wcf_ref = open_dataset_any(wcf_ref_files[0]).sel(time=slice(*ref_period))
+    scf_ref = open_dataset_any(scf_ref_files[0]).sel(time=slice(*ref_period))
+
+    def _score_branch(bias_adjust, wcf_model, scf_model):
+        wcf_thr = wcf_model.wcf.where(wcf_model.wcf > 0).quantile(q, dim='time')
+        scf_thr = scf_model.scf.where(scf_model.scf > 0).quantile(q, dim='time')
+
+        freq_m, dur_m, int_m, sev_m = _compound_indices(wcf_model, scf_model, wcf_thr, scf_thr)
+        freq_r, dur_r, int_r, sev_r = _compound_indices(wcf_ref, scf_ref, wcf_thr, scf_thr)
+
+        for label, model_da, ref_da in (
+            ('freq', freq_m, freq_r), ('dur', dur_m, dur_r),
+            ('int', int_m, int_r), ('sev', sev_m, sev_r),
+        ):
+            if _score_exists(GCM, run, bias_adjust, label, csv_path):
+                continue
+            common_years = np.intersect1d(model_da.year.values, ref_da.year.values)
+            r2, rmse = _pixel_r2_rmse(
+                model_da.sel(year=common_years), ref_da.sel(year=common_years), dim='year')
+            _append_validation_score(GCM, run, bias_adjust, label,
+                                     _mean_score(r2), _mean_score(rmse), csv_path)
+
+    if any(not _score_exists(GCM, run, True, v, csv_path) for v in compound_vars):
+        wcf_path = os.path.join(path_preprocessed, GCM,
+                                f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}{wcf_suffix}.zarr")
+        scf_path = os.path.join(path_preprocessed, GCM,
+                                f"scf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}.zarr")
+        if os.path.exists(wcf_path) and os.path.exists(scf_path):
+            wcf_adj = open_dataset_any(wcf_path).sel(time=slice(*ref_period))
+            scf_adj = open_dataset_any(scf_path).sel(time=slice(*ref_period))
+            _score_branch(True, wcf_adj, scf_adj)
+        else:
+            print(f"No bias-adjusted wcf_day/scf_day for {GCM}/{run}, skipping adjusted compound scores.")
+
+    if any(not _score_exists(GCM, run, False, v, csv_path) for v in compound_vars):
+        scf_raw_path, wcf_raw_path = compute_raw_ds_cf(
+            GCM, run, ssp, path_folder, path_preprocessed, reanalysis=reanalysis,
+            cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
+            shear_by_gcm_dir=shear_by_gcm_dir,
+        )
+        wcf_raw = open_dataset_any(wcf_raw_path).sel(time=slice(*ref_period))
+        scf_raw = open_dataset_any(scf_raw_path).sel(time=slice(*ref_period))
+        _score_branch(False, wcf_raw, scf_raw)
+
+
+def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
+                             shapefile_path, reanalysis='ERA5',
+                             cfg=DEFAULT_DS_CF_CONFIG, pv_cfg=DEFAULT_PVGIS_COEFFICIENTS,
+                             shear_ref_period=('1982-01-01', '2001-12-31'),
+                             shear_by_gcm_dir=None,
+                             ref_period=('1982-01-01', '2001-12-31'),
+                             csv_path=VALIDATION_CSV):
+    """
+    Score bias-adjustment skill for GCM/run against ERA5 and append/update
+    csv_path (columns: GCM, run, bias_adjust, var, mean R2, mean RMSE) with
+    one row per (bias_adjust in {True, False}) x var, across three stages:
+      1. the bias-adjusted variables themselves (tas, sfcWind, rsds)
+      2. solar/wind capacity factors (scf, wcf) -- computing the raw
+         ("non-aligned") counterpart from the un-adjusted GCM run if needed
+      3. the annual compound-event indices (freq, dur, int, sev)
+    Called from the end of unbias_GCM, so every stage skips whatever rows
+    are already in csv_path (cheap to call again on every unbias_GCM run for
+    the same GCM/run), and each stage is wrapped in a try/except so a
+    validation failure never breaks the caller -- unbias_GCM's own outputs
+    are already written to disk by the time this runs.
+    """
+    stages = (
+        ('variables', validate_bias_adjustment_variables,
+         dict(reanalysis=reanalysis, ref_period=ref_period, csv_path=csv_path)),
+        ('scf/wcf', validate_bias_adjustment_ds_cf,
+         dict(reanalysis=reanalysis, cfg=cfg, pv_cfg=pv_cfg,
+              shear_ref_period=shear_ref_period, shear_by_gcm_dir=shear_by_gcm_dir,
+              ref_period=ref_period, csv_path=csv_path)),
+        ('freq/dur/int/sev', validate_bias_adjustment_compound,
+         dict(reanalysis=reanalysis, cfg=cfg, pv_cfg=pv_cfg,
+              shear_ref_period=shear_ref_period, shear_by_gcm_dir=shear_by_gcm_dir,
+              ref_period=ref_period, csv_path=csv_path)),
+    )
+    for stage_name, stage_fn, kwargs in stages:
+        try:
+            stage_fn(GCM, run, ssp, path_preprocessed, path_folder, shapefile_path, **kwargs)
+        except Exception as e:
+            print(f"[validate_bias_adjustment] {stage_name} stage failed for {GCM}/{run}: {e}")
 
 
 # -------------------------
