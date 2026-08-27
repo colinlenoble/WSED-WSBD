@@ -2231,7 +2231,7 @@ if __name__ == "__main__":
 
     # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
     # GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
-    GCM, run = 'CanESM5', 'r10i1p1f1'
+    GCM, run = 'CanESM5', 'r10i1p2f1'
     
     # calculate_ds_cf_reanalysis(
     #     path_folder,
