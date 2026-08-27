@@ -435,8 +435,8 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dhist = dhist.stack(location=("lat", "lon"))
 
     # Jitter lower bounds set to a fixed safe value
-    rsds_low = 1e-6
-    wind_low = 1e-6
+    rsds_low = 1
+    wind_low = 1e-3
 
     def remove_constant_locations(da, dim='time'):
         """Drop locations where any single variable is constant or entirely
@@ -533,7 +533,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     ADJ = sdba.MBCn.train(
         ref, hist,
         base_kws={"nquantiles": 30, "group": "time"},
-        adj_kws={"interp": "nearest", "extrapolation": "constant"},
+        adj_kws={"interp": "linear", "extrapolation": "constant"},
         n_iter=20,
         n_escore=1000,
         pts_dim='multivar',
