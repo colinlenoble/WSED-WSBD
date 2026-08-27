@@ -1693,62 +1693,62 @@ if __name__ == "__main__":
 
     # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
     # GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
-    # GCM, run = 'CanESM5', 'r10i1p2f1'
+    GCM, run = 'CanESM5', 'r10i1p2f1'
     
-    calculate_ds_cf_reanalysis(
-        path_folder,
-        path_preprocessed,
-        era5_file_pattern,
-        reanalysis='ERA5',
-        shapefile_path=shapefile_path,
-        cfg=cfg,
-        pv_cfg=pv_cfg,
-        shear_ref_period=shear_ref_period
-    )
+    # calculate_ds_cf_reanalysis(
+    #     path_folder,
+    #     path_preprocessed,
+    #     era5_file_pattern,
+    #     reanalysis='ERA5',
+    #     shapefile_path=shapefile_path,
+    #     cfg=cfg,
+    #     pv_cfg=pv_cfg,
+    #     shear_ref_period=shear_ref_period
+    # )
 
   
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
-    aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
+    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v1')
+    # aggregate_ds_cf_reanalysis(path_preprocessed, temp_folder, shapefile_path,reanalysis='ERA5', suffix_shp='v2')
 
-    # unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
-    #             path_folder, gwl_list, reanalysis)
-    # calculate_ds_cf_reanalysis_grid_GCM(GCM, run, ssp, path_preprocessed,
-    #                                    path_folder, reanalysis,
-    #                                    shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
-    #                                    shear_ref_period=shear_ref_period,
-    #                                    shear_by_gcm_dir=shear_by_gcm_dir)
-    # aggregate_ds_cf_ref_GCM(GCM, path_preprocessed, temp_folder, shapefile_path,
-    #                         reanalysis=reanalysis, suffix_shp='v1', cfg=cfg)
-    # # --- Loop over gwl_list for the GCM/run just unbiased above, gated on
-    # # dadjusted_* existence rather than df_to_process/row[gwl]. df_to_process
-    # # is a wcf_day_* inventory snapshot taken at the very start of __main__,
-    # # before unbias_GCM produced anything -- so a GCM/run processed for the
-    # # first time in this same script run is never in it (see the earlier
-    # # "Empty DataFrame" case), and gating on it would skip every GWL just
-    # # unbiased. dadjusted_* is unbias_GCM's own direct output, so it's
-    # # authoritative regardless of when this run started. ---
-    # print(f"\n--- Processing {GCM} {run} ---")
-    # for gwl in gwl_list:
-    #     dadj_path = get_output_filename(path_preprocessed, GCM, ssp, run, gwl, reanalysis)
-    #     if not os.path.exists(dadj_path):
-    #         print(f"  Skipping {gwl} (dadjusted file not available)")
-    #         continue
-    #     print(f"  Processing {gwl}")
-    #     calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
-    #                        cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
-    #                        shear_by_gcm_dir=shear_by_gcm_dir)
-    #     aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
-    #                  gwl, shapefile_path, reanalysis, suffix_shp='v1')
+    unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path,
+                path_folder, gwl_list, reanalysis)
+    calculate_ds_cf_reanalysis_grid_GCM(GCM, run, ssp, path_preprocessed,
+                                       path_folder, reanalysis,
+                                       shapefile_path, cfg=cfg, pv_cfg=pv_cfg,
+                                       shear_ref_period=shear_ref_period,
+                                       shear_by_gcm_dir=shear_by_gcm_dir)
+    aggregate_ds_cf_ref_GCM(GCM, path_preprocessed, temp_folder, shapefile_path,
+                            reanalysis=reanalysis, suffix_shp='v1', cfg=cfg)
+    # --- Loop over gwl_list for the GCM/run just unbiased above, gated on
+    # dadjusted_* existence rather than df_to_process/row[gwl]. df_to_process
+    # is a wcf_day_* inventory snapshot taken at the very start of __main__,
+    # before unbias_GCM produced anything -- so a GCM/run processed for the
+    # first time in this same script run is never in it (see the earlier
+    # "Empty DataFrame" case), and gating on it would skip every GWL just
+    # unbiased. dadjusted_* is unbias_GCM's own direct output, so it's
+    # authoritative regardless of when this run started. ---
+    print(f"\n--- Processing {GCM} {run} ---")
+    for gwl in gwl_list:
+        dadj_path = get_output_filename(path_preprocessed, GCM, ssp, run, gwl, reanalysis)
+        if not os.path.exists(dadj_path):
+            print(f"  Skipping {gwl} (dadjusted file not available)")
+            continue
+        print(f"  Processing {gwl}")
+        calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
+                           cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
+                           shear_by_gcm_dir=shear_by_gcm_dir)
+        aggregate_ds_cf(GCM, run, ssp, path_preprocessed, temp_folder,
+                     gwl, shapefile_path, reanalysis, suffix_shp='v1')
 
-    #     if not os.path.exists(f"{temp_folder}{GCM}/pop_on_{GCM}.nc"):
-    #         print("  Aligning population to GCM grid...")
-    #         align_pop_to_GCM_sum(pop_path, GCM, run, ssp, gwl, reanalysis,
-    #                              path_preprocessed, temp_folder)
+        if not os.path.exists(f"{temp_folder}{GCM}/pop_on_{GCM}.nc"):
+            print("  Aligning population to GCM grid...")
+            align_pop_to_GCM_sum(pop_path, GCM, run, ssp, gwl, reanalysis,
+                                 path_preprocessed, temp_folder)
 
-    #     tas_pop_agg_path = (f"{path_preprocessed}{GCM}/tas_pop_agg_"
-    #                        f"{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_v1.nc")
-    #     if not os.path.exists(tas_pop_agg_path):
-    #         print("  Aggregating population-weighted temperature...")
-    #         aggregate_tas(GCM, run, ssp, gwl, path_preprocessed, temp_folder,
-    #                      shapefile_path, reanalysis=reanalysis, weight=True,
-    #                      suffix_shp='v1')
+        tas_pop_agg_path = (f"{path_preprocessed}{GCM}/tas_pop_agg_"
+                           f"{GCM}_{ssp}_{run}_{gwl}_{reanalysis}_v1.nc")
+        if not os.path.exists(tas_pop_agg_path):
+            print("  Aggregating population-weighted temperature...")
+            aggregate_tas(GCM, run, ssp, gwl, path_preprocessed, temp_folder,
+                         shapefile_path, reanalysis=reanalysis, weight=True,
+                         suffix_shp='v1')
