@@ -379,9 +379,16 @@ def compute_valuebyalpha_rgba(da, period_hist, period_comp, n_bins_change=5, n_b
     color_levels = base_cmap(np.linspace(0, 1, n_bins_change))
 
     # --- Discrete alpha bins ---
-    max_sev = float(np.nanmax(sev.values)) if np.isfinite(sev.values).any() else 1.0
-    max_sev = max_sev if max_sev > 0 else 1.0
-    sev_edges = np.linspace(0, max_sev, n_bins_sev + 1) ** 2 / max_sev
+    # Quantile-based edges (equal pixel count per bin) rather than a fixed
+    # power-law spacing: a fixed **2 spacing was tuned for severity's usual
+    # near-zero-heavy, long-tailed shape and gives poor separation for
+    # variables with a different shape (e.g. annual event frequency, which
+    # need not cluster near zero) -- quantiles adapt to whatever `sev`'s own
+    # distribution looks like.
+    if np.isfinite(sev.values).any():
+        sev_edges = np.nanquantile(sev.values, np.linspace(0, 1, n_bins_sev + 1))
+    else:
+        sev_edges = np.linspace(0, 1, n_bins_sev + 1)
     sev_bin = np.digitize(sev.values, sev_edges[1:-1])
     alpha_min, alpha_max = 0.4, 1.0
     alpha_levels = np.linspace(alpha_min, alpha_max, n_bins_sev)
