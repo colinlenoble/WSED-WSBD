@@ -28,7 +28,9 @@ from io_utils import (
 )
 
 from fit_local_shear import fit_local_shear
-from compute_solar_cf import compute_solar_cf, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS
+from compute_solar_cf import (
+    compute_solar_cf, build_valid_mask, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS,
+)
 
 # Wind capacity-factor physics (power curve + the three wind_method
 # extrapolation strategies) -- kept dependency-light (numpy/xarray only,
@@ -871,9 +873,19 @@ def calculate_ds_cf_reanalysis_grid_GCM(
         print("scf file already exists, skipping:", path_scf_ref)
     else:
         print("Computing solar potential (scf)...")
-        scf = compute_solar_cf(dref_rg['tas'], dref_rg['rsds'], dref_rg['sfcWind'], cfg=pv_cfg)
+        # Built from dref_rg['rsds'] (ERA5 ssrd already regridded onto the
+        # GCM grid) rather than the raw reanalysis grid, since this is the
+        # grid calculate_ds_cf_GCM's per-GWL scf_day_* also sits on -- see
+        # build_valid_mask's docstring for the lat=68.37N coastal-gap case
+        # this guards against. Persisted below as 'valid_mask' in
+        # scf_ref_*.zarr so calculate_ds_cf_GCM/compute_raw_ds_cf can reuse
+        # the exact same mask instead of every GWL rebuilding its own.
+        valid_mask = build_valid_mask(dref_rg['rsds'])
+        scf = compute_solar_cf(dref_rg['tas'], dref_rg['rsds'], dref_rg['sfcWind'],
+                               cfg=pv_cfg, valid_mask=valid_mask)
 
         solar_potential = scf.to_dataset(name='scf').convert_calendar('standard')
+        solar_potential['valid_mask'] = valid_mask.astype('i1')
         solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
         solar_potential['scf'] = solar_potential['scf'].astype('f4')
         solar_potential.attrs.update({
@@ -929,6 +941,27 @@ def calculate_ds_cf_reanalysis_grid_GCM(
     print("DS_CF reference files saved:", path_scf_ref, path_wcf_ref)
 
 
+def _load_scf_valid_mask(GCM, path_preprocessed, reanalysis, target_grid):
+    """
+    Load the reference validity mask cached by calculate_ds_cf_reanalysis_grid_GCM
+    (scf_ref_{GCM}_{reanalysis}.zarr's 'valid_mask' variable) and align it onto
+    target_grid's lat/lon, so calculate_ds_cf_GCM/compute_raw_ds_cf mask out
+    the same reference-coastal-gap pixels (e.g. lat=68.37N) that scf_ref itself
+    excludes, instead of leaving every per-GWL scf_day_* unmasked.
+    """
+    scf_ref_path = os.path.join(path_preprocessed, GCM, f"scf_ref_{GCM}_{reanalysis}.zarr")
+    scf_ref_files, _ = _match_files(scf_ref_path)
+    if not scf_ref_files:
+        raise FileNotFoundError(
+            f"No scf_ref file found for {GCM}/{reanalysis} at {scf_ref_path}. "
+            "Run calculate_ds_cf_reanalysis_grid_GCM first -- it builds and "
+            "caches the reference validity mask that scf_day_*/scf_raw_day_* "
+            "need to stay consistent with scf_ref_*."
+        )
+    valid_mask = open_dataset_any(scf_ref_files[0])['valid_mask'].astype(bool)
+    return valid_mask.reindex(lat=target_grid['lat'], lon=target_grid['lon'], method='nearest')
+
+
 def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
                       reanalysis='ERA5', cfg: DS_CFConfig = DEFAULT_DS_CF_CONFIG,
                       pv_cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
@@ -969,7 +1002,9 @@ def calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, gwl,
     ds['tas'] = ds['tas'] - 273.15
 
     # Solar potential, PVGIS relative-efficiency + Faiman module-temperature model.
-    solar_potential = compute_solar_cf(ds['tas'], ds['rsds'], ds['sfcWind'], cfg=pv_cfg)
+    valid_mask = _load_scf_valid_mask(GCM, path_preprocessed, reanalysis, ds)
+    solar_potential = compute_solar_cf(ds['tas'], ds['rsds'], ds['sfcWind'],
+                                       cfg=pv_cfg, valid_mask=valid_mask)
 
     solar_xr = solar_potential.to_dataset(name='scf').convert_calendar('standard')
     solar_xr = solar_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
@@ -1124,9 +1159,12 @@ def calculate_ds_cf_reanalysis(
         print("scf file already exists, skipping:", path_scf)
     else:
         print("Computing solar potential (scf)...")
-        scf = compute_solar_cf(dref['tas'], dref['rsds'], dref['sfcWind'], cfg=pv_cfg)
+        valid_mask = build_valid_mask(dref['rsds'])
+        scf = compute_solar_cf(dref['tas'], dref['rsds'], dref['sfcWind'],
+                               cfg=pv_cfg, valid_mask=valid_mask)
 
         solar_potential = scf.to_dataset(name='scf').convert_calendar('standard')
+        solar_potential['valid_mask'] = valid_mask.astype('i1')
         solar_potential = solar_potential.chunk({'time': 100, 'lat': -1, 'lon': -1})
         solar_potential['scf'] = solar_potential['scf'].astype('f4')
         solar_potential.attrs.update({
@@ -1404,7 +1442,14 @@ def compute_raw_ds_cf(GCM, run, ssp, path_folder, path_preprocessed,
     ds['tas'] = ds['tas'] - 273.15
 
     if not os.path.exists(scf_path):
-        solar_potential = compute_solar_cf(ds['tas'], ds['rsds'], ds['sfcWind'], cfg=pv_cfg)
+        # Same reference validity mask as calculate_ds_cf_GCM, so the
+        # bias_adjust=False validation branch is masked identically to the
+        # bias_adjust=True branch it's scored against (otherwise a coastal-
+        # gap pixel that's NaN in one branch and a >1 spike in the other
+        # would bias the R2/RMSE comparison, not just leave it noisy).
+        valid_mask = _load_scf_valid_mask(GCM, path_preprocessed, reanalysis, ds)
+        solar_potential = compute_solar_cf(ds['tas'], ds['rsds'], ds['sfcWind'],
+                                           cfg=pv_cfg, valid_mask=valid_mask)
         solar_xr = solar_potential.to_dataset(name='scf').convert_calendar('standard')
         solar_xr = solar_xr.chunk({'time': 100, 'lat': -1, 'lon': -1})
         solar_xr['scf'] = solar_xr['scf'].astype('f4')
