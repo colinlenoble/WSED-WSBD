@@ -134,7 +134,7 @@ DECOMPOSITION_CLASS_LABELS = ["All events", "Exactly 1 day", "Exactly 2 days", "
 
 def compute_duration_decomposition(
     compound, daily_deficit, wcf_da, scf_da, ref_start, ref_end,
-    duration_classes=DECOMPOSITION_DURATION_CLASSES,
+    duration_classes=DECOMPOSITION_DURATION_CLASSES, compute_severity_index=True,
 ):
     """
     Annual (year, lat, lon) drought-severity index (frequency * mean duration
@@ -150,12 +150,21 @@ def compute_duration_decomposition(
     the raw (non-rolled) capacity-factor fields, used only to build the
     resource/land validity mask from reference-period non-NaN coverage.
 
-    Returns ({label: annual_index_DataArray}, resource_valid, freq_all),
-    where freq_all is the "all events" class's annual event-count array --
-    exposed so callers can replicate fig1.py's build_land_mask convention
-    (exclude pixels with zero events in the first on-record year) if needed;
-    frequency/duration here are 0-filled rather than NaN for no-event
-    pixel-years, so that check has to be `== 0`, not `.isnull()`.
+    Returns ({label: annual_index_DataArray}, resource_valid, freq_all,
+    freq_by_class), where freq_all is the "all events" class's annual
+    event-count array -- exposed so callers can replicate fig1.py's
+    build_land_mask convention (exclude pixels with zero events in the
+    first on-record year) if needed -- and freq_by_class is
+    {label: annual_frequency_DataArray} for every class (freq_all ==
+    freq_by_class["all"]), letting callers decompose frequency alone
+    (e.g. fig_red_decomposition.py's frequency value-by-alpha, which fixes
+    duration per panel and so has no use for the duration/severity
+    factors). frequency/duration here are 0-filled rather than NaN for
+    no-event pixel-years, so that check has to be `== 0`, not `.isnull()`.
+
+    `compute_severity_index=False` skips building the (expensive,
+    full-grid-resample) severity index altogether -- for callers that only
+    want freq_by_class -- and `indices` comes back empty in that case.
     """
     print("  Building event table of compound low-production spells")
     df_events = compute_event_table(compound)
@@ -167,20 +176,23 @@ def compute_duration_decomposition(
     resource_valid = (wcf_ref_mean.notnull() & scf_ref_mean.notnull()).astype("int8").load()
 
     indices = {}
+    freq_by_class = {}
     freq_all = None
     for label, duration_class in duration_classes:
-        print(f"  Computing decomposed annual index for class '{label}'")
-        class_mask = build_duration_class_mask(df_events, compound, duration_class)
+        print(f"  Computing decomposed annual stats for class '{label}'")
         freq, dur = compute_annual_stats_for_duration_class(
             df_events_dedup, compound, duration_class,
         )
-        severity = xr.where(class_mask, daily_deficit, np.nan).resample(time="YE").mean()
-        severity["time"] = severity.time.dt.year
-        # 0-fill (not NaN) for pixel-years with no qualifying event -- a
-        # "no drought" year is real, known data.
-        severity = severity.rename({"time": "year"}).fillna(0.0)
-        indices[label] = (freq * dur * severity).load()
+        freq_by_class[label] = freq.load()
+        if compute_severity_index:
+            class_mask = build_duration_class_mask(df_events, compound, duration_class)
+            severity = xr.where(class_mask, daily_deficit, np.nan).resample(time="YE").mean()
+            severity["time"] = severity.time.dt.year
+            # 0-fill (not NaN) for pixel-years with no qualifying event --
+            # a "no drought" year is real, known data.
+            severity = severity.rename({"time": "year"}).fillna(0.0)
+            indices[label] = (freq_by_class[label] * dur * severity).load()
         if duration_class == ("ge", 1):
-            freq_all = freq.load()
+            freq_all = freq_by_class[label]
 
-    return indices, resource_valid, freq_all
+    return indices, resource_valid, freq_all, freq_by_class

@@ -274,21 +274,21 @@ def build_duration_decomposition_persistent(
     build_persistent_pipeline) and hands it off to the generic
     compute_duration_decomposition (see duration_decomposition.py), shared
     with fig1.py's build_duration_decomposition_daily. Returns
-    ({label: annual_index_DataArray}, resource_valid, freq_all) -- see
-    compute_duration_decomposition for details.
+    ({label: annual_index_DataArray}, resource_valid, freq_all,
+    freq_by_class) -- see compute_duration_decomposition for details.
     """
     wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound = build_persistent_pipeline(
         path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window,
     )
     daily_deficit = -(scf_roll - scf_thr) + -(wcf_roll - wcf_thr)
 
-    indices, resource_valid, freq_all = compute_duration_decomposition(
+    indices, resource_valid, freq_all, freq_by_class = compute_duration_decomposition(
         compound, daily_deficit, wcf.wcf, scf.scf, ref_start, ref_end, duration_classes,
     )
 
     del wcf, scf, wcf_roll, scf_roll, compound, daily_deficit
     gc.collect()
-    return indices, resource_valid, freq_all
+    return indices, resource_valid, freq_all, freq_by_class
 
 
 # =============================================================================
@@ -580,17 +580,21 @@ def plot_valuebyalpha_decomposition(
     lat_min=-60, lat_max=72,
     class_labels=DECOMPOSITION_CLASS_LABELS,
     suptitle="Compound WSE drought decomposition by event duration (ERA5)",
-    n_bins_change=5, n_bins_sev=5,
+    n_bins_change=5, n_bins_sev=5, value_label="severity",
 ):
     """
     2x2 grid of value-by-alpha maps (colour = relative change, opacity =
-    historical-period baseline severity): panel (a) uses the unrestricted
+    historical-period baseline value): panel (a) uses the unrestricted
     drought index (all events); panels (b)-(d) use the same index restricted
     to a single event-duration class. `indices` is an ordered mapping
     {label: (year, lat, lon) DataArray} in the same order as `class_labels`
     -- shared by both the persistent (rolling) decomposition
     (build_duration_decomposition_persistent) and the classic daily
-    decomposition (fig1.py's build_duration_decomposition_daily).
+    decomposition (fig1.py's build_duration_decomposition_daily). `indices`
+    need not be the freq*dur*severity index -- e.g. fig_red_decomposition.py
+    passes per-class annual frequency instead, since it fixes duration per
+    panel and wants to isolate the frequency change alone; `value_label`
+    names whatever quantity `indices` holds in the caption/legend.
     """
     shp = gpd.read_file(shapefile_path)
     panellabels = list(ascii_lowercase[:len(class_labels)])
@@ -661,7 +665,7 @@ def plot_valuebyalpha_decomposition(
     fig.suptitle(
         f"{suptitle}\n"
         f"Colour: relative change ({period_comp[0]}-{period_comp[1]} vs "
-        f"{period_hist[0]}-{period_hist[1]}); opacity: historical baseline severity",
+        f"{period_hist[0]}-{period_hist[1]}); opacity: historical baseline {value_label}",
         fontsize=7,
     )
     plt.tight_layout(rect=[0, 0, 1, 0.92])

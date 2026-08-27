@@ -276,7 +276,7 @@ def build_daily_pipeline(path_preprocessed, reanalysis, threshold, ref_start, re
 
 def build_duration_decomposition_daily(
     path_preprocessed, reanalysis, threshold, ref_start, ref_end,
-    duration_classes=DECOMPOSITION_DURATION_CLASSES,
+    duration_classes=DECOMPOSITION_DURATION_CLASSES, compute_severity_index=True,
 ):
     """
     Classic daily-coincidence half of the value-by-alpha duration-class
@@ -290,21 +290,22 @@ def build_duration_decomposition_daily(
     change" -- rather than re-deriving an approximation of it from the
     persistent (rolling-mean) pipeline.
 
-    Returns ({label: annual_index_DataArray}, resource_valid, freq_all) --
-    see compute_duration_decomposition for details.
+    Returns ({label: annual_index_DataArray}, resource_valid, freq_all,
+    freq_by_class) -- see compute_duration_decomposition for details.
     """
     wcf, scf, wcf_thr, scf_thr, compound = build_daily_pipeline(
         path_preprocessed, reanalysis, threshold, ref_start, ref_end,
     )
     daily_deficit = (scf_thr - scf.scf) + (wcf_thr - wcf.wcf)
 
-    indices, resource_valid, freq_all = compute_duration_decomposition(
+    indices, resource_valid, freq_all, freq_by_class = compute_duration_decomposition(
         compound, daily_deficit, wcf.wcf, scf.scf, ref_start, ref_end, duration_classes,
+        compute_severity_index=compute_severity_index,
     )
 
     del wcf, scf, compound, daily_deficit
     gc.collect()
-    return indices, resource_valid, freq_all
+    return indices, resource_valid, freq_all, freq_by_class
 
 
 # =============================================================================

@@ -3,15 +3,17 @@
 Compound wind-solar Renewable Energy Drought (RED): value-by-alpha
 decomposition by event-duration class.
 
-Produces a 2x2 figure (colour = relative change between period_comp and
-period_hist, opacity = period_hist baseline severity) decomposing the
-annual drought-severity index (frequency * mean duration * severity) into:
-  (a) all events combined (the unrestricted index)
+Produces a 2x2 figure (colour = relative change in annual event frequency
+between period_comp and period_hist, opacity = period_hist baseline
+frequency) for:
+  (a) all events combined (the unrestricted count)
   (b) events lasting exactly 1 day
   (c) events lasting exactly 2 days
   (d) events lasting 3 days or more
--- to diagnose which event-duration class is driving the change in the
-overall index.
+-- to diagnose which event-duration class is driving the change in event
+frequency. Duration is fixed per panel by construction (each class already
+restricts events to a specific length), so the duration/severity factors of
+fig1.py's headline index are dropped here in favour of frequency alone.
 
 Uses fig1.py's own event-detection pipeline (raw, un-smoothed daily wcf/scf;
 default --threshold 0.01, the classic per-day coincidence-below-threshold
@@ -73,12 +75,13 @@ def parse_args():
 
 def run_daily_decomposition(args):
     print(f"Duration-class decomposition (threshold={args.threshold})")
-    indices, resource_valid, freq_all = build_duration_decomposition_daily(
+    _, resource_valid, freq_all, freq_by_class = build_duration_decomposition_daily(
         path_preprocessed=args.path_preprocessed,
         reanalysis=args.reanalysis,
         threshold=args.threshold,
         ref_start=args.ref_start,
         ref_end=args.ref_end,
+        compute_severity_index=False,
     )
 
     thr_str = str(args.threshold).replace(".", "")
@@ -95,16 +98,17 @@ def run_daily_decomposition(args):
 
     print("Plotting decomposition figure")
     fig = plot_valuebyalpha_decomposition(
-        indices=indices, mask=mask, shapefile_path=args.shapefile,
+        indices=freq_by_class, mask=mask, shapefile_path=args.shapefile,
         period_hist=PERIOD_HIST, period_comp=PERIOD_COMP,
         lat_min=-60, lat_max=75,
-        suptitle="Compound WSE drought decomposition by event duration (ERA5)\n"
+        value_label="frequency",
+        suptitle="Compound WSE drought frequency decomposition by event duration (ERA5)\n"
                  f"raw daily wcf/scf (no rolling mean, fig1.py pipeline), "
                  f"low-day threshold = {args.threshold:.2f} quantile",
     )
     out_path = os.path.join(
         args.output_dir, "main",
-        f"fig_red_decomposition_daily_q{thr_str}.png",
+        f"fig_red_decomposition_daily_freq_q{thr_str}.png",
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
