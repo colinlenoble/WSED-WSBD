@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import glob as glob
 import gc
+import traceback
 from xclim import sdba
 from dask import delayed, compute
 import geopandas as gpd
@@ -1214,6 +1215,12 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     computed over that spatial sample (sklearn R2 convention, matching
     compare_wind_methods.r2_score), instead of a per-pixel-over-time R2
     averaged across pixels.
+
+    RMSE/MAE are also returned relative to the mean magnitude of the
+    observed climatology (rRMSE = RMSE / mean(|obs_clim|), same for rMAE) --
+    tas (~270 K), rsds (~200 W/m2), sfcWind (~5 m/s), scf/wcf (0-1) and the
+    compound indices all live on different scales, so the raw RMSE/MAE
+    aren't comparable across variables; the relative version is.
     """
     pred_clim = pred.mean(dim=dim, skipna=True)
     obs_clim = obs.mean(dim=dim, skipna=True)
@@ -1224,17 +1231,20 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     valid = np.isfinite(pred_v) & np.isfinite(obs_v)
     pred_v, obs_v = pred_v[valid], obs_v[valid]
     if obs_v.size < 2:
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan, np.nan
     resid = obs_v - pred_v
     ss_res = np.sum(resid ** 2)
     ss_tot = np.sum((obs_v - obs_v.mean()) ** 2)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
     rmse = np.sqrt(np.mean(resid ** 2))
     mae = np.mean(np.abs(resid))
-    return float(r2), float(rmse), float(mae)
+    obs_scale = np.mean(np.abs(obs_v))
+    rel_rmse = rmse / obs_scale if obs_scale > 0 else np.nan
+    rel_mae = mae / obs_scale if obs_scale > 0 else np.nan
+    return float(r2), float(rmse), float(mae), float(rel_rmse), float(rel_mae)
 
 
-def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae,
+def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae, rel_rmse, rel_mae,
                              csv_path=VALIDATION_CSV):
     """
     Upsert one row into the bias-adjustment validation CSV: replaces any
@@ -1252,7 +1262,7 @@ def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae,
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     row = pd.DataFrame([{
         'GCM': GCM, 'run': run, 'bias_adjust': bias_adjust, 'var': var,
-        'R2': r2, 'RMSE': rmse, 'MAE': mae,
+        'R2': r2, 'RMSE': rmse, 'MAE': mae, 'rRMSE': rel_rmse, 'rMAE': rel_mae,
     }])
     if os.path.exists(csv_path):
         existing = pd.read_csv(csv_path)
@@ -1261,7 +1271,8 @@ def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae,
         row = pd.concat([existing[keep], row], ignore_index=True)
     row.to_csv(csv_path, index=False)
     print(f"[validate_bias_adjustment] {GCM}/{run} bias_adjust={bias_adjust} {var}: "
-          f"R2={r2:.4f}, RMSE={rmse:.4f}, MAE={mae:.4f}")
+          f"R2={r2:.4f}, RMSE={rmse:.4f}, MAE={mae:.4f}, "
+          f"rRMSE={rel_rmse:.4f}, rMAE={rel_mae:.4f}")
 
 
 def _strip_cf_bounds(ds):
@@ -1349,6 +1360,31 @@ def _load_era5_on_grid(target_grid, path_folder, shapefile_path, reanalysis='ERA
     return dref_rg.where(mask2_da)
 
 
+def _load_era5_on_grid_cached(GCM, target_grid, path_folder, path_preprocessed,
+                              shapefile_path, reanalysis='ERA5'):
+    """
+    Cached wrapper around _load_era5_on_grid: the regrid+two-pass-mask it
+    does (xesmf conservative_normed onto the GCM's native grid) is the same
+    expensive, failure-prone step unbias_GCM already performs once per GCM
+    for its own dref training data (see unbias_GCM's inline regrid), yet
+    validate_bias_adjustment_variables was redoing it from scratch on every
+    single call -- unlike the scf/wcf and compound-index validation stages,
+    which reuse a wcf_ref_*/scf_ref_* cached on disk (see
+    calculate_ds_cf_reanalysis_grid_GCM) and so don't pay this cost or
+    inherit this failure mode more than once. Cached under
+    era5_on_grid_{GCM}_{reanalysis}.zarr, keyed only by GCM (not run/ssp)
+    since target_grid is the GCM's own native (lat, lon) grid, shared across
+    every run/ssp of that GCM.
+    """
+    cache_path = os.path.join(path_preprocessed, GCM, f"era5_on_grid_{GCM}_{reanalysis}.zarr")
+    if os.path.exists(cache_path):
+        return open_dataset_any(cache_path)
+    dref_rg = _load_era5_on_grid(target_grid, path_folder, shapefile_path, reanalysis)
+    dref_rg = dref_rg.compute()
+    safe_to_zarr(dref_rg, cache_path)
+    return dref_rg
+
+
 def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_folder,
                                        shapefile_path, reanalysis='ERA5',
                                        ref_period=('1982-01-01', '2001-12-31'),
@@ -1362,26 +1398,32 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
     pixels as the sample (see _climatology_r2_rmse_mae) -- a free-running
     GCM's day-to-day weather isn't phase-locked to ERA5's actual timeline,
     so a time-step-matched score mostly scores two uncorrelated weather
-    sequences against each other regardless of bias-adjustment quality.
-    Always recomputes and overwrites (see _append_validation_score's upsert
-    behavior), rather than skipping when a row already exists -- so calling
-    this (via unbias_GCM, at the end of every run) refreshes the scores even
-    when the dadjusted files were already produced by an earlier run, e.g.
-    after a scoring-methodology change like this one.
+    sequences against each other regardless of bias-adjustment quality. The
+    ERA5-on-GCM-grid regrid itself is cached (see
+    _load_era5_on_grid_cached) rather than recomputed from scratch every
+    call, matching how the scf/wcf and compound-index stages reuse their own
+    wcf_ref_*/scf_ref_* cache instead of paying for (and re-risking) the
+    expensive xesmf regrid on every run. Always recomputes and overwrites
+    the scores themselves (see _append_validation_score's upsert behavior),
+    rather than skipping when a row already exists -- so calling this (via
+    unbias_GCM, at the end of every run) refreshes the scores even when the
+    dadjusted files were already produced by an earlier run, e.g. after a
+    scoring-methodology change like this one.
     """
     variables = ['tas', 'sfcWind', 'rsds']
 
     dhist = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
     dhist = dhist.sel(time=slice(*ref_period))
-    dref = _load_era5_on_grid(dhist, path_folder, shapefile_path, reanalysis)
+    dref = _load_era5_on_grid_cached(GCM, dhist, path_folder, path_preprocessed,
+                                     shapefile_path, reanalysis)
     dref = dref.sel(time=slice(*ref_period))
 
     common_times = np.intersect1d(dhist.time.values, dref.time.values)
     dhist_c = dhist.sel(time=common_times)
     dref_c = dref.sel(time=common_times)
     for var in variables:
-        r2, rmse, mae = _climatology_r2_rmse_mae(dhist_c[var], dref_c[var])
-        _append_validation_score(GCM, run, False, var, r2, rmse, mae, csv_path)
+        r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(dhist_c[var], dref_c[var])
+        _append_validation_score(GCM, run, False, var, r2, rmse, mae, rel_rmse, rel_mae, csv_path)
 
     adj_path = get_output_filename(path_preprocessed, GCM, ssp, run, 'GWL0-61', reanalysis)
     if not os.path.exists(adj_path):
@@ -1393,8 +1435,8 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
         dadj_c = dadj.sel(time=common_times)
         dref_c = dref.sel(time=common_times)
         for var in variables:
-            r2, rmse, mae = _climatology_r2_rmse_mae(dadj_c[var], dref_c[var])
-            _append_validation_score(GCM, run, True, var, r2, rmse, mae, csv_path)
+            r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(dadj_c[var], dref_c[var])
+            _append_validation_score(GCM, run, True, var, r2, rmse, mae, rel_rmse, rel_mae, csv_path)
 
 
 def _raw_ds_cf_paths(GCM, run, ssp, path_preprocessed, reanalysis, cfg):
@@ -1511,14 +1553,14 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
 
     def _score_ds_cf(bias_adjust, wcf_model, scf_model):
         common_t = np.intersect1d(wcf_model.time.values, wcf_ref.time.values)
-        r2, rmse, mae = _climatology_r2_rmse_mae(
+        r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
             wcf_model.wcf.sel(time=common_t), wcf_ref.wcf.sel(time=common_t))
-        _append_validation_score(GCM, run, bias_adjust, 'wcf', r2, rmse, mae, csv_path)
+        _append_validation_score(GCM, run, bias_adjust, 'wcf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
 
         common_t = np.intersect1d(scf_model.time.values, scf_ref.time.values)
-        r2, rmse, mae = _climatology_r2_rmse_mae(
+        r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
             scf_model.scf.sel(time=common_t), scf_ref.scf.sel(time=common_t))
-        _append_validation_score(GCM, run, bias_adjust, 'scf', r2, rmse, mae, csv_path)
+        _append_validation_score(GCM, run, bias_adjust, 'scf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
 
     calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, 'GWL0-61',
                         reanalysis=reanalysis, cfg=cfg, pv_cfg=pv_cfg,
@@ -1620,9 +1662,10 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
             ('int', int_m, int_r), ('sev', sev_m, sev_r),
         ):
             common_years = np.intersect1d(model_da.year.values, ref_da.year.values)
-            r2, rmse, mae = _climatology_r2_rmse_mae(
+            r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
                 model_da.sel(year=common_years), ref_da.sel(year=common_years), dim='year')
-            _append_validation_score(GCM, run, bias_adjust, label, r2, rmse, mae, csv_path)
+            _append_validation_score(GCM, run, bias_adjust, label, r2, rmse, mae,
+                                     rel_rmse, rel_mae, csv_path)
 
     wcf_path = os.path.join(path_preprocessed, GCM,
                             f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}{wcf_suffix}.zarr")
@@ -1654,8 +1697,9 @@ def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
                              csv_path=VALIDATION_CSV):
     """
     Score bias-adjustment skill for GCM/run against ERA5 and append/update
-    csv_path (columns: GCM, run, bias_adjust, var, R2, RMSE, MAE) with
-    one row per (bias_adjust in {True, False}) x var, across three stages:
+    csv_path (columns: GCM, run, bias_adjust, var, R2, RMSE, MAE, rRMSE,
+    rMAE) with one row per (bias_adjust in {True, False}) x var, across
+    three stages:
       1. the bias-adjusted variables themselves (tas, sfcWind, rsds)
       2. solar/wind capacity factors (scf, wcf) -- computing the raw
          ("non-aligned") counterpart from the un-adjusted GCM run if needed
@@ -1664,7 +1708,12 @@ def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
     are already in csv_path (cheap to call again on every unbias_GCM run for
     the same GCM/run), and each stage is wrapped in a try/except so a
     validation failure never breaks the caller -- unbias_GCM's own outputs
-    are already written to disk by the time this runs.
+    are already written to disk by the time this runs. The full traceback is
+    printed (not just str(e)) since this is the only place a stage's failure
+    surfaces -- without it, a broken stage (e.g. 'variables', which redoes
+    the ERA5 regrid from scratch every call rather than reusing a cached
+    wcf_ref/scf_ref like the other two stages do) fails silently on every
+    run with no way to tell why its rows never appear in csv_path.
     """
     stages = (
         ('variables', validate_bias_adjustment_variables,
@@ -1681,8 +1730,9 @@ def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
     for stage_name, stage_fn, kwargs in stages:
         try:
             stage_fn(GCM, run, ssp, path_preprocessed, path_folder, shapefile_path, **kwargs)
-        except Exception as e:
-            print(f"[validate_bias_adjustment] {stage_name} stage failed for {GCM}/{run}: {e}")
+        except Exception:
+            print(f"[validate_bias_adjustment] {stage_name} stage failed for {GCM}/{run}:")
+            traceback.print_exc()
 
 
 # -------------------------
@@ -2212,8 +2262,8 @@ if __name__ == "__main__":
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
     # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
-    GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
-    # GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
+    # GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
+    GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
     # GCM, run = 'CanESM5', 'r11i1p1f1'
     
     # calculate_ds_cf_reanalysis(
