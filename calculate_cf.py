@@ -531,7 +531,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     ADJ = sdba.MBCn.train(
         ref, hist,
         base_kws={"nquantiles": 30, "group": "time"},
-        adj_kws={"interp": "linear", "extrapolation": "constant"},
+        adj_kws={"interp": "nearest", "extrapolation": "constant"},
         n_iter=20,
         n_escore=1000,
         pts_dim='multivar',
@@ -654,7 +654,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             hist=hist,
             sim=fut,
             base=sdba.QuantileDeltaMapping,
-            adj_kws={"interp": "linear", "extrapolation": "constant"},
+            adj_kws={"interp": "nearest", "extrapolation": "constant"},
         )
 
         adj = sdba.unstack_variables(adj).compute()
@@ -2212,8 +2212,8 @@ if __name__ == "__main__":
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
     # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
-    GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
-    # GCM, run = 'CanESM5', 'r10i1p1f1'
+    # GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
+    GCM, run = 'CanESM5', 'r10i1p1f1'
     
     # calculate_ds_cf_reanalysis(
     #     path_folder,
