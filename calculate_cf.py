@@ -1183,7 +1183,7 @@ def calculate_ds_cf_reanalysis(
 
 
 # -------------------------
-# Bias-adjustment validation (per-pixel R2/RMSE vs ERA5)
+# Bias-adjustment validation (spatial-sample R2/RMSE/MAE vs ERA5)
 # -------------------------
 # Scores how much closer bias-adjusted GCM output tracks ERA5 than the raw
 # ("non-aligned", i.e. not bias-adjusted) GCM does, at four levels:
@@ -1199,63 +1199,60 @@ VALIDATION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'valid
 VALIDATION_CSV = os.path.join(VALIDATION_DIR, 'score_bias_adjustment.csv')
 
 
-def _pixel_r2_rmse(pred, obs, dim='time'):
+def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     """
-    Per-pixel R2 and RMSE of `pred` against `obs` over `dim`. Pixels where
-    `obs` has zero variance over `dim` (ss_tot == 0, e.g. a constant or
-    all-but-one-NaN series) get R2 = NaN rather than +/-inf.
+    R2/RMSE/MAE of pred against obs, scored on each pixel's `dim`-mean (the
+    ref_period's ~20-year climatology) rather than on individual time steps:
+    a free-running GCM's day-to-day (or even month-to-month) weather isn't
+    phase-locked to ERA5's actual timeline, so a time-step-matched score
+    mostly measures whether two uncorrelated weather sequences happen to
+    agree at a given step, regardless of bias-adjustment quality (which only
+    corrects the marginal distribution, not day-to-day timing). Averaging
+    away the whole time axis first leaves the long-term-mean spatial pattern
+    -- the thing bias adjustment can actually be judged on -- and every
+    pixel's climatology becomes one (pred, obs) pair in a single R2/RMSE/MAE
+    computed over that spatial sample (sklearn R2 convention, matching
+    compare_wind_methods.r2_score), instead of a per-pixel-over-time R2
+    averaged across pixels.
     """
-    obs_mean = obs.mean(dim=dim, skipna=True)
-    resid = pred - obs
-    ss_res = (resid ** 2).sum(dim=dim, skipna=True)
-    ss_tot = ((obs - obs_mean) ** 2).sum(dim=dim, skipna=True)
-    n = resid.notnull().sum(dim=dim)
-    r2 = xr.where(ss_tot > 0, 1 - ss_res / ss_tot, np.nan)
-    rmse = np.sqrt(ss_res / n.where(n > 0))
-    return r2, rmse
+    pred_clim = pred.mean(dim=dim, skipna=True)
+    obs_clim = obs.mean(dim=dim, skipna=True)
+    pred_v = np.asarray(pred_clim.compute().values if hasattr(pred_clim, 'compute')
+                        else pred_clim.values).ravel()
+    obs_v = np.asarray(obs_clim.compute().values if hasattr(obs_clim, 'compute')
+                       else obs_clim.values).ravel()
+    valid = np.isfinite(pred_v) & np.isfinite(obs_v)
+    pred_v, obs_v = pred_v[valid], obs_v[valid]
+    if obs_v.size < 2:
+        return np.nan, np.nan, np.nan
+    resid = obs_v - pred_v
+    ss_res = np.sum(resid ** 2)
+    ss_tot = np.sum((obs_v - obs_v.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    rmse = np.sqrt(np.mean(resid ** 2))
+    mae = np.mean(np.abs(resid))
+    return float(r2), float(rmse), float(mae)
 
 
-def _monthly_mean(da):
-    """
-    Resample a daily DataArray to monthly means before scoring. A free-
-    running GCM run's day-to-day weather isn't phase-locked to the real
-    observed timeline the way a nudged/reanalysis-driven run would be, so a
-    day-matched R2 mostly scores whether two uncorrelated weather sequences
-    happen to agree on a given day -- close to 0 or negative regardless of
-    bias-adjustment quality, since the adjustment only corrects the marginal
-    distribution, not day-to-day timing. Monthly aggregation averages out
-    that daily noise and leaves the seasonal-cycle/lower-frequency signal
-    bias adjustment can actually be judged on.
-    """
-    return da.resample(time='MS').mean()
-
-
-def _mean_score(da):
-    """Spatial mean of a per-pixel score DataArray, skipping NaN pixels."""
-    val = da.mean(skipna=True)
-    if hasattr(val, 'compute'):
-        val = val.compute()
-    return float(val)
-
-
-def _append_validation_score(GCM, run, bias_adjust, var, mean_r2, mean_rmse,
+def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae,
                              csv_path=VALIDATION_CSV):
     """
     Upsert one row into the bias-adjustment validation CSV: replaces any
     existing row for this exact (GCM, run, bias_adjust, var) key (or appends
     a new one), so re-running validation -- e.g. after a scoring-methodology
-    change like the daily->monthly switch, or simply because unbias_GCM
-    re-validates every time it's called -- always reflects the latest
-    computation instead of being silently skipped by a stale row. This needs
-    a read-modify-write of the whole file, unlike a pure append; each
-    cluster job handles a distinct GCM/run, so two jobs should never target
-    the same key at once, but this is less safe than a pure append would be
-    under a genuine concurrent write to the exact same key.
+    change like the per-pixel/monthly -> spatial-sample/climatology switch,
+    or simply because unbias_GCM re-validates every time it's called --
+    always reflects the latest computation instead of being silently skipped
+    by a stale row. This needs a read-modify-write of the whole file, unlike
+    a pure append; each cluster job handles a distinct GCM/run, so two jobs
+    should never target the same key at once, but this is less safe than a
+    pure append would be under a genuine concurrent write to the exact same
+    key.
     """
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     row = pd.DataFrame([{
         'GCM': GCM, 'run': run, 'bias_adjust': bias_adjust, 'var': var,
-        'mean R2': mean_r2, 'mean RMSE': mean_rmse,
+        'R2': r2, 'RMSE': rmse, 'MAE': mae,
     }])
     if os.path.exists(csv_path):
         existing = pd.read_csv(csv_path)
@@ -1264,7 +1261,7 @@ def _append_validation_score(GCM, run, bias_adjust, var, mean_r2, mean_rmse,
         row = pd.concat([existing[keep], row], ignore_index=True)
     row.to_csv(csv_path, index=False)
     print(f"[validate_bias_adjustment] {GCM}/{run} bias_adjust={bias_adjust} {var}: "
-          f"mean R2={mean_r2:.4f}, mean RMSE={mean_rmse:.4f}")
+          f"R2={r2:.4f}, RMSE={rmse:.4f}, MAE={mae:.4f}")
 
 
 def _strip_cf_bounds(ds):
@@ -1357,19 +1354,20 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
                                        ref_period=('1982-01-01', '2001-12-31'),
                                        csv_path=VALIDATION_CSV):
     """
-    Per-pixel R2/RMSE (averaged over pixels) of monthly-mean tas/sfcWind/rsds
-    against ERA5 regridded to the GCM's grid, over ref_period, for both the
-    raw GCM historical (GWL0-61) run (bias_adjust=False) and its bias-adjusted
-    counterpart (bias_adjust=True, dadjusted_..._GWL0-61_*). Scored on
-    monthly means (see _monthly_mean) rather than daily values -- a
-    free-running GCM's day-to-day weather isn't phase-locked to ERA5's
-    actual timeline, so a daily R2 mostly scores two uncorrelated weather
+    R2/RMSE/MAE of tas/sfcWind/rsds against ERA5 regridded to the GCM's
+    grid, over ref_period, for both the raw GCM historical (GWL0-61) run
+    (bias_adjust=False) and its bias-adjusted counterpart (bias_adjust=True,
+    dadjusted_..._GWL0-61_*). Scored on each pixel's ref_period (~20-year)
+    mean rather than individual time steps, treating the collection of
+    pixels as the sample (see _climatology_r2_rmse_mae) -- a free-running
+    GCM's day-to-day weather isn't phase-locked to ERA5's actual timeline,
+    so a time-step-matched score mostly scores two uncorrelated weather
     sequences against each other regardless of bias-adjustment quality.
     Always recomputes and overwrites (see _append_validation_score's upsert
     behavior), rather than skipping when a row already exists -- so calling
     this (via unbias_GCM, at the end of every run) refreshes the scores even
     when the dadjusted files were already produced by an earlier run, e.g.
-    after a scoring-methodology change like the daily->monthly switch above.
+    after a scoring-methodology change like this one.
     """
     variables = ['tas', 'sfcWind', 'rsds']
 
@@ -1382,8 +1380,8 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
     dhist_c = dhist.sel(time=common_times)
     dref_c = dref.sel(time=common_times)
     for var in variables:
-        r2, rmse = _pixel_r2_rmse(_monthly_mean(dhist_c[var]), _monthly_mean(dref_c[var]))
-        _append_validation_score(GCM, run, False, var, _mean_score(r2), _mean_score(rmse), csv_path)
+        r2, rmse, mae = _climatology_r2_rmse_mae(dhist_c[var], dref_c[var])
+        _append_validation_score(GCM, run, False, var, r2, rmse, mae, csv_path)
 
     adj_path = get_output_filename(path_preprocessed, GCM, ssp, run, 'GWL0-61', reanalysis)
     if not os.path.exists(adj_path):
@@ -1395,8 +1393,8 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
         dadj_c = dadj.sel(time=common_times)
         dref_c = dref.sel(time=common_times)
         for var in variables:
-            r2, rmse = _pixel_r2_rmse(_monthly_mean(dadj_c[var]), _monthly_mean(dref_c[var]))
-            _append_validation_score(GCM, run, True, var, _mean_score(r2), _mean_score(rmse), csv_path)
+            r2, rmse, mae = _climatology_r2_rmse_mae(dadj_c[var], dref_c[var])
+            _append_validation_score(GCM, run, True, var, r2, rmse, mae, csv_path)
 
 
 def _raw_ds_cf_paths(GCM, run, ssp, path_preprocessed, reanalysis, cfg):
@@ -1481,18 +1479,20 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
                                    ref_period=('1982-01-01', '2001-12-31'),
                                    csv_path=VALIDATION_CSV):
     """
-    Per-pixel R2/RMSE (averaged over pixels) of monthly-mean scf/wcf against
-    the ERA5 reference already regridded to the GCM grid (wcf_ref/scf_ref,
-    produced by calculate_ds_cf_reanalysis_grid_GCM), over ref_period, for
-    both the bias-adjusted GWL0-61 scf/wcf (bias_adjust=True) and the raw
+    R2/RMSE/MAE of scf/wcf against the ERA5 reference already regridded to
+    the GCM grid (wcf_ref/scf_ref, produced by
+    calculate_ds_cf_reanalysis_grid_GCM), over ref_period, for both the
+    bias-adjusted GWL0-61 scf/wcf (bias_adjust=True) and the raw
     "non-aligned" scf/wcf computed directly from the un-adjusted GCM run via
-    compute_raw_ds_cf (bias_adjust=False). Scored on monthly means (see
-    _monthly_mean) for the same reason as validate_bias_adjustment_variables.
-    Always recomputes and overwrites (see _append_validation_score) rather
-    than skipping when a row already exists -- calculate_ds_cf_reanalysis_
-    grid_GCM/calculate_ds_cf_GCM/compute_raw_ds_cf are themselves cheap to
-    call again since each already skips its own expensive work when its
-    output file exists, so this only redoes the (cheap) scoring step.
+    compute_raw_ds_cf (bias_adjust=False). Scored on each pixel's ref_period
+    (~20-year) mean, over the spatial sample of pixels (see
+    _climatology_r2_rmse_mae), for the same reason as
+    validate_bias_adjustment_variables. Always recomputes and overwrites
+    (see _append_validation_score) rather than skipping when a row already
+    exists -- calculate_ds_cf_reanalysis_grid_GCM/calculate_ds_cf_GCM/
+    compute_raw_ds_cf are themselves cheap to call again since each already
+    skips its own expensive work when its output file exists, so this only
+    redoes the (cheap) scoring step.
     """
     calculate_ds_cf_reanalysis_grid_GCM(
         GCM, run, ssp, path_preprocessed, path_folder, reanalysis,
@@ -1511,14 +1511,14 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
 
     def _score_ds_cf(bias_adjust, wcf_model, scf_model):
         common_t = np.intersect1d(wcf_model.time.values, wcf_ref.time.values)
-        r2, rmse = _pixel_r2_rmse(_monthly_mean(wcf_model.wcf.sel(time=common_t)),
-                                   _monthly_mean(wcf_ref.wcf.sel(time=common_t)))
-        _append_validation_score(GCM, run, bias_adjust, 'wcf', _mean_score(r2), _mean_score(rmse), csv_path)
+        r2, rmse, mae = _climatology_r2_rmse_mae(
+            wcf_model.wcf.sel(time=common_t), wcf_ref.wcf.sel(time=common_t))
+        _append_validation_score(GCM, run, bias_adjust, 'wcf', r2, rmse, mae, csv_path)
 
         common_t = np.intersect1d(scf_model.time.values, scf_ref.time.values)
-        r2, rmse = _pixel_r2_rmse(_monthly_mean(scf_model.scf.sel(time=common_t)),
-                                   _monthly_mean(scf_ref.scf.sel(time=common_t)))
-        _append_validation_score(GCM, run, bias_adjust, 'scf', _mean_score(r2), _mean_score(rmse), csv_path)
+        r2, rmse, mae = _climatology_r2_rmse_mae(
+            scf_model.scf.sel(time=common_t), scf_ref.scf.sel(time=common_t))
+        _append_validation_score(GCM, run, bias_adjust, 'scf', r2, rmse, mae, csv_path)
 
     calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, 'GWL0-61',
                         reanalysis=reanalysis, cfg=cfg, pv_cfg=pv_cfg,
@@ -1581,16 +1581,17 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
                                       ref_period=('1982-01-01', '2001-12-31'),
                                       q=0.1, csv_path=VALIDATION_CSV):
     """
-    Per-pixel R2/RMSE (averaged over pixels, over years) of the annual
-    compound-event indices freq/dur/int/sev against the same indices
-    computed from ERA5 regridded to the GCM grid (wcf_ref/scf_ref), over
-    ref_period. For each branch (bias_adjust True/False), the wcf/scf
-    threshold (10th percentile of the branch's own non-zero ref_period
-    values) is computed once and applied identically to both the GCM series
-    and the ERA5 series -- mirroring make_grid_files.py's process_single_gcm,
-    which pairs a GCM's compound-event series and its own regridded-ERA5
-    counterpart under the same threshold rather than a threshold shared
-    across branches. Always recomputes and overwrites (see
+    R2/RMSE/MAE of the annual compound-event indices freq/dur/int/sev
+    against the same indices computed from ERA5 regridded to the GCM grid
+    (wcf_ref/scf_ref), over ref_period. Scored on each pixel's ref_period
+    (~20-year) mean across years, over the spatial sample of pixels (see
+    _climatology_r2_rmse_mae). For each branch (bias_adjust True/False), the
+    wcf/scf threshold (10th percentile of the branch's own non-zero
+    ref_period values) is computed once and applied identically to both the
+    GCM series and the ERA5 series -- mirroring make_grid_files.py's
+    process_single_gcm, which pairs a GCM's compound-event series and its
+    own regridded-ERA5 counterpart under the same threshold rather than a
+    threshold shared across branches. Always recomputes and overwrites (see
     _append_validation_score) rather than skipping when a row already
     exists.
     """
@@ -1619,10 +1620,9 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
             ('int', int_m, int_r), ('sev', sev_m, sev_r),
         ):
             common_years = np.intersect1d(model_da.year.values, ref_da.year.values)
-            r2, rmse = _pixel_r2_rmse(
+            r2, rmse, mae = _climatology_r2_rmse_mae(
                 model_da.sel(year=common_years), ref_da.sel(year=common_years), dim='year')
-            _append_validation_score(GCM, run, bias_adjust, label,
-                                     _mean_score(r2), _mean_score(rmse), csv_path)
+            _append_validation_score(GCM, run, bias_adjust, label, r2, rmse, mae, csv_path)
 
     wcf_path = os.path.join(path_preprocessed, GCM,
                             f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}{wcf_suffix}.zarr")
@@ -1654,7 +1654,7 @@ def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
                              csv_path=VALIDATION_CSV):
     """
     Score bias-adjustment skill for GCM/run against ERA5 and append/update
-    csv_path (columns: GCM, run, bias_adjust, var, mean R2, mean RMSE) with
+    csv_path (columns: GCM, run, bias_adjust, var, R2, RMSE, MAE) with
     one row per (bias_adjust in {True, False}) x var, across three stages:
       1. the bias-adjusted variables themselves (tas, sfcWind, rsds)
       2. solar/wind capacity factors (scf, wcf) -- computing the raw
@@ -2212,8 +2212,9 @@ if __name__ == "__main__":
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
     # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
+    GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
     # GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
-    GCM, run = 'CanESM5', 'r11i1p1f1'
+    # GCM, run = 'CanESM5', 'r11i1p1f1'
     
     # calculate_ds_cf_reanalysis(
     #     path_folder,
