@@ -9,6 +9,24 @@ import pandas as pd
 import glob as glob
 import gc
 import traceback
+import resource
+
+
+def _log_mem(msg):
+    """
+    Print `msg` with the process's peak RSS so far, flushed immediately.
+    HPC stdout is block-buffered when redirected to a log file (not a TTY),
+    so ordinary print() output can be silently lost -- never reaching disk
+    -- if the process is SIGKILL'd by the OOM killer before the buffer
+    flushes; that's why an OOM-killed job's log can show no progress prints
+    at all even though those lines did execute. flush=True forces each
+    checkpoint out immediately so the log reflects real progress (and real
+    peak memory at each stage) even on an abrupt kill. ru_maxrss is in KB on
+    Linux (this codebase's only target platform, per config.ESMFMKFILE_XENV
+    and the gpfs/... paths in its own logs).
+    """
+    peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+    print(f"[mem] peak RSS so far: {peak_gb:.1f} GB -- {msg}", flush=True)
 from xclim import sdba
 from dask import delayed, compute
 import geopandas as gpd
@@ -322,6 +340,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     before any computation starts, so they can run in parallel on the cluster.
     """
     print("Starting unbias_GCM function")
+    _log_mem("start of unbias_GCM")
 
     gwl_unbias = []
     for gwl in gwl_list:
@@ -368,6 +387,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     # --- Build the raster mask from the shapefile ---
     mask_template = dref.tas.isel(time=0).load()
+    _log_mem("after loading mask_template (single ERA5 time-slice, full grid)")
     shapefile = gpd.read_file(shapefile_path)
     lons, lats = np.meshgrid(mask_template.lon, mask_template.lat)
     coords = np.array([lons.flatten(), lats.flatten()]).T
@@ -382,6 +402,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dref = dref.where(mask == 1, np.nan)
     dref['mask'] = xr.where(~np.isnan(dref.isel(time=0).tas), 1, 0)
     print("dref mask coverage:", float(dref['mask'].sum() / dref['mask'].count()))
+    _log_mem("after coarse shapefile mask (pre-regrid, native ERA5 grid)")
 
     # Regrid reference to dhist grid. skipna=True matters specifically for
     # ssrd: it comes from ERA5-Land (ocean masked as NaN, native coverage
@@ -393,6 +414,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dref = regridder(dref, skipna=True, output_chunks={'lat': 50, 'lon': 50})
     dref = dref.convert_calendar('noleap').convert_calendar('standard')
     dhist = dhist.convert_calendar('noleap').convert_calendar('standard')
+    _log_mem("after regrid to GCM grid + calendar conversion (still lazy unless xesmf forced it)")
 
     # Second, finer mask on the regridded grid
     ref_grid = dref.tas.isel(time=0)
@@ -426,12 +448,14 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     dref = dref.sel(time=slice('1982-01-01', '2001-12-31'))
     dref = dref[['sfcWind', 'tas', 'rsds']]
+    _log_mem("after fine shapefile mask + ref_period slice")
 
     lon_ori = dref.lon
     lat_ori = dref.lat
 
     dref = dref.stack(location=("lat", "lon"))
     dhist = dhist.stack(location=("lat", "lon"))
+    _log_mem("after stack(location=(lat,lon))")
 
     # Jitter lower bounds set to a fixed safe value
     rsds_low = 1
@@ -449,6 +473,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
                 std = da[v].std(dim=dim)
                 is_allnan = da[v].isnull().all(dim=dim)
                 is_const = ((std == 0) | is_allnan).compute()
+                _log_mem(f"after remove_constant_locations std/isnull compute for var '{v}'")
                 if is_const.any():
                     idx_to_remove = da.location[is_const]
                     print(f"Variable '{v}': removing {len(idx_to_remove)} constant/all-NaN locations.")
@@ -456,11 +481,13 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         return da
 
     valid_mask = (~dref.tas.isnull().all('time')).compute()
+    _log_mem("after valid_mask compute (dref)")
     nb = valid_mask.count()
     print("Valid fraction before cleaning:", float(valid_mask.sum() / nb))
     dref = remove_constant_locations(dref)
     dref = dref.dropna(dim='location', how='all')
     print("Remaining locations:", dref.location.shape[0])
+    _log_mem("after dref remove_constant_locations + dropna")
 
     # dref's own constant/all-NaN scrub above says nothing about dhist: a
     # location can have real variance in the reanalysis but be constant or
@@ -471,6 +498,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dhist_matched = dhist.sel(location=dref.location).sortby('location')
     dhist_matched = remove_constant_locations(dhist_matched)
     dhist_matched = dhist_matched.dropna(dim='location', how='all')
+    _log_mem("after dhist remove_constant_locations + dropna")
 
     dref = dref.sel(location=dhist_matched.location).sortby('location')
     dhist = dhist_matched
@@ -523,20 +551,31 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
               f"locations with >=1 NaN time step={int((nan_per_loc > 0).sum())} "
               f"(out of {da.sizes['location']}), "
               f"max NaN time steps at one location={int(nan_per_loc.max())}")
+    _log_mem("after ref/hist NaN diagnostics")
 
     ref  = ref.chunk({'time': -1, 'location': chunk_loc})
     hist = hist.chunk({'time': -1, 'location': chunk_loc})
     print(f"Training window time steps: ref={ref.sizes['time']}, hist={hist.sizes['time']}")
+    _log_mem("before MBCn.train")
 
     # Train once
+    # n_escore subsamples n_escore time points per location, per iteration,
+    # to compute MBCn's energy-score convergence diagnostic -- an O(n_escore^2)
+    # pairwise-distance computation, repeated across n_iter iterations and
+    # every location. At global scale (many more locations than whatever
+    # regional domain this was likely tuned against) that quadratic cost is
+    # the leading OOM suspect, so cut it hard as a first experiment; it only
+    # weakens the diagnostic's precision, not the quantile-mapping adjustment
+    # itself, which is what actually produces the bias-adjusted output.
     ADJ = sdba.MBCn.train(
         ref, hist,
         base_kws={"nquantiles": 30, "group": "time"},
         adj_kws={"interp": "nearest", "extrapolation": "constant"},
         n_iter=20,
-        n_escore=1000,
+        n_escore=100,
         pts_dim='multivar',
     )
+    _log_mem("after MBCn.train")
     # xclim's TrainAdjust objects subclass dict (via Parametrizable), so
     # dask.delayed would otherwise traverse ADJ like a plain mapping and
     # rebuild it as a bare dict inside the delayed tasks, dropping .adjust().
