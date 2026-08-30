@@ -1361,7 +1361,7 @@ def _load_era5_on_grid(target_grid, path_folder, shapefile_path, reanalysis='ERA
 
 
 def _load_era5_on_grid_cached(GCM, target_grid, path_folder, path_preprocessed,
-                              shapefile_path, reanalysis='ERA5'):
+                              shapefile_path, ref_period, reanalysis='ERA5'):
     """
     Cached wrapper around _load_era5_on_grid: the regrid+two-pass-mask it
     does (xesmf conservative_normed onto the GCM's native grid) is the same
@@ -1375,14 +1375,22 @@ def _load_era5_on_grid_cached(GCM, target_grid, path_folder, path_preprocessed,
     era5_on_grid_{GCM}_{reanalysis}.zarr, keyed only by GCM (not run/ssp)
     since target_grid is the GCM's own native (lat, lon) grid, shared across
     every run/ssp of that GCM.
+
+    Sliced to ref_period *before* writing (every caller only ever uses
+    ref_period anyway) so the cache holds ~20 years, not the full
+    multi-decade reanalysis record. The regrid is left lazy going into
+    to_zarr -- no .compute() first -- so dask streams the regrid+write one
+    chunk at a time instead of materializing the whole (pre-slice, full-
+    record) array in memory at once; an earlier version of this cache
+    called .compute() here and OOM-killed the SLURM job that ran it.
     """
     cache_path = os.path.join(path_preprocessed, GCM, f"era5_on_grid_{GCM}_{reanalysis}.zarr")
     if os.path.exists(cache_path):
         return open_dataset_any(cache_path)
     dref_rg = _load_era5_on_grid(target_grid, path_folder, shapefile_path, reanalysis)
-    dref_rg = dref_rg.compute()
+    dref_rg = dref_rg.sel(time=slice(*ref_period))
     safe_to_zarr(dref_rg, cache_path)
-    return dref_rg
+    return open_dataset_any(cache_path)
 
 
 def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_folder,
@@ -1415,8 +1423,7 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
     dhist = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
     dhist = dhist.sel(time=slice(*ref_period))
     dref = _load_era5_on_grid_cached(GCM, dhist, path_folder, path_preprocessed,
-                                     shapefile_path, reanalysis)
-    dref = dref.sel(time=slice(*ref_period))
+                                     shapefile_path, ref_period, reanalysis)
 
     common_times = np.intersect1d(dhist.time.values, dref.time.values)
     dhist_c = dhist.sel(time=common_times)
