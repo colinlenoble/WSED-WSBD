@@ -1312,8 +1312,18 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     grid reloaded uncropped -- and ravel()ing two differently-shaped arrays
     would otherwise fail with an opaque broadcasting error instead of just
     scoring the cells both sides actually have.
+
+    Also returns n_years -- the actual size of `dim` after alignment,
+    converted to years (dim='year': as-is; dim='time': /365, noleap
+    calendar) -- so every score row records the sample size the
+    climatology was actually computed over, not just its quality. This is
+    the same number _check_time_overlap's callers already warn about when
+    it's short, but recorded unconditionally here (in the CSV, not just a
+    log line) so a good-looking R2 next to a 2-year sample is visible
+    without having to go dig up the run's console log.
     """
     pred, obs = xr.align(pred, obs, join='inner')
+    n_years = pred.sizes[dim] if dim == 'year' else pred.sizes[dim] / 365
     pred_clim = pred.mean(dim=dim, skipna=True)
     obs_clim = obs.mean(dim=dim, skipna=True)
     pred_v = np.asarray(pred_clim.compute().values if hasattr(pred_clim, 'compute')
@@ -1323,7 +1333,7 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     valid = np.isfinite(pred_v) & np.isfinite(obs_v)
     pred_v, obs_v = pred_v[valid], obs_v[valid]
     if obs_v.size < 2:
-        return np.nan, np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan, np.nan, n_years
     resid = obs_v - pred_v
     ss_res = np.sum(resid ** 2)
     ss_tot = np.sum((obs_v - obs_v.mean()) ** 2)
@@ -1333,7 +1343,7 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     obs_scale = np.mean(np.abs(obs_v))
     rel_rmse = rmse / obs_scale if obs_scale > 0 else np.nan
     rel_mae = mae / obs_scale if obs_scale > 0 else np.nan
-    return float(r2), float(rmse), float(mae), float(rel_rmse), float(rel_mae)
+    return float(r2), float(rmse), float(mae), float(rel_rmse), float(rel_mae), n_years
 
 
 def _reanchor_to_ref(model, ref, dim='time'):
@@ -1383,7 +1393,7 @@ def _check_time_overlap(n_common, len_model, len_ref, label, GCM, run):
 
 
 def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae, rel_rmse, rel_mae,
-                             csv_path=VALIDATION_CSV):
+                             n_years, csv_path=VALIDATION_CSV):
     """
     Upsert one row into the bias-adjustment validation CSV: replaces any
     existing row for this exact (GCM, run, bias_adjust, var) key (or appends
@@ -1396,11 +1406,18 @@ def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae, rel_rmse
     should never target the same key at once, but this is less safe than a
     pure append would be under a genuine concurrent write to the exact same
     key.
+
+    n_years (from _climatology_r2_rmse_mae) records the actual climatology
+    sample size the score was computed over, so a truncated/mismatched
+    window (e.g. a GCM whose GWL0-61 file is short, or ref/model windows
+    that only partly overlap) is visible directly in csv_path instead of
+    only as a console WARNING from _check_time_overlap.
     """
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     row = pd.DataFrame([{
         'GCM': GCM, 'run': run, 'bias_adjust': bias_adjust, 'var': var,
         'R2': r2, 'RMSE': rmse, 'MAE': mae, 'rRMSE': rel_rmse, 'rMAE': rel_mae,
+        'n_years': n_years,
     }])
     if os.path.exists(csv_path):
         existing = pd.read_csv(csv_path)
@@ -1410,7 +1427,7 @@ def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae, rel_rmse
     row.to_csv(csv_path, index=False)
     print(f"[validate_bias_adjustment] {GCM}/{run} bias_adjust={bias_adjust} {var}: "
           f"R2={r2:.4f}, RMSE={rmse:.4f}, MAE={mae:.4f}, "
-          f"rRMSE={rel_rmse:.4f}, rMAE={rel_mae:.4f}")
+          f"rRMSE={rel_rmse:.4f}, rMAE={rel_mae:.4f}, n_years={n_years:.1f}")
 
 
 def _strip_cf_bounds(ds):
@@ -1574,8 +1591,9 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
     _check_time_overlap(dhist_c.time.size, dhist.time.size, dref.time.size,
                         'raw variables time', GCM, run)
     for var in variables:
-        r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(dhist_c[var], dref_c[var])
-        _append_validation_score(GCM, run, False, var, r2, rmse, mae, rel_rmse, rel_mae, csv_path)
+        r2, rmse, mae, rel_rmse, rel_mae, n_years = _climatology_r2_rmse_mae(dhist_c[var], dref_c[var])
+        _append_validation_score(GCM, run, False, var, r2, rmse, mae, rel_rmse, rel_mae,
+                                 n_years, csv_path)
 
     adj_path = get_output_filename(path_preprocessed, GCM, ssp, run, 'GWL0-61', reanalysis)
     if not os.path.exists(adj_path):
@@ -1589,8 +1607,9 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
         _check_time_overlap(dadj_c.time.size, dadj.time.size, dref.time.size,
                             'adjusted variables time', GCM, run)
         for var in variables:
-            r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(dadj_c[var], dref_c[var])
-            _append_validation_score(GCM, run, True, var, r2, rmse, mae, rel_rmse, rel_mae, csv_path)
+            r2, rmse, mae, rel_rmse, rel_mae, n_years = _climatology_r2_rmse_mae(dadj_c[var], dref_c[var])
+            _append_validation_score(GCM, run, True, var, r2, rmse, mae, rel_rmse, rel_mae,
+                                     n_years, csv_path)
 
 
 def _raw_ds_cf_paths(GCM, run, ssp, path_preprocessed, reanalysis, cfg):
@@ -1713,16 +1732,18 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
         wcf_model_c, wcf_ref_c = _reanchor_to_ref(wcf_model, wcf_ref, dim='time')
         _check_time_overlap(wcf_model_c.time.size, wcf_model.time.size, wcf_ref.time.size,
                             'wcf time', GCM, run)
-        r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
+        r2, rmse, mae, rel_rmse, rel_mae, n_years = _climatology_r2_rmse_mae(
             wcf_model_c.wcf, wcf_ref_c.wcf)
-        _append_validation_score(GCM, run, bias_adjust, 'wcf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
+        _append_validation_score(GCM, run, bias_adjust, 'wcf', r2, rmse, mae, rel_rmse, rel_mae,
+                                 n_years, csv_path)
 
         scf_model_c, scf_ref_c = _reanchor_to_ref(scf_model, scf_ref, dim='time')
         _check_time_overlap(scf_model_c.time.size, scf_model.time.size, scf_ref.time.size,
                             'scf time', GCM, run)
-        r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
+        r2, rmse, mae, rel_rmse, rel_mae, n_years = _climatology_r2_rmse_mae(
             scf_model_c.scf, scf_ref_c.scf)
-        _append_validation_score(GCM, run, bias_adjust, 'scf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
+        _append_validation_score(GCM, run, bias_adjust, 'scf', r2, rmse, mae, rel_rmse, rel_mae,
+                                 n_years, csv_path)
 
     calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, 'GWL0-61',
                         reanalysis=reanalysis, cfg=cfg, pv_cfg=pv_cfg,
@@ -1833,10 +1854,10 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
             model_da_c, ref_da_c = _reanchor_to_ref(model_da, ref_da, dim='year')
             _check_time_overlap(model_da_c.year.size, model_da.year.size, ref_da.year.size,
                                 f'{label} year', GCM, run)
-            r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
+            r2, rmse, mae, rel_rmse, rel_mae, n_years = _climatology_r2_rmse_mae(
                 model_da_c, ref_da_c, dim='year')
             _append_validation_score(GCM, run, bias_adjust, label, r2, rmse, mae,
-                                     rel_rmse, rel_mae, csv_path)
+                                     rel_rmse, rel_mae, n_years, csv_path)
 
     wcf_path = os.path.join(path_preprocessed, GCM,
                             f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}{wcf_suffix}.zarr")
