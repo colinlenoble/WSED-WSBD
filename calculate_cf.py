@@ -1336,6 +1336,26 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     return float(r2), float(rmse), float(mae), float(rel_rmse), float(rel_mae)
 
 
+def _check_time_overlap(common, len_model, len_ref, label, GCM, run):
+    """
+    Warn when the intersect1d overlap actually scored is much shorter than
+    either side's own length -- e.g. a GCM's dadjusted_* GWL0-61 file only
+    covering 3285 of a 7300-day (20-year) ref_period would otherwise
+    silently shrink that variable's climatology sample to under half of
+    ref_period with no other signal in the log; the R2/RMSE/MAE rows in
+    csv_path look identical either way. Compares against the *longer* of
+    the two sides (not a hardcoded ref_period day count) so this works for
+    both the daily 'time' overlaps and the annual 'year' overlaps in
+    validate_bias_adjustment_compound without knowing the calendar.
+    """
+    n_common = len(common)
+    n_max = max(len_model, len_ref)
+    if n_max and n_common < 0.95 * n_max:
+        print(f"[validate_bias_adjustment] WARNING {GCM}/{run}: only {n_common}/{n_max} "
+              f"{label} steps overlap (model={len_model}, ref={len_ref}) -- "
+              "score computed on a reduced sample.")
+
+
 def _append_validation_score(GCM, run, bias_adjust, var, r2, rmse, mae, rel_rmse, rel_mae,
                              csv_path=VALIDATION_CSV):
     """
@@ -1518,6 +1538,8 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
                                      shapefile_path, ref_period, reanalysis)
 
     common_times = np.intersect1d(dhist.time.values, dref.time.values)
+    _check_time_overlap(common_times, dhist.time.size, dref.time.size,
+                        'raw variables time', GCM, run)
     dhist_c = dhist.sel(time=common_times)
     dref_c = dref.sel(time=common_times)
     for var in variables:
@@ -1531,6 +1553,8 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
     else:
         dadj = open_dataset_any(adj_path).sel(time=slice(*ref_period))
         common_times = np.intersect1d(dadj.time.values, dref.time.values)
+        _check_time_overlap(common_times, dadj.time.size, dref.time.size,
+                            'adjusted variables time', GCM, run)
         dadj_c = dadj.sel(time=common_times)
         dref_c = dref.sel(time=common_times)
         for var in variables:
@@ -1652,11 +1676,15 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
 
     def _score_ds_cf(bias_adjust, wcf_model, scf_model):
         common_t = np.intersect1d(wcf_model.time.values, wcf_ref.time.values)
+        _check_time_overlap(common_t, wcf_model.time.size, wcf_ref.time.size,
+                            'wcf time', GCM, run)
         r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
             wcf_model.wcf.sel(time=common_t), wcf_ref.wcf.sel(time=common_t))
         _append_validation_score(GCM, run, bias_adjust, 'wcf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
 
         common_t = np.intersect1d(scf_model.time.values, scf_ref.time.values)
+        _check_time_overlap(common_t, scf_model.time.size, scf_ref.time.size,
+                            'scf time', GCM, run)
         r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
             scf_model.scf.sel(time=common_t), scf_ref.scf.sel(time=common_t))
         _append_validation_score(GCM, run, bias_adjust, 'scf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
@@ -1761,6 +1789,8 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
             ('int', int_m, int_r), ('sev', sev_m, sev_r),
         ):
             common_years = np.intersect1d(model_da.year.values, ref_da.year.values)
+            _check_time_overlap(common_years, model_da.year.size, ref_da.year.size,
+                                f'{label} year', GCM, run)
             r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
                 model_da.sel(year=common_years), ref_da.sel(year=common_years), dim='year')
             _append_validation_score(GCM, run, bias_adjust, label, r2, rmse, mae,
