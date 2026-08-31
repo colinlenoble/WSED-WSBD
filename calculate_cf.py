@@ -1908,19 +1908,23 @@ def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
             print(f"[validate_bias_adjustment] {stage_name} stage failed for {GCM}/{run}:")
             traceback.print_exc()
 
-    # era5_on_grid_{GCM}_{reanalysis}.zarr (see _load_era5_on_grid_cached) is
-    # only needed transiently by the 'variables' stage above; deleting it
-    # here trades that cache away -- every future call to
-    # validate_bias_adjustment_variables for this GCM (any run/ssp) will
-    # redo the expensive xesmf regrid instead of reusing it.
-    era5_on_grid_path = os.path.join(path_preprocessed, GCM, f"era5_on_grid_{GCM}_{reanalysis}.zarr")
-    # scf_raw_day_*/wcf_raw_day_* (see compute_raw_ds_cf) are, unlike
-    # era5_on_grid, keyed by run/ssp too -- nothing outside this single
-    # validate_bias_adjustment call (the 'scf/wcf' and 'freq/dur/int/sev'
-    # stages above, both already finished by this point) ever reuses them,
-    # so deleting them here is pure storage savings, no recompute trade-off.
+    # era5_on_grid_{GCM}_{reanalysis}.zarr is deliberately NOT deleted here:
+    # it's cached by GCM only (not run/ssp -- see _load_era5_on_grid_cached),
+    # shared across every run of that GCM. Different runs of the same GCM
+    # are processed as separate concurrent SLURM jobs, so deleting it right
+    # after this run's validation finishes can race a sibling job that's
+    # mid-write or about to re-open the same cache path, producing a
+    # zarr GroupNotFoundError/FileNotFoundError on its side (seen live for
+    # INM-CM5-0). scf_raw_day_*/wcf_raw_day_* (below) don't have this
+    # problem since compute_raw_ds_cf keys them by run/ssp too.
+    #
+    # scf_raw_day_*/wcf_raw_day_* (see compute_raw_ds_cf) are keyed by
+    # run/ssp -- nothing outside this single validate_bias_adjustment call
+    # (the 'scf/wcf' and 'freq/dur/int/sev' stages above, both already
+    # finished by this point) ever reuses them, so deleting them here is
+    # pure storage savings with no recompute trade-off and no cross-job race.
     scf_raw_path, wcf_raw_path = _raw_ds_cf_paths(GCM, run, ssp, path_preprocessed, reanalysis, cfg)
-    for cleanup_path in (era5_on_grid_path, scf_raw_path, wcf_raw_path):
+    for cleanup_path in (scf_raw_path, wcf_raw_path):
         if os.path.exists(cleanup_path):
             try:
                 shutil.rmtree(cleanup_path)
