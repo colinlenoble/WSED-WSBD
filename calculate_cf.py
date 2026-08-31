@@ -1336,19 +1336,45 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     return float(r2), float(rmse), float(mae), float(rel_rmse), float(rel_mae)
 
 
-def _check_time_overlap(common, len_model, len_ref, label, GCM, run):
+def _reanchor_to_ref(model, ref, dim='time'):
     """
-    Warn when the intersect1d overlap actually scored is much shorter than
-    either side's own length -- e.g. a GCM's dadjusted_* GWL0-61 file only
-    covering 3285 of a 7300-day (20-year) ref_period would otherwise
-    silently shrink that variable's climatology sample to under half of
-    ref_period with no other signal in the log; the R2/RMSE/MAE rows in
-    csv_path look identical either way. Compares against the *longer* of
-    the two sides (not a hardcoded ref_period day count) so this works for
-    both the daily 'time' overlaps and the annual 'year' overlaps in
-    validate_bias_adjustment_compound without knowing the calendar.
+    Re-anchor model's `dim` axis onto ref's by matching the *last* step and
+    pairing backward by relative position, mirroring unbias_GCM's own
+    hist/ref time-shift (see 'Align historical time axis onto the
+    reference period' in unbias_GCM). Each GCM's own GWL0-61 window sits on
+    whatever real calendar dates that model actually crosses the target
+    warming level -- e.g. CMCC-ESM2's is 1971-1990, not the 1982-2001 most
+    models land on -- so pairing model against ref by literal calendar
+    date/year (a plain intersect1d) silently drops, or for a
+    non-overlapping GCM entirely empties, the comparison. Pairing by
+    relative position from the end instead uses every step both sides
+    actually have, however far apart their real calendars are.
+
+    Returns (model_aligned, ref_aligned), both trimmed to the shared length
+    n = min(len(model), len(ref)) and sharing identical `dim` coordinate
+    values (ref's own), so callers can use them directly with no further
+    alignment (no more intersect1d/.sel needed downstream).
     """
-    n_common = len(common)
+    n = min(model.sizes[dim], ref.sizes[dim])
+    model_aligned = model.isel({dim: slice(-n, None)})
+    ref_aligned = ref.isel({dim: slice(-n, None)})
+    model_aligned = model_aligned.assign_coords({dim: ref_aligned[dim].values})
+    return model_aligned, ref_aligned
+
+
+def _check_time_overlap(n_common, len_model, len_ref, label, GCM, run):
+    """
+    Warn when the shared sample actually scored (n_common, from
+    _reanchor_to_ref) is much shorter than either side's own length -- e.g.
+    a GCM's dadjusted_* GWL0-61 file genuinely only holding 10 of the
+    intended 20 years would otherwise silently shrink that variable's
+    climatology sample with no other signal in the log; the R2/RMSE/MAE
+    rows in csv_path look identical either way. Compares against the
+    *longer* of the two sides (not a hardcoded ref_period day count) so
+    this works for both the daily 'time' overlaps and the annual 'year'
+    overlaps in validate_bias_adjustment_compound without knowing the
+    calendar.
+    """
     n_max = max(len_model, len_ref)
     if n_max and n_common < 0.95 * n_max:
         print(f"[validate_bias_adjustment] WARNING {GCM}/{run}: only {n_common}/{n_max} "
@@ -1532,16 +1558,21 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
     """
     variables = ['tas', 'sfcWind', 'rsds']
 
+    # Not sliced to ref_period here: dhist's own GWL0-61 window is this
+    # GCM's actual (per-model) 20-year window around the target warming
+    # level, which for many GCMs does not literally fall inside
+    # ref_period's calendar dates (e.g. CMCC-ESM2's GWL0-61 is 1971-1990,
+    # not 1982-2001) -- slicing by ref_period here would silently truncate
+    # dhist before _reanchor_to_ref ever gets a chance to pair it against
+    # dref by relative position. dref (ERA5) is the one side that should
+    # stay pinned to ref_period's literal calendar dates.
     dhist = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
-    dhist = dhist.sel(time=slice(*ref_period))
     dref = _load_era5_on_grid_cached(GCM, dhist, path_folder, path_preprocessed,
                                      shapefile_path, ref_period, reanalysis)
 
-    common_times = np.intersect1d(dhist.time.values, dref.time.values)
-    _check_time_overlap(common_times, dhist.time.size, dref.time.size,
+    dhist_c, dref_c = _reanchor_to_ref(dhist, dref, dim='time')
+    _check_time_overlap(dhist_c.time.size, dhist.time.size, dref.time.size,
                         'raw variables time', GCM, run)
-    dhist_c = dhist.sel(time=common_times)
-    dref_c = dref.sel(time=common_times)
     for var in variables:
         r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(dhist_c[var], dref_c[var])
         _append_validation_score(GCM, run, False, var, r2, rmse, mae, rel_rmse, rel_mae, csv_path)
@@ -1551,12 +1582,12 @@ def validate_bias_adjustment_variables(GCM, run, ssp, path_preprocessed, path_fo
         print(f"No bias-adjusted GWL0-61 file for {GCM}/{run} at {adj_path}, "
               "skipping adjusted variable scores.")
     else:
-        dadj = open_dataset_any(adj_path).sel(time=slice(*ref_period))
-        common_times = np.intersect1d(dadj.time.values, dref.time.values)
-        _check_time_overlap(common_times, dadj.time.size, dref.time.size,
+        # Same reasoning as dhist above: dadj sits on this GCM's own
+        # GWL0-61 window, not necessarily ref_period's calendar dates.
+        dadj = open_dataset_any(adj_path)
+        dadj_c, dref_c = _reanchor_to_ref(dadj, dref, dim='time')
+        _check_time_overlap(dadj_c.time.size, dadj.time.size, dref.time.size,
                             'adjusted variables time', GCM, run)
-        dadj_c = dadj.sel(time=common_times)
-        dref_c = dref.sel(time=common_times)
         for var in variables:
             r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(dadj_c[var], dref_c[var])
             _append_validation_score(GCM, run, True, var, r2, rmse, mae, rel_rmse, rel_mae, csv_path)
@@ -1675,18 +1706,22 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
     scf_ref = open_dataset_any(scf_ref_files[0]).sel(time=slice(*ref_period))
 
     def _score_ds_cf(bias_adjust, wcf_model, scf_model):
-        common_t = np.intersect1d(wcf_model.time.values, wcf_ref.time.values)
-        _check_time_overlap(common_t, wcf_model.time.size, wcf_ref.time.size,
+        # wcf_model/scf_model sit on this GCM's own GWL0-61 window (not
+        # necessarily ref_period's calendar dates -- see
+        # validate_bias_adjustment_variables); reanchor by relative
+        # position instead of assuming calendar dates line up.
+        wcf_model_c, wcf_ref_c = _reanchor_to_ref(wcf_model, wcf_ref, dim='time')
+        _check_time_overlap(wcf_model_c.time.size, wcf_model.time.size, wcf_ref.time.size,
                             'wcf time', GCM, run)
         r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
-            wcf_model.wcf.sel(time=common_t), wcf_ref.wcf.sel(time=common_t))
+            wcf_model_c.wcf, wcf_ref_c.wcf)
         _append_validation_score(GCM, run, bias_adjust, 'wcf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
 
-        common_t = np.intersect1d(scf_model.time.values, scf_ref.time.values)
-        _check_time_overlap(common_t, scf_model.time.size, scf_ref.time.size,
+        scf_model_c, scf_ref_c = _reanchor_to_ref(scf_model, scf_ref, dim='time')
+        _check_time_overlap(scf_model_c.time.size, scf_model.time.size, scf_ref.time.size,
                             'scf time', GCM, run)
         r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
-            scf_model.scf.sel(time=common_t), scf_ref.scf.sel(time=common_t))
+            scf_model_c.scf, scf_ref_c.scf)
         _append_validation_score(GCM, run, bias_adjust, 'scf', r2, rmse, mae, rel_rmse, rel_mae, csv_path)
 
     calculate_ds_cf_GCM(GCM, run, ssp, path_preprocessed, 'GWL0-61',
@@ -1697,8 +1732,11 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
                             f"wcf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}{wcf_suffix}.zarr")
     scf_path = os.path.join(path_preprocessed, GCM,
                             f"scf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}.zarr")
-    wcf_adj = open_dataset_any(wcf_path).sel(time=slice(*ref_period))
-    scf_adj = open_dataset_any(scf_path).sel(time=slice(*ref_period))
+    # Not sliced to ref_period: wcf_adj/scf_adj sit on this GCM's own
+    # GWL0-61 window (see validate_bias_adjustment_variables); _score_ds_cf
+    # reanchors them against wcf_ref/scf_ref by relative position.
+    wcf_adj = open_dataset_any(wcf_path)
+    scf_adj = open_dataset_any(scf_path)
     _score_ds_cf(True, wcf_adj, scf_adj)
 
     scf_raw_path, wcf_raw_path = compute_raw_ds_cf(
@@ -1706,8 +1744,8 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
         cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
         shear_by_gcm_dir=shear_by_gcm_dir,
     )
-    wcf_raw = open_dataset_any(wcf_raw_path).sel(time=slice(*ref_period))
-    scf_raw = open_dataset_any(scf_raw_path).sel(time=slice(*ref_period))
+    wcf_raw = open_dataset_any(wcf_raw_path)
+    scf_raw = open_dataset_any(scf_raw_path)
     _score_ds_cf(False, wcf_raw, scf_raw)
 
 
@@ -1788,11 +1826,15 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
             ('freq', freq_m, freq_r), ('dur', dur_m, dur_r),
             ('int', int_m, int_r), ('sev', sev_m, sev_r),
         ):
-            common_years = np.intersect1d(model_da.year.values, ref_da.year.values)
-            _check_time_overlap(common_years, model_da.year.size, ref_da.year.size,
+            # model_da.year runs over this GCM's own GWL0-61 window (e.g.
+            # 1971-1990 for CMCC-ESM2), ref_da.year over ref_period's real
+            # ERA5 years (1982-2001) -- reanchor by relative position
+            # rather than intersecting literal calendar years.
+            model_da_c, ref_da_c = _reanchor_to_ref(model_da, ref_da, dim='year')
+            _check_time_overlap(model_da_c.year.size, model_da.year.size, ref_da.year.size,
                                 f'{label} year', GCM, run)
             r2, rmse, mae, rel_rmse, rel_mae = _climatology_r2_rmse_mae(
-                model_da.sel(year=common_years), ref_da.sel(year=common_years), dim='year')
+                model_da_c, ref_da_c, dim='year')
             _append_validation_score(GCM, run, bias_adjust, label, r2, rmse, mae,
                                      rel_rmse, rel_mae, csv_path)
 
@@ -1801,8 +1843,11 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
     scf_path = os.path.join(path_preprocessed, GCM,
                             f"scf_day_{GCM}_{ssp}_{run}_GWL0-61_{reanalysis}.zarr")
     if os.path.exists(wcf_path) and os.path.exists(scf_path):
-        wcf_adj = open_dataset_any(wcf_path).sel(time=slice(*ref_period))
-        scf_adj = open_dataset_any(scf_path).sel(time=slice(*ref_period))
+        # Not sliced to ref_period: sits on this GCM's own GWL0-61 window
+        # (see validate_bias_adjustment_variables); _score_branch reanchors
+        # by relative position.
+        wcf_adj = open_dataset_any(wcf_path)
+        scf_adj = open_dataset_any(scf_path)
         _score_branch(True, wcf_adj, scf_adj)
     else:
         print(f"No bias-adjusted wcf_day/scf_day for {GCM}/{run}, skipping adjusted compound scores.")
@@ -1812,8 +1857,8 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
         cfg=cfg, pv_cfg=pv_cfg, shear_ref_period=shear_ref_period,
         shear_by_gcm_dir=shear_by_gcm_dir,
     )
-    wcf_raw = open_dataset_any(wcf_raw_path).sel(time=slice(*ref_period))
-    scf_raw = open_dataset_any(scf_raw_path).sel(time=slice(*ref_period))
+    wcf_raw = open_dataset_any(wcf_raw_path)
+    scf_raw = open_dataset_any(scf_raw_path)
     _score_branch(False, wcf_raw, scf_raw)
 
 
