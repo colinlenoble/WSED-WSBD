@@ -1304,7 +1304,16 @@ def _climatology_r2_rmse_mae(pred, obs, dim='time'):
     tas (~270 K), rsds (~200 W/m2), sfcWind (~5 m/s), scf/wcf (0-1) and the
     compound indices all live on different scales, so the raw RMSE/MAE
     aren't comparable across variables; the relative version is.
+
+    pred/obs are aligned by coordinate label (inner join) on every shared
+    dim before averaging: callers already intersect `dim` themselves, but
+    non-`dim` axes (lat/lon) aren't guaranteed to match -- e.g. a GCM's
+    bias-adjusted output cropped to ERA5's domain vs. that same GCM's raw
+    grid reloaded uncropped -- and ravel()ing two differently-shaped arrays
+    would otherwise fail with an opaque broadcasting error instead of just
+    scoring the cells both sides actually have.
     """
+    pred, obs = xr.align(pred, obs, join='inner')
     pred_clim = pred.mean(dim=dim, skipna=True)
     obs_clim = obs.mean(dim=dim, skipna=True)
     pred_v = np.asarray(pred_clim.compute().values if hasattr(pred_clim, 'compute')
