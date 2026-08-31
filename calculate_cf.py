@@ -1,5 +1,6 @@
 # -*- coding: cp1252 -*-
 import os
+import shutil
 import config
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 import xesmf as xe
@@ -609,7 +610,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         base_kws={"nquantiles": 30, "group": "time"},
         adj_kws={"interp": "linear", "extrapolation": "constant"},
         n_iter=20,
-        n_escore=100,
+        n_escore=500,
         pts_dim='multivar',
     )
     _log_mem("after MBCn.train")
@@ -935,7 +936,13 @@ def calculate_ds_cf_reanalysis_grid_GCM(
     std_mask = dref_rg.tas.std(dim='time')
     if hasattr(std_mask, 'compute'):
         std_mask = std_mask.compute()
-    dref_rg = dref_rg.where(~std_mask.isnull() & (std_mask != 0), drop=True)
+    # No drop=True: dropping all-NaN/zero-variance cells here would shrink
+    # dref_rg's (lat, lon) shape relative to gcm_grid, breaking the
+    # same-grid assumption validate_bias_adjustment_ds_cf's _score_ds_cf
+    # relies on when it ravels wcf_ref/scf_ref against wcf_model/scf_model
+    # (masked-out cells stay NaN and get filtered by _climatology_r2_rmse_mae's
+    # own isfinite check instead).
+    dref_rg = dref_rg.where(~std_mask.isnull() & (std_mask != 0))
 
     # Persist once here: the solar and wind branches below both build a
     # separate graph on top of dref_rg (open + regrid + calendar-convert +
@@ -1815,6 +1822,20 @@ def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
             stage_fn(GCM, run, ssp, path_preprocessed, path_folder, shapefile_path, **kwargs)
         except Exception:
             print(f"[validate_bias_adjustment] {stage_name} stage failed for {GCM}/{run}:")
+            traceback.print_exc()
+
+    # era5_on_grid_{GCM}_{reanalysis}.zarr (see _load_era5_on_grid_cached) is
+    # only needed transiently by the 'variables' stage above; deleting it
+    # here trades that cache away -- every future call to
+    # validate_bias_adjustment_variables for this GCM (any run/ssp) will
+    # redo the expensive xesmf regrid instead of reusing it.
+    era5_on_grid_path = os.path.join(path_preprocessed, GCM, f"era5_on_grid_{GCM}_{reanalysis}.zarr")
+    if os.path.exists(era5_on_grid_path):
+        try:
+            shutil.rmtree(era5_on_grid_path)
+            print(f"[validate_bias_adjustment] Deleted {era5_on_grid_path}")
+        except OSError:
+            print(f"[validate_bias_adjustment] Failed to delete {era5_on_grid_path}:")
             traceback.print_exc()
 
 
