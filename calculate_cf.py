@@ -455,7 +455,24 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     dref = dref.stack(location=("lat", "lon"))
     dhist = dhist.stack(location=("lat", "lon"))
-    _log_mem("after stack(location=(lat,lon))")
+    _log_mem("after stack(location=(lat,lon)) (still lazy)")
+
+    # Materialize now, once: dref/dhist are still one long lazy graph all
+    # the way back to the raw ERA5 files (open_mfdataset_any -> regrid ->
+    # two masks -> stack). Without this, every *separate* .compute() call
+    # below (each of remove_constant_locations' 6 per-variable checks,
+    # valid_mask, the ref/hist NaN diagnostics) independently replays that
+    # entire chain from scratch -- Dask has no cross-call cache without
+    # .persist()/.compute() -- and each replay gets more expensive as more
+    # steps pile up before it. That's what produced the escalating
+    # 19GB -> 42GB -> 58GB -> 68GB -> 283GB peak-RSS climb across those
+    # checkpoints on a 500GB node. At this point dref/dhist are already
+    # regridded onto the (coarser) GCM grid, masked, and sliced to
+    # ref_period, so this is the smallest point at which materializing is
+    # still a single one-time cost, paid once instead of ~8 times over.
+    dref = dref.compute()
+    dhist = dhist.compute()
+    _log_mem("after materializing dref/dhist (single one-time compute)")
 
     # Jitter lower bounds set to a fixed safe value
     rsds_low = 1
@@ -570,9 +587,9 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     ADJ = sdba.MBCn.train(
         ref, hist,
         base_kws={"nquantiles": 30, "group": "time"},
-        adj_kws={"interp": "nearest", "extrapolation": "constant"},
+        adj_kws={"interp": "linear", "extrapolation": "constant"},
         n_iter=20,
-        n_escore=100,
+        n_escore=500,
         pts_dim='multivar',
     )
     _log_mem("after MBCn.train")
@@ -694,7 +711,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             hist=hist,
             sim=fut,
             base=sdba.QuantileDeltaMapping,
-            adj_kws={"interp": "nearest", "extrapolation": "constant"},
+            adj_kws={"interp": "linear", "extrapolation": "constant"},
         )
 
         adj = sdba.unstack_variables(adj).compute()
@@ -2307,9 +2324,9 @@ if __name__ == "__main__":
     cfg = DEFAULT_DS_CF_CONFIG
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
-    # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
+    GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
     # GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
-    GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
+    # GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
     # GCM, run = 'CanESM5', 'r11i1p1f1'
     
     # calculate_ds_cf_reanalysis(
