@@ -375,6 +375,22 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         print("Computing sfcWind from u10/v10")
         dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
 
+    # Slice to ref_period and drop unneeded variables *before* chunking/
+    # masking/regridding, not after (as this used to do at the ref_period
+    # slice further down, right before .stack()). dref.chunk({'time': -1,
+    # ...}) below puts ERA5's *entire* native time record in a single chunk
+    # per spatial block, so a later .sel(time=slice(ref_period)) can't
+    # reduce what the regrid actually computes -- Dask has to materialize
+    # the whole chunk (ERA5's full multi-decade record, at full native
+    # resolution, for every variable in the file, not just these 3) before
+    # it can even take the slice. Cutting to ref_period/3-vars here instead
+    # means every downstream step (both masks, the regrid, the stack, the
+    # materialize below) works on ~20 years instead of the full record.
+    ref_period = ('1982-01-01', '2001-12-31')
+    dref = dref[['sfcWind', 'tas', 'rsds']]
+    dref = dref.sel(time=slice(*ref_period))
+    _log_mem("after early ref_period slice + variable subset (pre-regrid)")
+
     dref = dref.sortby('lat').sortby('lon').sortby('time')
     dhist = dhist.sortby('lat').sortby('lon').sortby('time')
     dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
@@ -402,6 +418,12 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dref = dref.where(mask == 1, np.nan)
     dref['mask'] = xr.where(~np.isnan(dref.isel(time=0).tas), 1, 0)
     print("dref mask coverage:", float(dref['mask'].sum() / dref['mask'].count()))
+    # Drop the diagnostic 'mask' var again right away: the variable subset
+    # that used to implicitly drop it now runs *before* 'mask' is created
+    # (moved earlier, see above), so without this it would ride along as a
+    # 4th "variable" into stack_variables() below and corrupt the
+    # multivariate (sfcWind/tas/rsds-only) MBCn training array.
+    dref = dref[['sfcWind', 'tas', 'rsds']]
     _log_mem("after coarse shapefile mask (pre-regrid, native ERA5 grid)")
 
     # Regrid reference to dhist grid. skipna=True matters specifically for
@@ -446,9 +468,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     dref = set_variable_units(dref, var_units)
     dhist = set_variable_units(dhist, var_units)
 
-    dref = dref.sel(time=slice('1982-01-01', '2001-12-31'))
-    dref = dref[['sfcWind', 'tas', 'rsds']]
-    _log_mem("after fine shapefile mask + ref_period slice")
+    _log_mem("after fine shapefile mask (ref_period/variable subset already applied earlier)")
 
     lon_ori = dref.lon
     lat_ori = dref.lat
@@ -589,7 +609,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         base_kws={"nquantiles": 30, "group": "time"},
         adj_kws={"interp": "linear", "extrapolation": "constant"},
         n_iter=20,
-        n_escore=500,
+        n_escore=100,
         pts_dim='multivar',
     )
     _log_mem("after MBCn.train")
@@ -2324,9 +2344,9 @@ if __name__ == "__main__":
     cfg = DEFAULT_DS_CF_CONFIG
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
-    GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
+    # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
     # GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
-    # GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
+    GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
     # GCM, run = 'CanESM5', 'r11i1p1f1'
     
     # calculate_ds_cf_reanalysis(
