@@ -1839,13 +1839,20 @@ def validate_bias_adjustment(GCM, run, ssp, path_preprocessed, path_folder,
     # validate_bias_adjustment_variables for this GCM (any run/ssp) will
     # redo the expensive xesmf regrid instead of reusing it.
     era5_on_grid_path = os.path.join(path_preprocessed, GCM, f"era5_on_grid_{GCM}_{reanalysis}.zarr")
-    if os.path.exists(era5_on_grid_path):
-        try:
-            shutil.rmtree(era5_on_grid_path)
-            print(f"[validate_bias_adjustment] Deleted {era5_on_grid_path}")
-        except OSError:
-            print(f"[validate_bias_adjustment] Failed to delete {era5_on_grid_path}:")
-            traceback.print_exc()
+    # scf_raw_day_*/wcf_raw_day_* (see compute_raw_ds_cf) are, unlike
+    # era5_on_grid, keyed by run/ssp too -- nothing outside this single
+    # validate_bias_adjustment call (the 'scf/wcf' and 'freq/dur/int/sev'
+    # stages above, both already finished by this point) ever reuses them,
+    # so deleting them here is pure storage savings, no recompute trade-off.
+    scf_raw_path, wcf_raw_path = _raw_ds_cf_paths(GCM, run, ssp, path_preprocessed, reanalysis, cfg)
+    for cleanup_path in (era5_on_grid_path, scf_raw_path, wcf_raw_path):
+        if os.path.exists(cleanup_path):
+            try:
+                shutil.rmtree(cleanup_path)
+                print(f"[validate_bias_adjustment] Deleted {cleanup_path}")
+            except OSError:
+                print(f"[validate_bias_adjustment] Failed to delete {cleanup_path}:")
+                traceback.print_exc()
 
 
 # -------------------------
