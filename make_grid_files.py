@@ -17,9 +17,13 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
     aggregated yearly.
     """
 
-    # Deficits (clip at 0 so negatives can't creep in)
-    deficit_scf = xr.where(scf_ds["scf"] < scf_thr, scf_thr - scf_ds["scf"], 0)
-    deficit_wcf = xr.where(wcf_ds["wcf"] < wcf_thr, wcf_thr - wcf_ds["wcf"], 0)
+    # Deficits (clip at 0 so negatives can't creep in). <= to match the
+    # compound-day definition in calculate_cf.py's _compound_indices
+    # (low_wind/low_solar use wcf/scf <= thr), so a day exactly at the
+    # threshold is treated consistently by both the event flag and the
+    # deficit used for severity.
+    deficit_scf = xr.where(scf_ds["scf"] <= scf_thr, scf_thr - scf_ds["scf"], 0)
+    deficit_wcf = xr.where(wcf_ds["wcf"] <= wcf_thr, wcf_thr - wcf_ds["wcf"], 0)
     daily_deficit = deficit_scf + deficit_wcf
 
     # Mask to compound days
@@ -126,7 +130,17 @@ def duration_xr(da):
     ds_freq = ds_freq['duration'].to_dataset(name='frequency')
     ds_freq['frequency'] = ds_freq['frequency'].fillna(0)
     ds['duration'] = ds['duration'].fillna(0)
-    
+
+    # Reindex onto the full (year, lat, lon) grid from da: a year with zero
+    # events at every single pixel never becomes a level value coming out of
+    # groupby/to_xarray above, so it's missing entirely (not just NaN) --
+    # the fillna(0) calls above can't catch that. This also keeps freq/dur
+    # on the same coordinates as compute_severity's intensity output, which
+    # is already calendar-complete via its .resample(...).fillna(0).
+    full_years = np.unique(da.time.dt.year.values)
+    ds = ds.reindex(year=full_years, lat=da.lat.values, lon=da.lon.values, fill_value=0)
+    ds_freq = ds_freq.reindex(year=full_years, lat=da.lat.values, lon=da.lon.values, fill_value=0)
+
     return ds, ds_freq
     
 def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):

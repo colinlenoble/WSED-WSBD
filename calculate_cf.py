@@ -1770,6 +1770,24 @@ def validate_bias_adjustment_ds_cf(GCM, run, ssp, path_preprocessed, path_folder
     _score_ds_cf(False, wcf_raw, scf_raw)
 
 
+def _thr_diff_stats(thr_model, thr_ref):
+    """
+    Mean absolute (and relative) difference between a per-pixel threshold
+    computed from the model series and the same threshold computed from the
+    reference series -- diagnostic for validate_bias_adjustment_compound,
+    which detects compound events on both series using only the model's
+    threshold (see _score_branch). Quantifies how much that shortcut
+    actually shifts the event definition away from what ERA5's own
+    threshold would give.
+    """
+    diff = thr_model - thr_ref
+    if hasattr(diff, 'compute'):
+        diff = diff.compute()
+    thr_ref_c = thr_ref.compute() if hasattr(thr_ref, 'compute') else thr_ref
+    rel = xr.where(thr_ref_c != 0, diff / thr_ref_c, np.nan)
+    return float(np.abs(diff).mean(skipna=True)), float(np.abs(rel).mean(skipna=True)) * 100
+
+
 def _compound_indices(wcf, scf, wcf_thr, scf_thr):
     """
     Annual (year, lat, lon) freq/dur/int/sev compound-event indices from
@@ -1797,6 +1815,11 @@ def _compound_indices(wcf, scf, wcf_thr, scf_thr):
 
     freq = ds_freq.frequency
     dur = ds_dur.duration
+    if not (freq.year.size == dur.year.size == intensity.year.size):
+        print(f"[validate_bias_adjustment] WARNING: freq/dur/int year mismatch -- "
+              f"freq={freq.year.size}, dur={dur.year.size}, int={intensity.year.size} "
+              f"years. sev=freq*dur*intensity below will silently inner-join to the "
+              f"years shared by all three.")
     sev = freq * dur * intensity
     return freq, dur, intensity, sev
 
@@ -1839,6 +1862,17 @@ def validate_bias_adjustment_compound(GCM, run, ssp, path_preprocessed, path_fol
     def _score_branch(bias_adjust, wcf_model, scf_model):
         wcf_thr = wcf_model.wcf.where(wcf_model.wcf > 0).quantile(q, dim='time')
         scf_thr = scf_model.scf.where(scf_model.scf > 0).quantile(q, dim='time')
+
+        # Diagnostic only (detection below still uses the model's threshold
+        # for both series): how far off is the model's threshold from what
+        # ERA5's own threshold actually is?
+        wcf_thr_ref = wcf_ref.wcf.where(wcf_ref.wcf > 0).quantile(q, dim='time')
+        scf_thr_ref = scf_ref.scf.where(scf_ref.scf > 0).quantile(q, dim='time')
+        for label, thr_model, thr_ref in (('wcf', wcf_thr, wcf_thr_ref), ('scf', scf_thr, scf_thr_ref)):
+            mean_abs_diff, mean_abs_pct = _thr_diff_stats(thr_model, thr_ref)
+            print(f"[validate_bias_adjustment] {GCM}/{run} bias_adjust={bias_adjust} "
+                  f"{label}_thr model-vs-ref: mean|delta|={mean_abs_diff:.4f}, "
+                  f"mean|delta%|={mean_abs_pct:.1f}%")
 
         freq_m, dur_m, int_m, sev_m = _compound_indices(wcf_model, scf_model, wcf_thr, scf_thr)
         freq_r, dur_r, int_r, sev_r = _compound_indices(wcf_ref, scf_ref, wcf_thr, scf_thr)
@@ -2483,8 +2517,8 @@ if __name__ == "__main__":
 
     # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
     # GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
-    GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
-    # GCM, run = 'CanESM5', 'r11i1p1f1'
+    #GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
+    GCM, run = 'CanESM5', 'r11i1p1f1'
     
     # calculate_ds_cf_reanalysis(
     #     path_folder,
