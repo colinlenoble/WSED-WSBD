@@ -529,7 +529,7 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
     """Bootstrap slope samples for the reanalysis reference sev, per region."""
     reanalysis = reanalysis or config.REANALYSIS
     agg_ref = xr.open_dataset(
-        os.path.join(preprocessed_path, f'agg_ref_annual_sev_{reanalysis}_all_year.nc')
+        os.path.join(preprocessed_path, f'grid_ref_annual_sev_{reanalysis}_all_year.nc')
     )
     agg_ref = agg_ref.mean(dim='realization')
 
@@ -586,9 +586,9 @@ if __name__ == '__main__':
     out_dir            = os.path.join(config.PATH_PREPROCESSED, 'trend_evaluation')
     os.makedirs(out_dir, exist_ok=True)
 
-    # make_annual_freq_ref(preprocessed_path, out_dir)
-    # preprocess_ref(out_dir, out_dir)
-    # preprocess_ref_boot(out_dir, out_dir, shapefile_path)
+    make_annual_freq_ref(preprocessed_path, out_dir)
+    preprocess_ref(out_dir, out_dir)
+    preprocess_ref_boot(out_dir, out_dir, shapefile_path)
 
     uncertainty_range(preprocessed_path, out_dir)
     slopes_samples(preprocessed_path, out_dir, shapefile_path)
