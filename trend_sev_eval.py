@@ -56,15 +56,15 @@ def _target_grid(preprocessed_path, reanalysis):
 
 
 # ---------------------------------------------------------------------------
-# PDD components (mirrors calculate_cf.py's _compound_indices /
-# make_grid_files.py's compute_severity+duration_xr exactly: <= threshold
-# comparison, so a day exactly at the threshold is treated the same way
-# here as by the compound-day flag itself and by every other script in the
-# pipeline).
+# Severity (sev) components: sev = intensity * duration * frequency
+# (mirrors calculate_cf.py's _compound_indices / make_grid_files.py's
+# compute_severity+duration_xr exactly: <= threshold comparison, so a day
+# exactly at the threshold is treated the same way here as by the
+# compound-day flag itself and by every other script in the pipeline).
 # ---------------------------------------------------------------------------
 
 def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
-    """Mean deficit on compound-event days, aggregated yearly."""
+    """Mean deficit (intensity) on compound-event days, aggregated yearly."""
     deficit_scf = xr.where(scf_ds["scf"] <= scf_thr, scf_thr - scf_ds["scf"], 0)
     deficit_wcf = xr.where(wcf_ds["wcf"] <= wcf_thr, wcf_thr - wcf_ds["wcf"], 0)
     daily_deficit = deficit_scf + deficit_wcf
@@ -138,7 +138,7 @@ def duration_xr(da):
 
 
 # ---------------------------------------------------------------------------
-# Reference period (reanalysis-based): one PDD series per GCM's own grid +
+# Reference period (reanalysis-based): one sev series per GCM's own grid +
 # GWL0-61 threshold (same per-model threshold every other GWL is scored
 # against), regridded onto the common reanalysis target grid and
 # concatenated over 'realization' -- mirrors make_grid_files.py's
@@ -146,7 +146,7 @@ def duration_xr(da):
 # ---------------------------------------------------------------------------
 
 def make_annual_freq_ref(preprocessed_path, out_dir, reanalysis=None):
-    """Build annual PDD for the reanalysis reference period, once per GCM grid."""
+    """Build annual sev for the reanalysis reference period, once per GCM grid."""
     reanalysis = reanalysis or config.REANALYSIS
     grid = _target_grid(preprocessed_path, reanalysis)
 
@@ -185,19 +185,25 @@ def make_annual_freq_ref(preprocessed_path, out_dir, reanalysis=None):
         wcf_ref = wcf_ref.convert_calendar('standard')
         scf_ref = scf_ref.convert_calendar('standard')
 
-        severity_ref = compute_severity(compound_ref.start_cooc, scf_ref, wcf_ref, scf_thr, wcf_thr)
+        intensity_ref = compute_severity(compound_ref.start_cooc, scf_ref, wcf_ref, scf_thr, wcf_thr)
+        intensity_ref['time'] = intensity_ref.time.dt.year
+        intensity_ref = intensity_ref.rename({'time': 'year'})
+
         ds_dur, ds_freq = duration_xr(compound_ref.start_cooc)
-        ds_dur  = ds_dur.reindex({'lat': scf_ref.lat, 'lon': scf_ref.lon})
-        ds_freq = ds_freq.reindex({'lat': scf_ref.lat, 'lon': scf_ref.lon})
+        # duration_xr's groupby-based output only carries (year, lat, lon)
+        # combinations that had at least one compound-event day, so a year
+        # with zero events anywhere is entirely absent from its 'year'
+        # coordinate -- reindex onto intensity_ref's full (always-complete,
+        # one row per calendar year from resample) year/lat/lon grid and
+        # fill those zero-event years with 0 rather than leaving them NaN.
+        ds_dur  = ds_dur.reindex_like(intensity_ref, fill_value=0)
+        ds_freq = ds_freq.reindex_like(intensity_ref, fill_value=0)
 
-        severity_ref['time'] = severity_ref.time.dt.year
-        severity_ref = severity_ref.rename({'time': 'year'})
-
-        pdd_ref = (severity_ref * ds_dur.duration * ds_freq.frequency).to_dataset(name='pdd')
-        pdd_ref = xe.Regridder(pdd_ref, grid, method='nearest_s2d')(pdd_ref)
-        pdd_ref['GCM'] = f'{GCM}_{reanalysis}'
-        pdd_ref['run'] = run
-        dfinal.append(pdd_ref.expand_dims({'realization': [i]}))
+        sev_ref = (intensity_ref * ds_dur.duration * ds_freq.frequency).to_dataset(name='sev')
+        sev_ref = xe.Regridder(sev_ref, grid, method='nearest_s2d')(sev_ref)
+        sev_ref['GCM'] = f'{GCM}_{reanalysis}'
+        sev_ref['run'] = run
+        dfinal.append(sev_ref.expand_dims({'realization': [i]}))
 
     xr.concat(dfinal, dim='realization').to_netcdf(
         os.path.join(out_dir, f'grid_ref_annual_sev_{reanalysis}_all_year.nc')
@@ -205,20 +211,20 @@ def make_annual_freq_ref(preprocessed_path, out_dir, reanalysis=None):
 
 
 def preprocess_ref(preprocessed_path, out_dir, reanalysis=None):
-    """Compute bootstrap CI of trend for the reanalysis reference PDD."""
+    """Compute bootstrap CI of trend for the reanalysis reference sev."""
     reanalysis = reanalysis or config.REANALYSIS
     ds_ref = xr.open_dataset(os.path.join(preprocessed_path, f'grid_ref_annual_sev_{reanalysis}_all_year.nc'))
-    low, up, mean = stationary_bootstrap_ci_grid(ds_ref.pdd)
+    low, up, mean = stationary_bootstrap_ci_grid(ds_ref.sev)
     ds = low.to_dataset(name='low_trend')
     ds['up_trend']   = up
     ds['mean_trend'] = mean
     ds.to_netcdf(f'{out_dir}/grid_ic_ref.nc')
 
 
-def preprocess_single_pdd(preprocessed_path, GCM, run, reanalysis=None):
+def preprocess_single_sev(preprocessed_path, GCM, run, reanalysis=None):
     """
-    Concatenate GWL0-61 and GWL1 PDD into a single 38-year series for trend
-    estimation (the "38-year window whose first 20 years were centered on
+    Concatenate GWL0-61 and GWL1 sev into a single 40-year series for trend
+    estimation (the "40-year window whose first 20 years were centered on
     GWL0.61" described in the trend-evaluation Methods).
     """
     reanalysis = reanalysis or config.REANALYSIS
@@ -256,32 +262,38 @@ def preprocess_single_pdd(preprocessed_path, GCM, run, reanalysis=None):
     compound_gwl061 = (wcf_gwl061['low_wind'] * scf_gwl061['low_solar']).to_dataset(name='compound')
     compound_gwl1   = (wcf_gwl1['low_wind']   * scf_gwl1['low_solar']  ).to_dataset(name='compound')
 
-    severity_gwl061 = compute_severity(compound_gwl061.compound, scf_gwl061, wcf_gwl061, scf_thr, wcf_thr)
-    severity_gwl1   = compute_severity(compound_gwl1.compound,   scf_gwl1,   wcf_gwl1,   scf_thr, wcf_thr)
+    intensity_gwl061 = compute_severity(compound_gwl061.compound, scf_gwl061, wcf_gwl061, scf_thr, wcf_thr)
+    intensity_gwl1   = compute_severity(compound_gwl1.compound,   scf_gwl1,   wcf_gwl1,   scf_thr, wcf_thr)
+
+    for da in (intensity_gwl061, intensity_gwl1):
+        da['time'] = da.time.dt.year
+
+    intensity_gwl061 = intensity_gwl061.rename({'time': 'year'})
+    intensity_gwl1   = intensity_gwl1.rename({'time': 'year'})
 
     dur_gwl061, freq_gwl061 = duration_xr(compound_gwl061.compound)
     dur_gwl1,   freq_gwl1   = duration_xr(compound_gwl1.compound)
 
-    dur_gwl061  = dur_gwl061.reindex_like(severity_gwl061)
-    dur_gwl1    = dur_gwl1.reindex_like(severity_gwl1)
-    freq_gwl061 = freq_gwl061.reindex_like(severity_gwl061)
-    freq_gwl1   = freq_gwl1.reindex_like(severity_gwl1)
+    # duration_xr's groupby-based output only carries (year, lat, lon)
+    # combinations that had at least one compound-event day, so a year with
+    # zero events anywhere is entirely absent from its 'year' coordinate --
+    # reindex onto intensity's full (always-complete, one row per calendar
+    # year from resample) year/lat/lon grid and fill those zero-event years
+    # with 0 rather than leaving them NaN.
+    dur_gwl061  = dur_gwl061.reindex_like(intensity_gwl061, fill_value=0)
+    dur_gwl1    = dur_gwl1.reindex_like(intensity_gwl1, fill_value=0)
+    freq_gwl061 = freq_gwl061.reindex_like(intensity_gwl061, fill_value=0)
+    freq_gwl1   = freq_gwl1.reindex_like(intensity_gwl1, fill_value=0)
 
-    for sev in (severity_gwl061, severity_gwl1):
-        sev['time'] = sev.time.dt.year
+    sev_gwl061 = (intensity_gwl061 * dur_gwl061.duration * freq_gwl061.frequency)
+    sev_gwl1   = (intensity_gwl1   * dur_gwl1.duration   * freq_gwl1.frequency  )
 
-    severity_gwl061 = severity_gwl061.rename({'time': 'year'})
-    severity_gwl1   = severity_gwl1.rename({'time': 'year'})
+    n_years_gwl061 = sev_gwl061.year.size
+    n_years_gwl1 = 40 - n_years_gwl061
+    sev_gwl1 = sev_gwl1.isel(year=slice(0, n_years_gwl1))
 
-    pdd_gwl061 = (severity_gwl061 * dur_gwl061.duration * freq_gwl061.frequency)
-    pdd_gwl1   = (severity_gwl1   * dur_gwl1.duration   * freq_gwl1.frequency  )
-
-    n_years_gwl061 = pdd_gwl061.year.size
-    n_years_gwl1 = 38 - n_years_gwl061
-    pdd_gwl1 = pdd_gwl1.isel(year=slice(0, n_years_gwl1))
-
-    pdd_gwl1['year'] = pdd_gwl1.year + n_years_gwl061
-    return xr.concat([pdd_gwl061, pdd_gwl1], dim='year')
+    sev_gwl1['year'] = sev_gwl1.year + n_years_gwl061
+    return xr.concat([sev_gwl061, sev_gwl1], dim='year')
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +308,7 @@ def preprocess_single_pdd(preprocessed_path, GCM, run, reanalysis=None):
 #
 # Below, index generation is vectorized across bootstrap replicates: the
 # stationary-bootstrap block structure only depends on n (number of years,
-# ~38 here) and block_size, not on the data, so one array of shape
+# ~40 here) and block_size, not on the data, so one array of shape
 # (n_boot, n) is built with a loop over the n time steps (vectorized across
 # n_boot) instead of a loop over n_boot. The same index array is then used
 # to gather + fit *every* grid cell/series at once via array ops. This
@@ -447,8 +459,8 @@ def uncertainty_range(preprocessed_path, out_dir, reanalysis=None):
     ds_final = []
     for i, p in enumerate(wcf_paths):
         GCM, run = p.split('_')[-5], p.split('_')[-3]
-        pdd = preprocess_single_pdd(preprocessed_path, GCM, run, reanalysis)
-        low, up, mean = stationary_bootstrap_ci_grid(pdd)
+        sev = preprocess_single_sev(preprocessed_path, GCM, run, reanalysis)
+        low, up, mean = stationary_bootstrap_ci_grid(sev)
         ds = low.to_dataset(name='low_trend')
         ds['up_trend']   = up
         ds['mean_trend'] = mean
@@ -478,13 +490,13 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
     ds_final = []
     for i, p in enumerate(wcf_paths):
         GCM, run = p.split('_')[-5], p.split('_')[-3]
-        pdd = preprocess_single_pdd(preprocessed_path, GCM, run, reanalysis)
+        sev = preprocess_single_sev(preprocessed_path, GCM, run, reanalysis)
 
         for r in regions:
             lat_lo, lat_hi = r["lat"]
             lon_lo, lon_hi = r["lon"]
-            pdd_region = (
-                pdd
+            sev_region = (
+                sev
                 .sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
                 .mean(dim=['lat', 'lon'])
             )
@@ -493,7 +505,7 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
             # CI) but not written to disk, to keep this file small across
             # 32 realizations x 4 regions.
             low, up, mean, _ = _stationary_bootstrap_slopes(
-                pdd_region.values, n_boot=2000, block_size=5, ci=95
+                sev_region.values, n_boot=2000, block_size=5, ci=95
             )
             ds_final.append(xr.Dataset(
                 {
@@ -514,7 +526,7 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
 
 
 def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
-    """Bootstrap slope samples for the reanalysis reference PDD, per region."""
+    """Bootstrap slope samples for the reanalysis reference sev, per region."""
     reanalysis = reanalysis or config.REANALYSIS
     agg_ref = xr.open_dataset(
         os.path.join(preprocessed_path, f'agg_ref_annual_sev_{reanalysis}_all_year.nc')
@@ -540,8 +552,8 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
     for r in regions:
         lat_lo, lat_hi = r["lat"]
         lon_lo, lon_hi = r["lon"]
-        pdd = (
-            agg_ref.pdd
+        sev = (
+            agg_ref.sev
             .where(mask)
             .sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
             .mean(dim=['lat', 'lon'])
@@ -549,7 +561,7 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
         # Summary only (see slopes_samples() above) -- the full bootstrap
         # distribution isn't kept on disk.
         low, up, mean, _ = _stationary_bootstrap_slopes(
-            pdd.values, n_boot=2000, block_size=5, ci=95
+            sev.values, n_boot=2000, block_size=5, ci=95
         )
         ds_final.append(xr.Dataset(
             {
