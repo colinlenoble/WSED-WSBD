@@ -264,9 +264,16 @@ def _compute_and_save(thr, tot_re, mix, demand_cfg,
     else:
         fname = f"rl_agg_adaptation_{period}_{thr}_ren_pen_{tot_re}_{mix}_v2.csv"
     out_path = os.path.join(out_dir, fname)
+    required_cols = {"poly_idx", "GCM", "run", "rl_cum",
+                     "gwl_ds_cf", "gwl_tas", "period", "tot_re", "share_re"}
     if os.path.exists(out_path):
-        print(f"  [SKIP] {fname}")
-        return
+        existing_cols = set(pd.read_csv(out_path, index_col=0, nrows=0).columns)
+        missing = required_cols - existing_cols
+        if not missing:
+            print(f"  [SKIP] {fname}")
+            return
+        print(f"  [STALE] {fname} is missing columns {sorted(missing)} "
+              "(schema changed since it was written) -- recomputing.")
     print(f"\n  Computing: {fname}")
     df_final = []
     for GCM, run in _iter_gcm_runs(path_preprocessed, ssp, reanalysis, suffix_shp):
