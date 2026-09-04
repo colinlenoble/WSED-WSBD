@@ -5,7 +5,6 @@ os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XCLIM
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XCLIM
 
 import argparse
-import glob
 import gc
 
 import cartopy.crs as ccrs
@@ -51,7 +50,7 @@ FIG_WIDTH_IN = 5.15   # column width � fontsizes in pt will match LaTeX
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Build aggregated gridded datasets (if needed) and produce "
+            "Build aggregated gridded datasets in memory and produce "
             "value-by-alpha maps for projected compound energy drought changes."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -63,27 +62,8 @@ def parse_args():
         default=config.PATH_PREPROCESSED,
         help=(
             "Root folder of the preprocessed daily wcf/scf files (zarr, falls "
-            "back to .nc) (e.g. <GCM>/wcf_day_*.zarr). Used when building the "
-            "aggregated datasets."
-        ),
-    )
-    parser.add_argument(
-        "--force_rebuild",
-        action="store_true",
-        default=False,
-        help=(
-            "Force re-building the aggregated gridded datasets even if they "
-            "already exist on disk."
-        ),
-    )
-
-    # --- GWL data (used for plotting) ---
-    parser.add_argument(
-        "--path_gwl",
-        default=config.PATH_PREPROCESSED + "agg_datasets/",
-        help=(
-            "Root folder containing GWL sub-directories: "
-            "gridded_GWL0-61/, gridded_GWL1-5/, gridded_GWL2/, gridded_GWL3/."
+            "back to .nc) (e.g. <GCM>/wcf_day_*.zarr). Used to build the "
+            "aggregated datasets in memory on every run."
         ),
     )
     parser.add_argument(
@@ -111,7 +91,7 @@ def parse_args():
         default=None,
         help=(
             "Path to a pre-computed regional CSV file "
-            "(columns: GWL, region, realization, GCM, frequency, severity, duration). "
+            "(columns: GWL, region, realization, GCM, frequency, intensity, duration). "
             "If not provided, the regional DataFrame is computed on-the-fly."
         ),
     )
@@ -162,7 +142,7 @@ def parse_args():
 # -- DATASET BUILDING (from load_gridded_data_compound) ----------------------
 # =============================================================================
 
-def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
+def compute_intensity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
     """
     Expected shortfall: mean positive deficit on compound-event days,
     aggregated yearly.
@@ -172,8 +152,8 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
     daily_deficit = deficit_scf + deficit_wcf
 
     masked = xr.where(comp_da == 1, daily_deficit, np.nan)
-    severity = masked.resample(time="YE").mean().fillna(0)
-    return severity
+    intensity = masked.resample(time="YE").mean().fillna(0)
+    return intensity
 
 
 def duration_xr(da):
@@ -221,28 +201,21 @@ def duration_xr(da):
     )
     df["year"] = df.groupby(["event_id", "lat", "lon"])["year"].transform("min")
 
-    combined_keys = np.core.defchararray.add(
-        np.core.defchararray.add(
-            np.core.defchararray.add(df["event_id"].values.astype(str), ";"),
-            np.core.defchararray.add(df["lat"].values.astype(str), ";"),
-        ),
-        np.core.defchararray.add(
-            df["lon"].values.astype(str),
-            np.core.defchararray.add(";", df["year"].values.astype(str)),
-        ),
+    counts_df = (
+        df.groupby(["event_id", "lat", "lon", "year"], sort=False)
+        .size()
+        .reset_index(name="duration")
     )
-    unique_keys, counts = np.unique(combined_keys, return_counts=True)
-    event_ids_s, lat_s, lon_s, year_s = zip(*(k.split(";") for k in unique_keys))
 
     dur_da = xr.DataArray(
-        counts,
+        counts_df["duration"].to_numpy(),
         dims="event_instance",
         coords={
-            "event_instance": np.arange(len(counts)),
-            "event_id": ("event_instance", np.array(event_ids_s, dtype=int)),
-            "lat":      ("event_instance", np.array(lat_s,      dtype=float)),
-            "lon":      ("event_instance", np.array(lon_s,      dtype=float)),
-            "year":     ("event_instance", np.array(year_s,     dtype=int)),
+            "event_instance": np.arange(len(counts_df)),
+            "event_id": ("event_instance", counts_df["event_id"].to_numpy(dtype=int)),
+            "lat":      ("event_instance", counts_df["lat"].to_numpy(dtype=float)),
+            "lon":      ("event_instance", counts_df["lon"].to_numpy(dtype=float)),
+            "year":     ("event_instance", counts_df["year"].to_numpy(dtype=int)),
         },
     ).to_dataset(name="duration")
 
@@ -259,24 +232,13 @@ def duration_xr(da):
     return ds, ds_freq
 
 
-def _agg_output_path(preprocessed_path, gwl, gcm, run, ssp):
-    """Return the standard output .nc path for one GCM / GWL combination."""
-    out_dir = os.path.join(preprocessed_path, "agg_datasets", f"gridded_{gwl}")
-    return os.path.join(out_dir, f"agg_{gcm}_{run}_{ssp}_{gwl}_ERA5.nc")
-
-
-def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebuild=False):
+def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea):
     """
-    Build the aggregated gridded dataset for one (GCM, GWL) pair and save it.
-    Skips if the output file already exists and force_rebuild is False.
+    Build the aggregated gridded dataset for one (GCM, GWL) pair and return it
+    in memory. Nothing is written to disk here -- the caller concatenates the
+    per-GCM datasets directly, avoiding a save/reload round trip.
     """
-    out_path = _agg_output_path(preprocessed_path, gwl, gcm, run, ssp)
-    if os.path.exists(out_path) and not force_rebuild:
-        print(f"    [skip] {out_path} already exists.")
-        return
-
-    print(f"    Building {gcm} / {gwl} �")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    print(f"    Building {gcm} / {gwl}")
 
     # Load projection data (zarr preferred, falls back to .nc)
     wcf_files, _ = match_files(
@@ -311,21 +273,21 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebu
     wcf      = wcf.convert_calendar("standard")
     scf      = scf.convert_calendar("standard")
 
-    # Severity, duration, frequency
-    severity_ds     = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr)
+    # Intensity, duration, frequency
+    intensity_ds    = compute_intensity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr)
     ds_dur, ds_freq = duration_xr(compound.start_cooc)
     ds_dur  = ds_dur.reindex( {"lat": scf.lat, "lon": scf.lon})
     ds_freq = ds_freq.reindex({"lat": scf.lat, "lon": scf.lon})
 
-    severity_ds["time"] = severity_ds.time.dt.year
-    severity_ds         = severity_ds.rename({"time": "year"})
+    intensity_ds["time"] = intensity_ds.time.dt.year
+    intensity_ds         = intensity_ds.rename({"time": "year"})
 
-    pdd = severity_ds * ds_dur.duration * ds_freq.frequency
+    severity = intensity_ds * ds_dur.duration * ds_freq.frequency
 
     ds_final              = ds_dur.copy()
     ds_final["frequency"] = ds_freq.frequency
-    ds_final["severity"]  = severity_ds
-    ds_final["pdd"]       = pdd
+    ds_final["intensity"] = intensity_ds
+    ds_final["severity"]  = severity
 
     comp_annual           = compound.resample(time="YE").sum()
     comp_annual["time"]   = comp_annual.time.dt.year
@@ -341,17 +303,19 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea, force_rebu
     ds_final["ssp"]     = xr.DataArray([ssp],  dims="realization")
     ds_final["gwl"]     = xr.DataArray([gwl],  dims="realization")
 
-    ds_final.load().to_netcdf(out_path)
-    print(f"    Saved ? {out_path}")
+    ds_final = ds_final.load()
 
     # Release memory
-    del wcf, scf, wcf_ref, scf_ref, compound, severity_ds, ds_dur, ds_freq, ds_final
+    del wcf, scf, wcf_ref, scf_ref, compound, intensity_ds, ds_dur, ds_freq
     gc.collect()
 
+    return ds_final
 
-def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclude_gcm_run=None, force_rebuild=False):
+
+def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclude_gcm_run=None):
     """
-    Build all aggregated gridded datasets that are missing (or all, if force_rebuild).
+    Build the aggregated gridded dataset for every requested GWL, entirely in
+    memory (no per-GCM/GWL cache file is written to or read from disk).
 
     Parameters
     ----------
@@ -361,8 +325,14 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
         GWL keys to process, e.g. ['GWL0-61', 'GWL1-5', 'GWL2', 'GWL3'].
     exclude_gcm : list of str or None
         GCMs to skip entirely.
-    force_rebuild : bool
-        If True, rebuild even if the output file already exists.
+    exclude_gcm_run : list of str or None
+        "GCM:run" pairs to skip.
+
+    Returns
+    -------
+    dict of {gwl_key: xr.Dataset}
+        One dataset per GWL that had at least one usable GCM, concatenated
+        over a fresh 'realization' dimension.
     """
     exclude_gcm     = exclude_gcm or []
     exclude_gcm_run = set(tuple(x.split(":")) for x in (exclude_gcm_run or []))
@@ -376,6 +346,7 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
         )
     wcf_rea = open_dataset_any(rea_files[0]).isel(time=slice(0, 2))
 
+    built = {}
     for gwl in gwl_list:
         print(f"\n  -- Building datasets for {gwl} --")
 
@@ -390,18 +361,28 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
         run_list = [p.split("_")[-3] for p in wcf_paths]
         ssp_list = [p.split("_")[-4] for p in wcf_paths]
 
-        for i, (gcm, run, ssp) in enumerate(zip(gcm_list, run_list, ssp_list)):
+        gcm_datasets = []
+        for gcm, run, ssp in zip(gcm_list, run_list, ssp_list):
             if gcm in exclude_gcm or (gcm, run) in exclude_gcm_run:
                 print(f"    [excluded] {gcm} {run}")
                 continue
             try:
-                _build_single_gcm(
-                    preprocessed_path, gwl, gcm, run, ssp, wcf_rea,
-                    force_rebuild=force_rebuild,
-                )
+                gcm_datasets.append(_build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea))
             except Exception as exc:
                 print(f"    [ERROR] {gcm} / {gwl}: {exc}")
             gc.collect()
+
+        if not gcm_datasets:
+            print(f"  No datasets built for {gwl}.")
+            continue
+
+        gwl_ds = xr.concat(gcm_datasets, dim="realization")
+        gwl_ds["realization"] = np.arange(len(gcm_datasets))
+        built[gwl] = gwl_ds
+        del gcm_datasets
+        gc.collect()
+
+    return built
 
 
 # =============================================================================
@@ -447,48 +428,6 @@ def _reduce_to_2d(da):
     return da
 
 
-def load_gwl_dataset(path_gwl, gwl_key, exclude_gcm, exclude_gcm_run=None):
-    """Load a GWL dataset and filter out unwanted GCMs."""
-    files = sorted(glob.glob(os.path.join(path_gwl, f"gridded_{gwl_key}", f"agg*{gwl_key}*.nc")))
-    if not files:
-        raise FileNotFoundError(f"No files found under {path_gwl}/gridded_{gwl_key}/agg*{gwl_key}*.nc")
-    print(f"  Found {len(files)} file(s) for {gwl_key}")
-    ds = xr.open_mfdataset(
-        files,
-        combine="nested",
-        concat_dim="realization",
-        join="override",
-    )
-    exclude_gcm_run = set(tuple(x.split(":")) for x in (exclude_gcm_run or []))
-    gcms = ds.GCM.values
-    runs = ds.run.values
-    keep = [i for i, (g, r) in enumerate(zip(gcms, runs))
-            if g not in exclude_gcm and (g, r) not in exclude_gcm_run]
-    ds = ds.isel(realization=keep)
-    return ds
-
-
-def load_baseline_dataset(path_gwl, exclude_gcm, exclude_gcm_run=None):
-    """Load the GWL0-61 baseline dataset."""
-    files = sorted(glob.glob(os.path.join(path_gwl, "gridded_GWL0-61", "agg*.nc")))
-    if not files:
-        raise FileNotFoundError(f"No files found under {path_gwl}/gridded_GWL0-61/agg*.nc")
-    print(f"  Found {len(files)} file(s) for GWL0-61")
-    ds = xr.open_mfdataset(
-        files,
-        combine="nested",
-        concat_dim="realization",
-        join="override"  # handles any coord conflicts on lat/lon/year
-    )
-    exclude_gcm_run = set(tuple(x.split(":")) for x in (exclude_gcm_run or []))
-    gcms = ds.GCM.values
-    runs = ds.run.values
-    keep = [i for i, (g, r) in enumerate(zip(gcms, runs))
-            if g not in exclude_gcm and (g, r) not in exclude_gcm_run]
-    ds = ds.isel(realization=keep)
-    return ds
-
-
 # =============================================================================
 # Align baseline and projection datasets by common GCMs
 # =============================================================================
@@ -496,7 +435,7 @@ def load_baseline_dataset(path_gwl, exclude_gcm, exclude_gcm_run=None):
 def from_ds_to_plot_decomp(ds_gwl, ds_ref):
     """
     Align baseline (ds_ref) and projection (ds_gwl) datasets by common GCMs.
-    Returns (ref_freq, ref_sev, ref_dur, proj_freq, proj_sev, proj_dur, weight).
+    Returns (ref_freq, ref_int, ref_dur, proj_freq, proj_int, proj_dur, weight).
     """
     gcm_gwl = ds_gwl.GCM.values
     gcm_ref = ds_ref.GCM.values
@@ -531,8 +470,8 @@ def from_ds_to_plot_decomp(ds_gwl, ds_ref):
     weight = xr.DataArray(weights, dims="realization")
 
     return (
-        ds_ref.frequency, ds_ref.severity, ds_ref.duration,
-        ds_gwl.frequency, ds_gwl.severity, ds_gwl.duration,
+        ds_ref.frequency, ds_ref.intensity, ds_ref.duration,
+        ds_gwl.frequency, ds_gwl.intensity, ds_gwl.duration,
         weight,
     )
 
@@ -549,11 +488,10 @@ def _robust_slice(da, lat_lo, lat_hi, lon_lo, lon_hi):
     return da.sel(lat=lat_slice, lon=lon_slice)
 
 
-def create_dataframe_regional(path_gwl, mask, exclude_gcm, exclude_gcm_run=None, regions=None):
+def create_dataframe_regional(built_datasets, mask, regions=None):
     """
-    For each GWL level and each region, extract the spatial mean of frequency,
-    severity and duration per realization.
-    Datasets are loaded one at a time and freed immediately to limit memory use.
+    For each already-built (in-memory) GWL dataset and each region, extract
+    the spatial mean of frequency, intensity and duration per realization.
     """
     if regions is None:
         regions = [
@@ -564,27 +502,19 @@ def create_dataframe_regional(path_gwl, mask, exclude_gcm, exclude_gcm_run=None,
             {"name": "India",           "lat": [10,  30],  "lon": [70,     90]},
         ]
 
-    # Loaders are callables so datasets are opened one at a time, not all at once
-    gwl_loaders = [
-        ("GWL0-61", lambda: load_baseline_dataset(path_gwl, exclude_gcm, exclude_gcm_run)),
-        ("GWL1-5",  lambda: load_gwl_dataset(path_gwl, "GWL1-5", exclude_gcm, exclude_gcm_run)),
-        ("GWL2",    lambda: load_gwl_dataset(path_gwl, "GWL2",   exclude_gcm, exclude_gcm_run)),
-        ("GWL3",    lambda: load_gwl_dataset(path_gwl, "GWL3",   exclude_gcm, exclude_gcm_run)),
-    ]
-
     rows = []
-    for gwl_label, loader in gwl_loaders:
-        print(f"  Loading {gwl_label} �")
-        ds = loader()
+    for gwl_label, base_ds in built_datasets.items():
+        print(f"  Aggregating regional stats for {gwl_label}")
 
+        # Subsetting first gives us an independent Dataset, so masking below
+        # does not mutate the shared dataset the main plotting loop reuses.
+        ds = base_ds[["frequency", "intensity", "duration", "GCM"]]
         ds["frequency"] = ds["frequency"].where(mask == 1)
-        ds["severity"]  = ds["severity"].where(mask == 1)
+        ds["intensity"] = ds["intensity"].where(mask == 1)
         ds["duration"]  = ds["duration"].where(mask == 1)
         if "year" in ds.dims:
             ds = ds.mean(dim="year")
 
-        # Compute eagerly so all dask arrays are resolved before we free the dataset
-        ds = ds.compute()
         gcms = ds.GCM.values
 
         for reg in regions:
@@ -592,11 +522,11 @@ def create_dataframe_regional(path_gwl, mask, exclude_gcm, exclude_gcm_run=None,
             lon_lo, lon_hi = reg["lon"]
 
             freq_sub  = _robust_slice(ds.frequency, lat_lo, lat_hi, lon_lo, lon_hi)
-            sev_sub   = _robust_slice(ds.severity,  lat_lo, lat_hi, lon_lo, lon_hi)
+            int_sub   = _robust_slice(ds.intensity, lat_lo, lat_hi, lon_lo, lon_hi)
             dur_sub   = _robust_slice(ds.duration,  lat_lo, lat_hi, lon_lo, lon_hi)
 
             freq_mean = freq_sub.mean(dim=("lat", "lon"), skipna=True).values
-            sev_mean  = sev_sub.mean( dim=("lat", "lon"), skipna=True).values
+            int_mean  = int_sub.mean( dim=("lat", "lon"), skipna=True).values
             dur_mean  = dur_sub.mean( dim=("lat", "lon"), skipna=True).values
 
             for ridx in range(len(gcms)):
@@ -606,20 +536,17 @@ def create_dataframe_regional(path_gwl, mask, exclude_gcm, exclude_gcm_run=None,
                     "realization": ridx,
                     "GCM":         gcms[ridx],
                     "frequency":   float(freq_mean[ridx]),
-                    "severity":    float(sev_mean[ridx]),
+                    "intensity":   float(int_mean[ridx]),
                     "duration":    float(dur_mean[ridx]),
                 })
-
-        del ds
-        gc.collect()
 
     return pd.DataFrame(rows)
 
 
-def add_pdd_and_weights(df):
-    """Add 'pdd' column and inverse-frequency GCM 'weight' column."""
+def add_severity_and_weights(df):
+    """Add 'severity' column (frequency x intensity x duration) and inverse-frequency GCM 'weight' column."""
     df = df.copy()
-    df["pdd"] = df["frequency"] * df["severity"] * df["duration"]
+    df["severity"] = df["frequency"] * df["intensity"] * df["duration"]
 
     anchor_region = df["region"].iloc[0]
     anchor  = df[(df["region"] == anchor_region) & (df["GWL"] == "GWL0-61")]
@@ -635,8 +562,8 @@ def add_pdd_and_weights(df):
 # =============================================================================
 
 def plot_gwl_valuebyalpha_discrete(
-    da_ref_freq, da_ref_sev, da_ref_dur,
-    da_proj_freq, da_proj_sev, da_proj_dur,
+    da_ref_freq, da_ref_int, da_ref_dur,
+    da_proj_freq, da_proj_int, da_proj_dur,
     weight,
     mask,
     shapefile_path,
@@ -663,8 +590,8 @@ def plot_gwl_valuebyalpha_discrete(
         ]
 
     # --- 1. Compound index ---
-    base_comp = da_ref_freq  * da_ref_sev  * da_ref_dur
-    proj_comp = da_proj_freq * da_proj_sev * da_proj_dur
+    base_comp = da_ref_freq  * da_ref_int  * da_ref_dur
+    proj_comp = da_proj_freq * da_proj_int * da_proj_dur
 
     def _crop_lat(da):
         return da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
@@ -677,7 +604,7 @@ def plot_gwl_valuebyalpha_discrete(
     proj_mean  = proj_comp.weighted(weight).mean(dim="realization")
     rel_change = 100.0 * (proj_mean - base_mean) / base_mean
     rel_change = rel_change.where(np.isfinite(rel_change))
-    sev        = base_mean
+    severity   = base_mean
     dChange    = rel_change
 
     # --- 3. Discrete colour bins ---
@@ -690,14 +617,14 @@ def plot_gwl_valuebyalpha_discrete(
     # --- 4. Discrete alpha bins ---
     max_sev   = 1.0
     sev_edges = np.linspace(0, max_sev, n_bins_sev + 1) ** 2 / max_sev
-    sev_bin   = np.digitize(sev.values, sev_edges[1:-1])
+    sev_bin   = np.digitize(severity.values, sev_edges[1:-1])
 
     alpha_min, alpha_max = 0.4, 1.0
     alpha_levels = np.linspace(alpha_min, alpha_max, n_bins_sev)
 
     # --- 5. RGBA assembly ---
     nlat, nlon = dChange.shape
-    valid_mask = np.isfinite(dChange.values) & np.isfinite(sev.values)
+    valid_mask = np.isfinite(dChange.values) & np.isfinite(severity.values)
     rgba_map   = np.zeros((nlat, nlon, 4), dtype=float)
     cb = np.clip(change_bin, 0, n_bins_change - 1)
     sb = np.clip(sev_bin,    0, n_bins_sev    - 1)
@@ -717,8 +644,8 @@ def plot_gwl_valuebyalpha_discrete(
     shp = gpd.read_file(shapefile_path)
     ax_map.imshow(
         rgba_map,
-        extent=[sev.lon.min().item(), sev.lon.max().item(),
-                sev.lat.min().item(), sev.lat.max().item()],
+        extent=[severity.lon.min().item(), severity.lon.max().item(),
+                severity.lat.min().item(), severity.lat.max().item()],
         origin="lower",
         transform=ccrs.PlateCarree(),
         interpolation="nearest",
@@ -823,7 +750,7 @@ def plot_gwl_valuebyalpha_discrete(
     for reg in regions:
         df_reg = df_regions[df_regions["region"] == reg["name"]]
         for gwl_grp in gwl_order:
-            vals = df_reg[df_reg["GWL"] == gwl_grp]["pdd"].dropna().values
+            vals = df_reg[df_reg["GWL"] == gwl_grp]["severity"].dropna().values
             if vals.size > 0:
                 y_min = min(y_min, np.nanmin(vals))
                 y_max = max(y_max, np.nanmax(vals))
@@ -835,13 +762,13 @@ def plot_gwl_valuebyalpha_discrete(
         df_reg = df_regions[df_regions["region"] == reg["name"]]
 
         data_box = [
-            df_reg[df_reg["GWL"] == gwl_grp]["pdd"].dropna().values
+            df_reg[df_reg["GWL"] == gwl_grp]["severity"].dropna().values
             for gwl_grp in gwl_order
         ]
 
         # Scatter dots: light blue, very small, behind the violin
         for i, gwl_grp in enumerate(gwl_order):
-            sub = df_reg[df_reg["GWL"] == gwl_grp]["pdd"].dropna().values
+            sub = df_reg[df_reg["GWL"] == gwl_grp]["severity"].dropna().values
             x_jitter = np.random.normal(i + 1, 0.07, size=len(sub))
             ax_ts.scatter(x_jitter, sub, s=0.8, color="#0a3a60", alpha=0.5,
                           linewidths=0, zorder=4)
@@ -866,7 +793,7 @@ def plot_gwl_valuebyalpha_discrete(
 
         # Weighted mean: solid red horizontal line
         for i, gwl_grp in enumerate(gwl_order):
-            sub = df_reg[df_reg["GWL"] == gwl_grp]["pdd"].dropna().values
+            sub = df_reg[df_reg["GWL"] == gwl_grp]["severity"].dropna().values
             w   = df_reg[df_reg["GWL"] == gwl_grp]["weight"].dropna().values
             if sub.size > 0:
                 try:
@@ -1012,8 +939,8 @@ def plot_supp_valuebyalpha_stacked(
 # =============================================================================
 
 def _compute_ensemble_rel_change(
-    da_ref_freq, da_ref_sev, da_ref_dur,
-    da_proj_freq, da_proj_sev, da_proj_dur,
+    da_ref_freq, da_ref_int, da_ref_dur,
+    da_proj_freq, da_proj_int, da_proj_dur,
     weight, mask, lat_min=-60, lat_max=68,
 ):
     """
@@ -1023,16 +950,16 @@ def _compute_ensemble_rel_change(
     """
     def _crop(da):
         return da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
-    base = (da_ref_freq  * da_ref_sev  * da_ref_dur ).weighted(weight).mean(dim="realization")
-    proj = (da_proj_freq * da_proj_sev * da_proj_dur).weighted(weight).mean(dim="realization")
+    base = (da_ref_freq  * da_ref_int  * da_ref_dur ).weighted(weight).mean(dim="realization")
+    proj = (da_proj_freq * da_proj_int * da_proj_dur).weighted(weight).mean(dim="realization")
     base = _crop(base).where(mask == 1)
     proj = _crop(proj).where(mask == 1)
     rc = 100.0 * (proj - base) / base
     return rc.where(np.isfinite(rc)).values   # numpy (nlat, nlon)
 
 def _compute_rgba_map(
-    da_ref_freq, da_ref_sev, da_ref_dur,
-    da_proj_freq, da_proj_sev, da_proj_dur,
+    da_ref_freq, da_ref_int, da_ref_dur,
+    da_proj_freq, da_proj_int, da_proj_dur,
     weight, mask, lat_min=-60, lat_max=68,
     n_bins_change=5, n_bins_sev=5,
 ):
@@ -1040,14 +967,14 @@ def _compute_rgba_map(
     def _crop(da):
         return da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
 
-    base_comp = _crop(da_ref_freq  * da_ref_sev  * da_ref_dur ).where(mask == 1)
-    proj_comp = _crop(da_proj_freq * da_proj_sev * da_proj_dur).where(mask == 1)
+    base_comp = _crop(da_ref_freq  * da_ref_int  * da_ref_dur ).where(mask == 1)
+    proj_comp = _crop(da_proj_freq * da_proj_int * da_proj_dur).where(mask == 1)
     base_mean  = base_comp.weighted(weight).mean(dim="realization")
     proj_mean  = proj_comp.weighted(weight).mean(dim="realization")
     rel_change = 100.0 * (proj_mean - base_mean) / base_mean
     rel_change = rel_change.where(np.isfinite(rel_change))
-    sev     = base_mean
-    dChange = rel_change
+    severity = base_mean
+    dChange  = rel_change
 
     change_edges = [-100, -25, -10, 10, 25, 100]
     change_bin   = np.digitize(dChange.values, change_edges[1:-1])
@@ -1056,12 +983,12 @@ def _compute_rgba_map(
 
     max_sev   = 1.0
     sev_edges = np.linspace(0, max_sev, n_bins_sev + 1) ** 2 / max_sev
-    sev_bin   = np.digitize(sev.values, sev_edges[1:-1])
+    sev_bin   = np.digitize(severity.values, sev_edges[1:-1])
     alpha_min, alpha_max = 0.4, 1.0
     alpha_levels = np.linspace(alpha_min, alpha_max, n_bins_sev)
 
     nlat, nlon    = dChange.shape
-    valid_px      = np.isfinite(dChange.values) & np.isfinite(sev.values)
+    valid_px      = np.isfinite(dChange.values) & np.isfinite(severity.values)
     rgba_map      = np.zeros((nlat, nlon, 4), dtype=float)
     cb = np.clip(change_bin, 0, n_bins_change - 1)
     sb = np.clip(sev_bin,    0, n_bins_sev    - 1)
@@ -1069,15 +996,48 @@ def _compute_rgba_map(
     rgba_map[valid_px,  3] = alpha_levels[sb[valid_px]]
 
     extent = [
-        float(sev.lon.min()), float(sev.lon.max()),
-        float(sev.lat.min()), float(sev.lat.max()),
+        float(severity.lon.min()), float(severity.lon.max()),
+        float(severity.lat.min()), float(severity.lat.max()),
     ]
     return rgba_map, extent, change_edges, sev_edges, color_levels, alpha_levels
 
 
+def _block_index_lists(lats, lons, block_size):
+    """
+    Precompute, once, the pixel row/col indices belonging to each spatial
+    block along lat and lon. Reused across every bootstrap draw instead of
+    being recomputed inside the resampling loop.
+    """
+    lat_edges = np.arange(lats.min(), lats.max(), block_size)
+    lon_edges = np.arange(lons.min(), lons.max(), block_size)
+    row_idx_by_block = [
+        np.where((lats >= lb) & (lats < lb + block_size))[0] for lb in lat_edges
+    ]
+    col_idx_by_block = [
+        np.where((lons >= lob) & (lons < lob + block_size))[0] for lob in lon_edges
+    ]
+    return row_idx_by_block, col_idx_by_block
+
+
+def _draw_block_resample(rng, row_idx_by_block, col_idx_by_block):
+    """
+    One block-bootstrap draw: resample lat-blocks and lon-blocks with
+    replacement and return the resulting pixel row/col indices (repeated
+    when a block is drawn more than once), matching the cartesian product
+    that the equivalent nested-loop formulation would visit.
+    """
+    n_lat_b = len(row_idx_by_block)
+    n_lon_b = len(col_idx_by_block)
+    sel_lat = rng.integers(0, n_lat_b, size=n_lat_b) if n_lat_b else np.array([], dtype=int)
+    sel_lon = rng.integers(0, n_lon_b, size=n_lon_b) if n_lon_b else np.array([], dtype=int)
+    rows = np.concatenate([row_idx_by_block[b] for b in sel_lat]) if n_lat_b else np.array([], dtype=int)
+    cols = np.concatenate([col_idx_by_block[b] for b in sel_lon]) if n_lon_b else np.array([], dtype=int)
+    return rows, cols
+
+
 def compute_global_change_stats_gwl(
-    da_ref_freq, da_ref_sev, da_ref_dur,
-    da_proj_freq, da_proj_sev, da_proj_dur,
+    da_ref_freq, da_ref_int, da_ref_dur,
+    da_proj_freq, da_proj_int, da_proj_dur,
     weight,
     mask,
     lat_min=-60,
@@ -1092,7 +1052,7 @@ def compute_global_change_stats_gwl(
     Parameters
     ----------
     da_ref_*  / da_proj_* : xr.DataArray
-        Frequency, severity, duration for baseline and projection (realization, lat, lon).
+        Frequency, intensity, duration for baseline and projection (realization, lat, lon).
     weight : xr.DataArray
         Per-realization GCM weights (dim realization).
     mask : array-like
@@ -1113,8 +1073,8 @@ def compute_global_change_stats_gwl(
     def _crop(da):
         return da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
 
-    base_comp = (da_ref_freq  * da_ref_sev  * da_ref_dur ).weighted(weight).mean(dim="realization")
-    proj_comp = (da_proj_freq * da_proj_sev * da_proj_dur).weighted(weight).mean(dim="realization")
+    base_comp = (da_ref_freq  * da_ref_int  * da_ref_dur ).weighted(weight).mean(dim="realization")
+    proj_comp = (da_proj_freq * da_proj_int * da_proj_dur).weighted(weight).mean(dim="realization")
 
     base_comp = _crop(base_comp).where(mask == 1)
     proj_comp = _crop(proj_comp).where(mask == 1)
@@ -1127,40 +1087,30 @@ def compute_global_change_stats_gwl(
     global_late  = float(proj_comp.weighted(lat_weights).mean(dim=["lat", "lon"]).values)
     global_rel_change = 100.0 * (global_late - global_early) / global_early
 
-    # Spatial block-bootstrap on the 2-D absolute-change field
+    # Spatial block-bootstrap on the 2-D absolute-change field (vectorized:
+    # block membership is precomputed once, then each draw is a single
+    # numpy fancy-indexing extraction instead of a per-pixel Python loop).
     data         = abs_change.values
     lats         = abs_change.lat.values
     lons         = abs_change.lon.values
     weight_1d    = np.cos(np.deg2rad(lats))   # (nlat,) area weights
 
-    lat_blocks = np.arange(lats.min(), lats.max(), block_size)
-    lon_blocks = np.arange(lons.min(), lons.max(), block_size)
+    row_idx_by_block, col_idx_by_block = _block_index_lists(lats, lons, block_size)
 
     rng = np.random.default_rng()
-    bootstrap_means = []
-    for _ in range(n_bootstrap):
-        s_lat = rng.choice(lat_blocks, size=len(lat_blocks), replace=True)
-        s_lon = rng.choice(lon_blocks, size=len(lon_blocks), replace=True)
+    bootstrap_means = np.full(n_bootstrap, np.nan)
+    for it in range(n_bootstrap):
+        rows, cols = _draw_block_resample(rng, row_idx_by_block, col_idx_by_block)
+        if rows.size == 0 or cols.size == 0:
+            continue
+        sub_data = data[np.ix_(rows, cols)]
+        sub_w    = weight_1d[rows][:, None]
+        valid    = np.isfinite(sub_data)
+        wsum = np.sum(np.where(valid, sub_w, 0.0))
+        if wsum > 0:
+            bootstrap_means[it] = np.sum(np.where(valid, sub_data * sub_w, 0.0)) / wsum
 
-        b_vals, b_wts = [], []
-        for lb in s_lat:
-            for lob in s_lon:
-                li_arr = np.where((lats >= lb) & (lats < lb + block_size))[0]
-                lo_arr = np.where((lons >= lob) & (lons < lob + block_size))[0]
-                if li_arr.size and lo_arr.size:
-                    for li in li_arr:
-                        for loi in lo_arr:
-                            v = data[li, loi]
-                            if not np.isnan(v):
-                                b_vals.append(v)
-                                b_wts.append(weight_1d[li])
-
-        if b_vals:
-            b_vals = np.array(b_vals)
-            b_wts  = np.array(b_wts)
-            bootstrap_means.append(np.sum(b_vals * b_wts) / np.sum(b_wts))
-
-    bootstrap_means = np.array(bootstrap_means)
+    bootstrap_means = bootstrap_means[np.isfinite(bootstrap_means)]
     ci_lower_rel = 100.0 * np.percentile(bootstrap_means, 2.5)  / global_early
     ci_upper_rel = 100.0 * np.percentile(bootstrap_means, 97.5) / global_early
 
@@ -1170,8 +1120,8 @@ def compute_global_change_stats_gwl(
     gcm_to_idx  = {g: np.where(gcm_vals == g)[0] for g in unique_gcms}
     n_gcms      = len(unique_gcms)
 
-    base_per_real = _crop(da_ref_freq  * da_ref_sev  * da_ref_dur ).where(mask == 1)
-    proj_per_real = _crop(da_proj_freq * da_proj_sev * da_proj_dur).where(mask == 1)
+    base_per_real = _crop(da_ref_freq  * da_ref_int  * da_ref_dur ).where(mask == 1)
+    proj_per_real = _crop(da_proj_freq * da_proj_int * da_proj_dur).where(mask == 1)
     base_np  = base_per_real.values                # (n_real, nlat, nlon)
     proj_np  = proj_per_real.values
     lats_gcm = base_per_real.lat.values
@@ -1196,8 +1146,8 @@ def compute_global_change_stats_gwl(
 
 
 def compute_bin_change_stats_gwl(
-    da_ref_freq, da_ref_sev, da_ref_dur,
-    da_proj_freq, da_proj_sev, da_proj_dur,
+    da_ref_freq, da_ref_int, da_ref_dur,
+    da_proj_freq, da_proj_int, da_proj_dur,
     weight,
     mask,
     lat_min=-60,
@@ -1241,8 +1191,8 @@ def compute_bin_change_stats_gwl(
     def _crop(da):
         return da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
 
-    base_comp = (da_ref_freq  * da_ref_sev  * da_ref_dur ).weighted(weight).mean(dim="realization")
-    proj_comp = (da_proj_freq * da_proj_sev * da_proj_dur).weighted(weight).mean(dim="realization")
+    base_comp = (da_ref_freq  * da_ref_int  * da_ref_dur ).weighted(weight).mean(dim="realization")
+    proj_comp = (da_proj_freq * da_proj_int * da_proj_dur).weighted(weight).mean(dim="realization")
     base_comp = _crop(base_comp).where(mask == 1)
     proj_comp = _crop(proj_comp).where(mask == 1)
 
@@ -1257,8 +1207,6 @@ def compute_bin_change_stats_gwl(
     weight_1d = np.cos(np.deg2rad(lats))
     w2d       = np.outer(weight_1d, np.ones(len(lons)))
 
-    lat_blocks = np.arange(lats.min(), lats.max(), block_size)
-    lon_blocks = np.arange(lons.min(), lons.max(), block_size)
     rng = np.random.default_rng()
 
     # Precompute per-realization compound arrays for the GCM bootstrap
@@ -1266,25 +1214,51 @@ def compute_bin_change_stats_gwl(
     unique_gcms = np.unique(gcm_vals)
     gcm_to_idx  = {g: np.where(gcm_vals == g)[0] for g in unique_gcms}
     n_gcms      = len(unique_gcms)
-    base_per_real = _crop(da_ref_freq  * da_ref_sev  * da_ref_dur ).where(mask == 1)
-    proj_per_real = _crop(da_proj_freq * da_proj_sev * da_proj_dur).where(mask == 1)
+    base_per_real = _crop(da_ref_freq  * da_ref_int  * da_ref_dur ).where(mask == 1)
+    proj_per_real = _crop(da_proj_freq * da_proj_int * da_proj_dur).where(mask == 1)
     base_np   = base_per_real.values   # (n_real, nlat, nlon)
     proj_np   = proj_per_real.values
     rng_gcm   = np.random.default_rng()
 
-    results = []
-    for k in range(len(change_edges) - 1):
+    n_bins = len(change_edges) - 1
+    ref_valid = np.isfinite(bin_src)
+    bin_masks = []
+    for k in range(n_bins):
         lo, hi = change_edges[k], change_edges[k + 1]
-        # Pixels valid in BOTH the reference bin definition AND the current GWL
-        ref_valid = np.isfinite(bin_src)
         if k == 0:
             bin_pix = np.isfinite(data) & ref_valid & (bin_src < hi)
-        elif k == len(change_edges) - 2:
+        elif k == n_bins - 1:
             bin_pix = np.isfinite(data) & ref_valid & (bin_src >= lo)
         else:
             bin_pix = np.isfinite(data) & ref_valid & (bin_src >= lo) & (bin_src < hi)
+        bin_masks.append(bin_pix)
+    n_pixels_list = [int(np.sum(bp)) for bp in bin_masks]
 
-        n_pixels = int(np.sum(bin_pix))
+    # Spatial block-bootstrap (vectorized): draw once per iteration and
+    # compute every bin's weighted mean from that same resampled field,
+    # instead of resampling independently -- and via nested pixel loops --
+    # for each bin.
+    row_idx_by_block, col_idx_by_block = _block_index_lists(lats, lons, block_size)
+    boot_means = np.full((n_bootstrap, n_bins), np.nan)
+    for it in range(n_bootstrap):
+        rows, cols = _draw_block_resample(rng, row_idx_by_block, col_idx_by_block)
+        if rows.size == 0 or cols.size == 0:
+            continue
+        sub_data = data[np.ix_(rows, cols)]
+        sub_w    = weight_1d[rows][:, None]
+        for k, bin_pix in enumerate(bin_masks):
+            if n_pixels_list[k] == 0:
+                continue
+            sub_bin = bin_pix[np.ix_(rows, cols)]
+            valid   = sub_bin & np.isfinite(sub_data)
+            wsum = np.sum(np.where(valid, sub_w, 0.0))
+            if wsum > 0:
+                boot_means[it, k] = np.sum(np.where(valid, sub_data * sub_w, 0.0)) / wsum
+
+    results = []
+    for k in range(n_bins):
+        bin_pix  = bin_masks[k]
+        n_pixels = n_pixels_list[k]
         if n_pixels == 0:
             results.append({
                 "bin": bin_labels[k], "mean": np.nan,
@@ -1300,30 +1274,11 @@ def compute_bin_change_stats_gwl(
             / np.sum(np.where(bin_pix, w2d, 0.0))
         )
 
-        # Spatial block-bootstrap restricted to bin pixels
-        bootstrap_means = []
-        for _ in range(n_bootstrap):
-            s_lat = rng.choice(lat_blocks, size=len(lat_blocks), replace=True)
-            s_lon = rng.choice(lon_blocks, size=len(lon_blocks), replace=True)
-            b_vals, b_wts = [], []
-            for lb in s_lat:
-                for lob in s_lon:
-                    li_arr = np.where((lats >= lb) & (lats < lb + block_size))[0]
-                    lo_arr = np.where((lons >= lob) & (lons < lob + block_size))[0]
-                    if li_arr.size and lo_arr.size:
-                        for li in li_arr:
-                            for loi in lo_arr:
-                                if bin_pix[li, loi]:
-                                    b_vals.append(data[li, loi])
-                                    b_wts.append(weight_1d[li])
-            if b_vals:
-                b_arr = np.array(b_vals)
-                w_arr = np.array(b_wts)
-                bootstrap_means.append(np.sum(b_arr * w_arr) / np.sum(w_arr))
-
-        if bootstrap_means:
-            ci_lower = np.percentile(bootstrap_means, 2.5)
-            ci_upper = np.percentile(bootstrap_means, 97.5)
+        bin_boot_means = boot_means[:, k]
+        bin_boot_means = bin_boot_means[np.isfinite(bin_boot_means)]
+        if bin_boot_means.size:
+            ci_lower = np.percentile(bin_boot_means, 2.5)
+            ci_upper = np.percentile(bin_boot_means, 97.5)
         else:
             ci_lower = ci_upper = np.nan
 
@@ -1380,28 +1335,31 @@ def main():
             raise ValueError(f"Unknown GWL level '{lv}'. Valid: {list(level_to_key.keys())}.")
 
     # ------------------------------------------------------------------
-    # STEP 0 � Build missing aggregated gridded datasets
+    # STEP 0 - Build all aggregated gridded datasets, in memory
     # ------------------------------------------------------------------
     # We always build GWL0-61 (baseline) plus every requested projection level.
+    # Nothing is written to/read from disk here; the resulting datasets are
+    # reused directly below for the regional dataframe and the figures.
     gwl_keys_to_build = ["GWL0-61"] + [level_to_key[lv] for lv in args.gwl_levels]
     print("=" * 60)
-    print("STEP 0 � Building aggregated gridded datasets (if needed)")
+    print("STEP 0 - Building aggregated gridded datasets (in memory)")
     print("=" * 60)
-    build_gridded_datasets(
+    built = build_gridded_datasets(
         preprocessed_path=args.preprocessed_path,
         gwl_list=gwl_keys_to_build,
         exclude_gcm=args.exclude_gcm,
         exclude_gcm_run=args.exclude_gcm_run,
-        force_rebuild=args.force_rebuild,
     )
+    if "GWL0-61" not in built:
+        raise FileNotFoundError("No baseline (GWL0-61) data could be built.")
 
     # ------------------------------------------------------------------
-    # STEP 1 � Load baseline dataset and build land mask
+    # STEP 1 - Build land mask from the baseline dataset
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("STEP 1 � Loading baseline dataset and building land mask")
+    print("STEP 1 - Building land mask")
     print("=" * 60)
-    ds_baseline = load_baseline_dataset(args.path_gwl, args.exclude_gcm, args.exclude_gcm_run)
+    ds_baseline = built["GWL0-61"]
     ref_2d = _reduce_to_2d(ds_baseline.duration)
     mask   = build_land_mask(ref_2d, args.shapefile)
 
@@ -1434,17 +1392,12 @@ def main():
         df_regions = pd.read_csv(regional_csv_path)
     else:
         print(f"No regional DataFrame found at {regional_csv_path} � computing �")
-        df_regions = create_dataframe_regional(
-            path_gwl=args.path_gwl,
-            mask=mask,
-            exclude_gcm=args.exclude_gcm,
-            exclude_gcm_run=args.exclude_gcm_run,
-        )
+        df_regions = create_dataframe_regional(built, mask)
         os.makedirs(os.path.dirname(regional_csv_path), exist_ok=True)
         df_regions.to_csv(regional_csv_path, index=False)
         print(f"  Saved ? {regional_csv_path}")
 
-    df_regions = add_pdd_and_weights(df_regions)
+    df_regions = add_severity_and_weights(df_regions)
 
     # ------------------------------------------------------------------
     # STEP 3 � Optional agreement hatching
@@ -1475,27 +1428,31 @@ def main():
         gwl_label = level_to_label[level]
         fname     = level_to_fname[level]
 
-        print(f"\nProcessing {gwl_label} �")
-        ds_proj = load_gwl_dataset(args.path_gwl, gwl_key, args.exclude_gcm, args.exclude_gcm_run)
+        if gwl_key not in built:
+            print(f"  [warn] No data built for {gwl_label}, skipping.")
+            continue
 
-        print(f"  Aligning GCMs �")
-        (da_ref_freq, da_ref_sev, da_ref_dur,
-         da_proj_freq, da_proj_sev, da_proj_dur,
+        print(f"\nProcessing {gwl_label}")
+        ds_proj = built[gwl_key]
+
+        print(f"  Aligning GCMs")
+        (da_ref_freq, da_ref_int, da_ref_dur,
+         da_proj_freq, da_proj_int, da_proj_dur,
          weight) = from_ds_to_plot_decomp(ds_proj, ds_baseline)
 
         # Freeze colour-bin membership at GWL1.5 so higher GWLs report stats
         # for the same spatial zones that were red/orange/gray/etc. at 1.5�C.
         if level == "1.5":
             gwl15_rel_change_data = _compute_ensemble_rel_change(
-                da_ref_freq, da_ref_sev, da_ref_dur,
-                da_proj_freq, da_proj_sev, da_proj_dur,
+                da_ref_freq, da_ref_int, da_ref_dur,
+                da_proj_freq, da_proj_int, da_proj_dur,
                 weight=weight, mask=mask, lat_min=-60, lat_max=68,
             )
 
         print(f"  Computing global change statistics �")
         global_chg, ci_lo, ci_hi, gcm_ci_lo, gcm_ci_hi = compute_global_change_stats_gwl(
-            da_ref_freq, da_ref_sev, da_ref_dur,
-            da_proj_freq, da_proj_sev, da_proj_dur,
+            da_ref_freq, da_ref_int, da_ref_dur,
+            da_proj_freq, da_proj_int, da_proj_dur,
             weight=weight, mask=mask,
             lat_min=-60, lat_max=68,
         )
@@ -1506,8 +1463,8 @@ def main():
         )
         print(f"  Computing per-bin change statistics �")
         bin_stats = compute_bin_change_stats_gwl(
-            da_ref_freq, da_ref_sev, da_ref_dur,
-            da_proj_freq, da_proj_sev, da_proj_dur,
+            da_ref_freq, da_ref_int, da_ref_dur,
+            da_proj_freq, da_proj_int, da_proj_dur,
             weight=weight, mask=mask,
             lat_min=-60, lat_max=68,
             reference_data=gwl15_rel_change_data,
@@ -1522,8 +1479,8 @@ def main():
             )
         print(f"  Plotting �")
         fig = plot_gwl_valuebyalpha_discrete(
-            da_ref_freq=da_ref_freq, da_ref_sev=da_ref_sev, da_ref_dur=da_ref_dur,
-            da_proj_freq=da_proj_freq, da_proj_sev=da_proj_sev, da_proj_dur=da_proj_dur,
+            da_ref_freq=da_ref_freq, da_ref_int=da_ref_int, da_ref_dur=da_ref_dur,
+            da_proj_freq=da_proj_freq, da_proj_int=da_proj_int, da_proj_dur=da_proj_dur,
             weight=weight, mask=mask,
             shapefile_path=args.shapefile,
             df_regions=df_regions,
@@ -1545,8 +1502,8 @@ def main():
         # ------ Collect data for the supplementary stacked figure ------
         print(f"  Collecting rgba map for supplementary figure �")
         _rgba, _extent, _cedges, _sedges, _clvl, _alvl = _compute_rgba_map(
-            da_ref_freq, da_ref_sev, da_ref_dur,
-            da_proj_freq, da_proj_sev, da_proj_dur,
+            da_ref_freq, da_ref_int, da_ref_dur,
+            da_proj_freq, da_proj_int, da_proj_dur,
             weight=weight, mask=mask, lat_min=-60, lat_max=68,
         )
         supp_items.append({"rgba_map": _rgba, "extent": _extent, "gwl_label": gwl_label})
@@ -1577,8 +1534,8 @@ def main():
                 no_wind_mask_supp = _land & (_mf.values < 0.5)
         # ----------------------------------------------------------------
 
-        del ds_proj, da_ref_freq, da_ref_sev, da_ref_dur
-        del da_proj_freq, da_proj_sev, da_proj_dur, weight, fig
+        del da_ref_freq, da_ref_int, da_ref_dur
+        del da_proj_freq, da_proj_int, da_proj_dur, weight, fig
         gc.collect()
 
     # ------------------------------------------------------------------
