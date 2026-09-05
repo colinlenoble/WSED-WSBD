@@ -10,6 +10,7 @@ import pandas as pd
 import rasterio
 from rasterio.features import geometry_mask
 import geopandas as gpd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py /
 # make_grid_files.py (prefers a .zarr store when present, falls back to
@@ -525,13 +526,102 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
     )
 
 
-def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
-    """Bootstrap slope samples for the reanalysis reference sev, per region."""
+def _ref_realization_regional_series(args):
+    """
+    Worker: build one GCM-threshold's ERA5-based reference severity grid
+    (same recipe as make_annual_freq_ref's inner loop), then immediately
+    reduce it to a masked per-region annual time series and discard the
+    (year, lat, lon) grid -- only a handful of small 1-D arrays per
+    GCM/region ever have to leave this worker process.
+
+    Returns (GCM, run, {region_name: (years, values)}).
+    """
+    preprocessed_path, GCM, run, reanalysis, grid_coords, mask, regions = args
+
+    wcf_gwl061_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'wcf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
+    scf_gwl061_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'scf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
+    wcf_ref_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'wcf_ref_{GCM}_{reanalysis}'))
+    scf_ref_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'scf_ref_{GCM}_{reanalysis}'))
+
+    wcf_gwl061 = open_dataset_any(wcf_gwl061_files[0])
+    scf_gwl061 = open_dataset_any(scf_gwl061_files[0])
+    wcf_ref = open_dataset_any(wcf_ref_files[0])
+    scf_ref = open_dataset_any(scf_ref_files[0])
+
+    wcf_ref['time'] = pd.to_datetime(wcf_ref.time.dt.strftime('%Y-%m-%d').values)
+    scf_ref['time'] = pd.to_datetime(scf_ref.time.dt.strftime('%Y-%m-%d').values)
+
+    wcf_thr = _pos_quantile(wcf_gwl061.wcf, 0.1)
+    scf_thr = _pos_quantile(scf_gwl061.scf, 0.1)
+
+    wcf_ref['low_wind']  = xr.where(wcf_ref.wcf <= wcf_thr, 1, 0)
+    scf_ref['low_solar'] = xr.where(scf_ref.scf <= scf_thr, 1, 0)
+    compound_ref = (wcf_ref.low_wind * scf_ref.low_solar).to_dataset(name='start_cooc')
+
+    wcf_ref = wcf_ref.convert_calendar('standard')
+    scf_ref = scf_ref.convert_calendar('standard')
+
+    intensity_ref = compute_severity(compound_ref.start_cooc, scf_ref, wcf_ref, scf_thr, wcf_thr)
+    intensity_ref['time'] = intensity_ref.time.dt.year
+    intensity_ref = intensity_ref.rename({'time': 'year'})
+
+    ds_dur, ds_freq = duration_xr(compound_ref.start_cooc)
+    ds_dur  = ds_dur.reindex_like(intensity_ref, fill_value=0)
+    ds_freq = ds_freq.reindex_like(intensity_ref, fill_value=0)
+
+    sev_ref = (intensity_ref * ds_dur.duration * ds_freq.frequency).to_dataset(name='sev')
+    sev_ref = xe.Regridder(sev_ref, grid_coords, method='nearest_s2d')(sev_ref).sev
+    sev_ref = sev_ref.where(xr.DataArray(mask, dims=['lat', 'lon'], coords={'lat': sev_ref.lat, 'lon': sev_ref.lon}))
+
+    years = sev_ref.year.values
+    region_out = {}
+    for r in regions:
+        lat_lo, lat_hi = r["lat"]
+        lon_lo, lon_hi = r["lon"]
+        series = sev_ref.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi)).mean(dim=['lat', 'lon'])
+        region_out[r["name"]] = series.values
+
+    return GCM, run, years, region_out
+
+
+def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=None, max_workers=4):
+    """
+    Bootstrap trend CI of the ERA5 reference severity, per region.
+
+    Streams straight from each GCM-threshold's own reference-period severity
+    grid to a masked regional-mean annual series, instead of going through
+    make_annual_freq_ref's grid_ref_annual_sev_*.nc (a (realization, year,
+    lat, lon) grid for every GCM, concatenated and held in memory all at
+    once before being written to disk) -- that intermediate is what was
+    running this out of memory. No (realization, year, lat, lon) grid is
+    ever built, on disk or off: each realization's grid is reduced to a
+    handful of per-region 1-D series and discarded immediately.
+
+    make_annual_freq_ref()/preprocess_ref() average across GCM-threshold
+    realizations *before* the regional spatial mean; here that order is
+    flipped (regional mean first, then averaged across realizations below),
+    which gives the same composite regional series since both steps are
+    plain means over disjoint axes (grid cells vs. realizations) and so
+    commute -- but flipping the order is exactly what lets each realization
+    be reduced to a few numbers immediately instead of needing every
+    realization's full grid in memory at once.
+
+    Each realization's grid+regrid work is independent of every other's, so
+    it is embarrassingly parallel across GCMs -- distributed across
+    `max_workers` processes (keep this modest; each worker still holds one
+    GCM's full grid transiently during regridding).
+    """
     reanalysis = reanalysis or config.REANALYSIS
-    agg_ref = xr.open_dataset(
-        os.path.join(preprocessed_path, f'grid_ref_annual_sev_{reanalysis}_all_year.nc')
-    )
-    agg_ref = agg_ref.mean(dim='realization')
+    grid = _target_grid(preprocessed_path, reanalysis)
+    grid_coords = xr.Dataset(coords={'lat': grid.lat.values, 'lon': grid.lon.values})
+
+    wcf_paths = glob_any(os.path.join(preprocessed_path, f'*/wcf_day_*ssp*GWL0-61_{reanalysis}'))
+    gcm_list = [x.split('_')[-5] for x in wcf_paths]
+    run_list = [x.split('_')[-3] for x in wcf_paths]
 
     regions = [
         {"name": "Guiana Shield", "lat": [-10, 10],  "lon": [-70, -50]},
@@ -542,26 +632,36 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
 
     shapefile = gpd.read_file(shapefile_path)
     transform = rasterio.transform.from_bounds(
-        agg_ref.lon.min().item(), agg_ref.lat.min().item(),
-        agg_ref.lon.max().item(), agg_ref.lat.max().item(),
-        len(agg_ref.lon), len(agg_ref.lat),
+        grid_coords.lon.min().item(), grid_coords.lat.min().item(),
+        grid_coords.lon.max().item(), grid_coords.lat.max().item(),
+        len(grid_coords.lon), len(grid_coords.lat),
     )
-    mask = rasterize_shapefile(shapefile, (len(agg_ref.lat), len(agg_ref.lon)), transform)[::-1, :]
+    mask = rasterize_shapefile(shapefile, (len(grid_coords.lat), len(grid_coords.lon)), transform)[::-1, :]
+
+    tasks = [
+        (preprocessed_path, GCM, run, reanalysis, grid_coords, mask, regions)
+        for GCM, run in zip(gcm_list, run_list)
+    ]
+
+    region_series = {r["name"]: [] for r in regions}
+    years_ref = None
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_ref_realization_regional_series, t) for t in tasks]
+        for i, fut in enumerate(as_completed(futures)):
+            GCM, run, years, region_out = fut.result()
+            print(f'[{i + 1}/{len(tasks)}] processed reference realization {GCM} {run}')
+            years_ref = years
+            for name, series in region_out.items():
+                region_series[name].append(series)
 
     ds_final = []
     for r in regions:
-        lat_lo, lat_hi = r["lat"]
-        lon_lo, lon_hi = r["lon"]
-        sev = (
-            agg_ref.sev
-            .where(mask)
-            .sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
-            .mean(dim=['lat', 'lon'])
-        )
-        # Summary only (see slopes_samples() above) -- the full bootstrap
-        # distribution isn't kept on disk.
+        # Average across GCM-threshold realizations (see docstring) --
+        # equivalent to averaging the full grid across realizations first,
+        # but computed from the already-tiny per-region series.
+        composite = np.nanmean(np.stack(region_series[r["name"]], axis=0), axis=0)
         low, up, mean, _ = _stationary_bootstrap_slopes(
-            sev.values, n_boot=2000, block_size=5, ci=95
+            composite, n_boot=2000, block_size=5, ci=95
         )
         ds_final.append(xr.Dataset(
             {
@@ -580,15 +680,29 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--era5-ref-only', action='store_true',
+        help="Only compute the ERA5 reference regional trend CI (preprocess_ref_boot -> "
+             "slopes_ic_ref_region_*.nc); skip the per-GCM uncertainty_range/slopes_samples passes.",
+    )
+    parser.add_argument(
+        '--max-workers', type=int, default=4,
+        help="Worker processes for preprocess_ref_boot's per-GCM regridding (default: 4).",
+    )
+    args = parser.parse_args()
 
     preprocessed_path = config.PATH_PREPROCESSED
     shapefile_path    = config.SHAPEFILE_PATH
     out_dir            = os.path.join(config.PATH_PREPROCESSED, 'trend_evaluation')
     os.makedirs(out_dir, exist_ok=True)
 
-    make_annual_freq_ref(preprocessed_path, out_dir)
-    preprocess_ref(out_dir, out_dir)
-    preprocess_ref_boot(out_dir, out_dir, shapefile_path)
+    # make_annual_freq_ref(preprocessed_path, out_dir)  # full-grid path -- only needed for preprocess_ref()'s map-panel grid_ic_ref.nc, not for the regional CI below
+    # preprocess_ref(out_dir, out_dir)
+    preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, max_workers=args.max_workers)
 
-    uncertainty_range(preprocessed_path, out_dir)
-    slopes_samples(preprocessed_path, out_dir, shapefile_path)
+    if not args.era5_ref_only:
+        uncertainty_range(preprocessed_path, out_dir)
+        slopes_samples(preprocessed_path, out_dir, shapefile_path)

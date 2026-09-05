@@ -1,4 +1,4 @@
-# -*- coding: cp1252 -*-
+# -*- coding: utf-8 -*-
 import os
 import config
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XCLIM
@@ -41,7 +41,7 @@ import cmocean as cmo
 # =============================================================================
 # Figure size constants (LaTeX-compatible)
 # =============================================================================
-FIG_WIDTH_IN = 5.15   # column width � fontsizes in pt will match LaTeX
+FIG_WIDTH_IN = 5.15   # column width - fontsizes in pt will match LaTeX
 
 # =============================================================================
 # CLI arguments
@@ -404,7 +404,7 @@ def rasterize_shapefile(shapefile, shape, transform):
 def build_land_mask(ref_2d, shapefile_path):
     """
     Build a boolean land mask on the lat/lon grid of ref_2d (a 2-D DataArray).
-    ref_2d must have dims (lat, lon) � no time or realization.
+    ref_2d must have dims (lat, lon) - no time or realization.
     """
     shapefile = gpd.read_file(shapefile_path)
     transform = rasterio.transform.from_bounds(
@@ -558,7 +558,7 @@ def add_severity_and_weights(df):
 
 
 # =============================================================================
-# Main figure � value-by-alpha map + regional boxplots
+# Main figure - value-by-alpha map + regional boxplots
 # =============================================================================
 
 def plot_gwl_valuebyalpha_discrete(
@@ -573,7 +573,7 @@ def plot_gwl_valuebyalpha_discrete(
     agreement_threshold=15.0,
     map_title=None,
     relchange_label="Relative change (%)",
-    sev_label="Average annual\nseverity (0.61 �C)",
+    sev_label="Average annual\nseverity (0.61 °C)",
     lat_min=-60,
     lat_max=68,
     regions=None,
@@ -743,7 +743,7 @@ def plot_gwl_valuebyalpha_discrete(
 
     # --- 10. Regional violin plots (all 4 GWL levels) ---
     gwl_order   = ["GWL0-61", "GWL1-5", "GWL2", "GWL3"]
-    gwl_display = ["0.61�C",  "1.5�C",  "2.0�C", "3.0�C"]
+    gwl_display = ["0.61°C",  "1.5°C",  "2.0°C", "3.0°C"]
 
     # Shared y-axis limits across all regions and GWL levels
     y_min, y_max = float("inf"), float("-inf")
@@ -840,7 +840,7 @@ def plot_supp_valuebyalpha_stacked(
     color_levels=None,
     alpha_levels=None,
     relchange_label="Relative change (%)",
-    sev_label="Average annual\nseverity (0.61 �C)",
+    sev_label="Average annual\nseverity (0.61 °C)",
 ):
     """
     Supplementary figure: value-by-alpha maps for multiple GWL levels stacked
@@ -908,7 +908,7 @@ def plot_supp_valuebyalpha_stacked(
             )
 
         panel_letter = ascii_lowercase[i]
-        panel_gwl    = gwl_label.replace(".0�C", "�C")
+        panel_gwl    = gwl_label.replace(".0°C", "°C")
         ax.annotate(
             f"$\\mathbf{{{panel_letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
@@ -1323,7 +1323,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     level_to_key = {"1.5": "GWL1-5", "2.0": "GWL2", "3.0": "GWL3"}
-    level_to_label = {"1.5": "1.5�C", "2.0": "2.0�C", "3.0": "3.0�C"}
+    level_to_label = {"1.5": "1.5°C", "2.0": "2.0°C", "3.0": "3.0°C"}
     level_to_fname = {
         "1.5": "fig2_projected_change_valuebyalpha_GWL1-5.png",
         "2.0": "fig2_projected_change_valuebyalpha_GWL2.png",
@@ -1367,7 +1367,7 @@ def main():
     hist_null_da = None
     if args.path_hist is not None:
         if os.path.exists(args.path_hist):
-            print(f"  Loading historical null mask from {args.path_hist} �")
+            print(f"  Loading historical null mask from {args.path_hist} ...")
             _ds_hist = xr.open_dataset(args.path_hist)
             _dur_hist = _ds_hist.duration
             if "year" in _dur_hist.dims:
@@ -1378,20 +1378,20 @@ def main():
             print(f"  [warn] --path_hist not found: {args.path_hist}. Dark grey layer uses GCM baseline.")
 
     # ------------------------------------------------------------------
-    # STEP 2 � Regional DataFrame
+    # STEP 2 - Regional DataFrame
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("STEP 2 � Regional DataFrame")
+    print("STEP 2 - Regional DataFrame")
     print("=" * 60)
-    # Default save/load path � can be overridden with --regional_csv
+    # Default save/load path - can be overridden with --regional_csv
     default_csv = os.path.join(args.output_dir, "regional_data_projections.csv")
     regional_csv_path = args.regional_csv if args.regional_csv is not None else default_csv
 
     if os.path.exists(regional_csv_path):
-        print(f"Found existing regional DataFrame at {regional_csv_path} � loading it.")
+        print(f"Found existing regional DataFrame at {regional_csv_path}, loading it.")
         df_regions = pd.read_csv(regional_csv_path)
     else:
-        print(f"No regional DataFrame found at {regional_csv_path} � computing �")
+        print(f"No regional DataFrame found at {regional_csv_path}, computing...")
         df_regions = create_dataframe_regional(built, mask)
         os.makedirs(os.path.dirname(regional_csv_path), exist_ok=True)
         df_regions.to_csv(regional_csv_path, index=False)
@@ -1400,20 +1400,20 @@ def main():
     df_regions = add_severity_and_weights(df_regions)
 
     # ------------------------------------------------------------------
-    # STEP 3 � Optional agreement hatching
+    # STEP 3 - Optional agreement hatching
     # ------------------------------------------------------------------
     hatchings = None
     if args.agreement_path is not None and os.path.exists(args.agreement_path):
-        print(f"\nLoading agreement mask from {args.agreement_path} �")
+        print(f"\nLoading agreement mask from {args.agreement_path} ...")
         hatchings = xr.open_dataarray(args.agreement_path)
     elif args.agreement_path is not None:
         print(f"  [warn] Agreement file not found: {args.agreement_path}. Hatching disabled.")
 
     # ------------------------------------------------------------------
-    # STEP 4 � Loop over GWL levels and produce figures
+    # STEP 4 - Loop over GWL levels and produce figures
     # ------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("STEP 4 � Producing figures")
+    print("STEP 4 - Producing figures")
     print("=" * 60)
     # GWL1.5 rel_change field used as fixed colour-bin mask for all GWL levels
     gwl15_rel_change_data = None
@@ -1441,7 +1441,7 @@ def main():
          weight) = from_ds_to_plot_decomp(ds_proj, ds_baseline)
 
         # Freeze colour-bin membership at GWL1.5 so higher GWLs report stats
-        # for the same spatial zones that were red/orange/gray/etc. at 1.5�C.
+        # for the same spatial zones that were red/orange/gray/etc. at 1.5°C.
         if level == "1.5":
             gwl15_rel_change_data = _compute_ensemble_rel_change(
                 da_ref_freq, da_ref_int, da_ref_dur,
@@ -1449,7 +1449,7 @@ def main():
                 weight=weight, mask=mask, lat_min=-60, lat_max=68,
             )
 
-        print(f"  Computing global change statistics �")
+        print(f"  Computing global change statistics ...")
         global_chg, ci_lo, ci_hi, gcm_ci_lo, gcm_ci_hi = compute_global_change_stats_gwl(
             da_ref_freq, da_ref_int, da_ref_dur,
             da_proj_freq, da_proj_int, da_proj_dur,
@@ -1461,7 +1461,7 @@ def main():
             f"[spatial CI: {ci_lo:+.2f}%, {ci_hi:+.2f}%] "
             f"[GCM CI: {gcm_ci_lo:+.2f}%, {gcm_ci_hi:+.2f}%]"
         )
-        print(f"  Computing per-bin change statistics �")
+        print(f"  Computing per-bin change statistics ...")
         bin_stats = compute_bin_change_stats_gwl(
             da_ref_freq, da_ref_int, da_ref_dur,
             da_proj_freq, da_proj_int, da_proj_dur,
@@ -1477,7 +1477,7 @@ def main():
                 f"[GCM CI: {s['gcm_ci_lower']:+7.2f}%, {s['gcm_ci_upper']:+7.2f}%]  "
                 f"({s['n_pixels']} pixels)"
             )
-        print(f"  Plotting �")
+        print(f"  Plotting ...")
         fig = plot_gwl_valuebyalpha_discrete(
             da_ref_freq=da_ref_freq, da_ref_int=da_ref_int, da_ref_dur=da_ref_dur,
             da_proj_freq=da_proj_freq, da_proj_int=da_proj_int, da_proj_dur=da_proj_dur,
@@ -1489,7 +1489,7 @@ def main():
             agreement_threshold=args.agreement_threshold,
             map_title=f"Annual severity change under {gwl_label} warming",
             relchange_label="Relative change (%)",
-            sev_label="Average annual\nseverity (0.61 �C)",
+            sev_label="Average annual\nseverity (0.61 °C)",
             lat_min=-60, lat_max=68,
             hist_null_da=hist_null_da,
         )
@@ -1500,7 +1500,7 @@ def main():
         print(f"  Saved ? {out_path}")
 
         # ------ Collect data for the supplementary stacked figure ------
-        print(f"  Collecting rgba map for supplementary figure �")
+        print(f"  Collecting rgba map for supplementary figure ...")
         _rgba, _extent, _cedges, _sedges, _clvl, _alvl = _compute_rgba_map(
             da_ref_freq, da_ref_int, da_ref_dur,
             da_proj_freq, da_proj_int, da_proj_dur,
@@ -1539,11 +1539,11 @@ def main():
         gc.collect()
 
     # ------------------------------------------------------------------
-    # STEP 5 � Supplementary stacked figure (all GWL, no violin plots)
+    # STEP 5 - Supplementary stacked figure (all GWL, no violin plots)
     # ------------------------------------------------------------------
     if supp_items:
         print("\n" + "=" * 60)
-        print("STEP 5 � Supplementary stacked value-by-alpha figure")
+        print("STEP 5 - Supplementary stacked value-by-alpha figure")
         print("=" * 60)
         fig_supp = plot_supp_valuebyalpha_stacked(
             gwl_items=supp_items,
