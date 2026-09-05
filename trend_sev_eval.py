@@ -141,81 +141,133 @@ def duration_xr(da):
 # ---------------------------------------------------------------------------
 # Reference period (reanalysis-based): one sev series per GCM's own grid +
 # GWL0-61 threshold (same per-model threshold every other GWL is scored
-# against), regridded onto the common reanalysis target grid and
-# concatenated over 'realization' -- mirrors make_grid_files.py's
-# load_gridded_data_compound reference branch.
+# against), regridded onto the common reanalysis target grid -- mirrors
+# make_grid_files.py's load_gridded_data_compound reference branch.
+#
+# grid_ic_ref.nc (built by make_grid_ref_trend_ci below) holds the
+# observed-side analog of uncertainty_range()'s per-GCM
+# agg_ic_ann_sev_GCMs_all_year_*.nc: the ERA5 severity trend's bootstrap CI
+# (low_trend/up_trend/mean_trend) at *every grid cell*, used to check
+# whether a GCM's projected per-cell trend CI overlaps the observed one
+# (the fig2 map panel). This is distinct from preprocess_ref_boot()'s
+# slopes_ic_ref_region_*.nc, which is the same ERA5 reference trend but
+# bootstrapped from *regional-mean* series for the joyplot panels.
 # ---------------------------------------------------------------------------
 
-def make_annual_freq_ref(preprocessed_path, out_dir, reanalysis=None):
-    """Build annual sev for the reanalysis reference period, once per GCM grid."""
+def _build_ref_severity_grid(preprocessed_path, GCM, run, reanalysis, grid_coords):
+    """
+    One GCM-threshold's ERA5-based reference-period severity, regridded onto
+    `grid_coords`. Shared by both reference pipelines below (per-cell grid
+    and per-region series) so the recipe -- per-model GWL0-61 threshold,
+    compound flag, severity, regrid -- is defined once.
+    """
+    wcf_gwl061_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'wcf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
+    scf_gwl061_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'scf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
+    wcf_ref_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'wcf_ref_{GCM}_{reanalysis}'))
+    scf_ref_files, _ = match_files(
+        os.path.join(preprocessed_path, GCM, f'scf_ref_{GCM}_{reanalysis}'))
+
+    wcf_gwl061 = open_dataset_any(wcf_gwl061_files[0])
+    scf_gwl061 = open_dataset_any(scf_gwl061_files[0])
+    wcf_ref = open_dataset_any(wcf_ref_files[0])
+    scf_ref = open_dataset_any(scf_ref_files[0])
+
+    wcf_ref['time'] = pd.to_datetime(wcf_ref.time.dt.strftime('%Y-%m-%d').values)
+    scf_ref['time'] = pd.to_datetime(scf_ref.time.dt.strftime('%Y-%m-%d').values)
+
+    wcf_thr = _pos_quantile(wcf_gwl061.wcf, 0.1)
+    scf_thr = _pos_quantile(scf_gwl061.scf, 0.1)
+
+    wcf_ref['low_wind']  = xr.where(wcf_ref.wcf <= wcf_thr, 1, 0)
+    scf_ref['low_solar'] = xr.where(scf_ref.scf <= scf_thr, 1, 0)
+    compound_ref = (wcf_ref.low_wind * scf_ref.low_solar).to_dataset(name='start_cooc')
+
+    wcf_ref = wcf_ref.convert_calendar('standard')
+    scf_ref = scf_ref.convert_calendar('standard')
+
+    intensity_ref = compute_severity(compound_ref.start_cooc, scf_ref, wcf_ref, scf_thr, wcf_thr)
+    intensity_ref['time'] = intensity_ref.time.dt.year
+    intensity_ref = intensity_ref.rename({'time': 'year'})
+
+    ds_dur, ds_freq = duration_xr(compound_ref.start_cooc)
+    # duration_xr's groupby-based output only carries (year, lat, lon)
+    # combinations that had at least one compound-event day, so a year
+    # with zero events anywhere is entirely absent from its 'year'
+    # coordinate -- reindex onto intensity_ref's full (always-complete,
+    # one row per calendar year from resample) year/lat/lon grid and
+    # fill those zero-event years with 0 rather than leaving them NaN.
+    ds_dur  = ds_dur.reindex_like(intensity_ref, fill_value=0)
+    ds_freq = ds_freq.reindex_like(intensity_ref, fill_value=0)
+
+    sev_ref = (intensity_ref * ds_dur.duration * ds_freq.frequency).to_dataset(name='sev')
+    return xe.Regridder(sev_ref, grid_coords, method='nearest_s2d')(sev_ref).sev
+
+
+def _ref_realization_grid(args):
+    """Worker: regridded (year, lat, lon) reference severity for one GCM-threshold."""
+    preprocessed_path, GCM, run, reanalysis, grid_coords = args
+    sev_ref = _build_ref_severity_grid(preprocessed_path, GCM, run, reanalysis, grid_coords)
+    return GCM, run, sev_ref
+
+
+def make_grid_ref_trend_ci(preprocessed_path, out_dir, reanalysis=None, max_workers=4, boot_batch=100):
+    """
+    Per-grid-cell bootstrap trend CI of the ERA5 reference severity
+    (-> grid_ic_ref.nc: low_trend/up_trend/mean_trend at every lat/lon).
+
+    Streams each GCM-threshold realization's full grid into a running
+    per-cell sum/count instead of building a (realization, year, lat, lon)
+    stack of every realization and writing *that* to disk first (the old
+    make_annual_freq_ref -> grid_ref_annual_sev_*.nc -> preprocess_ref
+    path) -- holding every realization's full grid in memory at once was
+    the actual OOM cause. Here at most a couple of full grids (the running
+    sum/count plus whichever realization just finished) are ever alive
+    regardless of how many realizations there are. A running sum/count
+    (rather than a running mean) keeps the accumulation nan-safe: a cell
+    that's NaN in one realization (e.g. a differing land/no-data edge) but
+    finite in others still gets averaged over only the realizations where
+    it's finite, exactly like a plain nanmean over 'realization' would.
+
+    Each realization's regrid is independent of the others, so the work is
+    distributed across `max_workers` processes. `boot_batch` bounds the
+    per-cell bootstrap's memory the same way it does in
+    stationary_bootstrap_ci_grid (see its docstring) -- lower it if this
+    step itself runs out of memory on the composite grid.
+    """
     reanalysis = reanalysis or config.REANALYSIS
     grid = _target_grid(preprocessed_path, reanalysis)
+    grid_coords = xr.Dataset(coords={'lat': grid.lat.values, 'lon': grid.lon.values})
 
     wcf_paths = glob_any(os.path.join(preprocessed_path, f'*/wcf_day_*ssp*GWL0-61_{reanalysis}'))
     gcm_list = [x.split('_')[-5] for x in wcf_paths]
     run_list = [x.split('_')[-3] for x in wcf_paths]
 
-    dfinal = []
-    for i, (GCM, run) in enumerate(zip(gcm_list, run_list)):
-        print(f'Processing GCM: {GCM}, Run: {run}')
+    tasks = [(preprocessed_path, GCM, run, reanalysis, grid_coords) for GCM, run in zip(gcm_list, run_list)]
 
-        wcf_gwl061_files, _ = match_files(
-            os.path.join(preprocessed_path, GCM, f'wcf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
-        scf_gwl061_files, _ = match_files(
-            os.path.join(preprocessed_path, GCM, f'scf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
-        wcf_ref_files, _ = match_files(
-            os.path.join(preprocessed_path, GCM, f'wcf_ref_{GCM}_{reanalysis}'))
-        scf_ref_files, _ = match_files(
-            os.path.join(preprocessed_path, GCM, f'scf_ref_{GCM}_{reanalysis}'))
+    sum_sev = None
+    count_sev = None
+    template = None
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_ref_realization_grid, t) for t in tasks]
+        for i, fut in enumerate(as_completed(futures)):
+            GCM, run, sev_ref = fut.result()
+            print(f'[{i + 1}/{len(tasks)}] accumulated reference realization {GCM} {run}')
+            values = sev_ref.values
+            if sum_sev is None:
+                sum_sev = np.zeros_like(values)
+                count_sev = np.zeros_like(values)
+                template = sev_ref
+            finite = np.isfinite(values)
+            sum_sev[finite]   += values[finite]
+            count_sev[finite] += 1
 
-        wcf_gwl061 = open_dataset_any(wcf_gwl061_files[0])
-        scf_gwl061 = open_dataset_any(scf_gwl061_files[0])
-        wcf_ref = open_dataset_any(wcf_ref_files[0])
-        scf_ref = open_dataset_any(scf_ref_files[0])
+    composite_values = np.where(count_sev > 0, sum_sev / np.maximum(count_sev, 1), np.nan)
+    composite = xr.DataArray(composite_values, dims=template.dims, coords=template.coords, name='sev')
 
-        wcf_ref['time'] = pd.to_datetime(wcf_ref.time.dt.strftime('%Y-%m-%d').values)
-        scf_ref['time'] = pd.to_datetime(scf_ref.time.dt.strftime('%Y-%m-%d').values)
-
-        wcf_thr = _pos_quantile(wcf_gwl061.wcf, 0.1)
-        scf_thr = _pos_quantile(scf_gwl061.scf, 0.1)
-
-        wcf_ref['low_wind']  = xr.where(wcf_ref.wcf <= wcf_thr, 1, 0)
-        scf_ref['low_solar'] = xr.where(scf_ref.scf <= scf_thr, 1, 0)
-        compound_ref = (wcf_ref.low_wind * scf_ref.low_solar).to_dataset(name='start_cooc')
-
-        wcf_ref = wcf_ref.convert_calendar('standard')
-        scf_ref = scf_ref.convert_calendar('standard')
-
-        intensity_ref = compute_severity(compound_ref.start_cooc, scf_ref, wcf_ref, scf_thr, wcf_thr)
-        intensity_ref['time'] = intensity_ref.time.dt.year
-        intensity_ref = intensity_ref.rename({'time': 'year'})
-
-        ds_dur, ds_freq = duration_xr(compound_ref.start_cooc)
-        # duration_xr's groupby-based output only carries (year, lat, lon)
-        # combinations that had at least one compound-event day, so a year
-        # with zero events anywhere is entirely absent from its 'year'
-        # coordinate -- reindex onto intensity_ref's full (always-complete,
-        # one row per calendar year from resample) year/lat/lon grid and
-        # fill those zero-event years with 0 rather than leaving them NaN.
-        ds_dur  = ds_dur.reindex_like(intensity_ref, fill_value=0)
-        ds_freq = ds_freq.reindex_like(intensity_ref, fill_value=0)
-
-        sev_ref = (intensity_ref * ds_dur.duration * ds_freq.frequency).to_dataset(name='sev')
-        sev_ref = xe.Regridder(sev_ref, grid, method='nearest_s2d')(sev_ref)
-        sev_ref['GCM'] = f'{GCM}_{reanalysis}'
-        sev_ref['run'] = run
-        dfinal.append(sev_ref.expand_dims({'realization': [i]}))
-
-    xr.concat(dfinal, dim='realization').to_netcdf(
-        os.path.join(out_dir, f'grid_ref_annual_sev_{reanalysis}_all_year.nc')
-    )
-
-
-def preprocess_ref(preprocessed_path, out_dir, reanalysis=None):
-    """Compute bootstrap CI of trend for the reanalysis reference sev."""
-    reanalysis = reanalysis or config.REANALYSIS
-    ds_ref = xr.open_dataset(os.path.join(preprocessed_path, f'grid_ref_annual_sev_{reanalysis}_all_year.nc'))
-    low, up, mean = stationary_bootstrap_ci_grid(ds_ref.sev)
+    low, up, mean = stationary_bootstrap_ci_grid(composite, boot_batch=boot_batch)
     ds = low.to_dataset(name='low_trend')
     ds['up_trend']   = up
     ds['mean_trend'] = mean
@@ -528,53 +580,17 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
 
 def _ref_realization_regional_series(args):
     """
-    Worker: build one GCM-threshold's ERA5-based reference severity grid
-    (same recipe as make_annual_freq_ref's inner loop), then immediately
-    reduce it to a masked per-region annual time series and discard the
-    (year, lat, lon) grid -- only a handful of small 1-D arrays per
-    GCM/region ever have to leave this worker process.
+    Worker: build one GCM-threshold's ERA5-based reference severity grid via
+    _build_ref_severity_grid, then immediately reduce it to a masked
+    per-region annual time series and discard the (year, lat, lon) grid --
+    only a handful of small 1-D arrays per GCM/region ever have to leave
+    this worker process.
 
-    Returns (GCM, run, {region_name: (years, values)}).
+    Returns (GCM, run, years, {region_name: values}).
     """
     preprocessed_path, GCM, run, reanalysis, grid_coords, mask, regions = args
 
-    wcf_gwl061_files, _ = match_files(
-        os.path.join(preprocessed_path, GCM, f'wcf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
-    scf_gwl061_files, _ = match_files(
-        os.path.join(preprocessed_path, GCM, f'scf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
-    wcf_ref_files, _ = match_files(
-        os.path.join(preprocessed_path, GCM, f'wcf_ref_{GCM}_{reanalysis}'))
-    scf_ref_files, _ = match_files(
-        os.path.join(preprocessed_path, GCM, f'scf_ref_{GCM}_{reanalysis}'))
-
-    wcf_gwl061 = open_dataset_any(wcf_gwl061_files[0])
-    scf_gwl061 = open_dataset_any(scf_gwl061_files[0])
-    wcf_ref = open_dataset_any(wcf_ref_files[0])
-    scf_ref = open_dataset_any(scf_ref_files[0])
-
-    wcf_ref['time'] = pd.to_datetime(wcf_ref.time.dt.strftime('%Y-%m-%d').values)
-    scf_ref['time'] = pd.to_datetime(scf_ref.time.dt.strftime('%Y-%m-%d').values)
-
-    wcf_thr = _pos_quantile(wcf_gwl061.wcf, 0.1)
-    scf_thr = _pos_quantile(scf_gwl061.scf, 0.1)
-
-    wcf_ref['low_wind']  = xr.where(wcf_ref.wcf <= wcf_thr, 1, 0)
-    scf_ref['low_solar'] = xr.where(scf_ref.scf <= scf_thr, 1, 0)
-    compound_ref = (wcf_ref.low_wind * scf_ref.low_solar).to_dataset(name='start_cooc')
-
-    wcf_ref = wcf_ref.convert_calendar('standard')
-    scf_ref = scf_ref.convert_calendar('standard')
-
-    intensity_ref = compute_severity(compound_ref.start_cooc, scf_ref, wcf_ref, scf_thr, wcf_thr)
-    intensity_ref['time'] = intensity_ref.time.dt.year
-    intensity_ref = intensity_ref.rename({'time': 'year'})
-
-    ds_dur, ds_freq = duration_xr(compound_ref.start_cooc)
-    ds_dur  = ds_dur.reindex_like(intensity_ref, fill_value=0)
-    ds_freq = ds_freq.reindex_like(intensity_ref, fill_value=0)
-
-    sev_ref = (intensity_ref * ds_dur.duration * ds_freq.frequency).to_dataset(name='sev')
-    sev_ref = xe.Regridder(sev_ref, grid_coords, method='nearest_s2d')(sev_ref).sev
+    sev_ref = _build_ref_severity_grid(preprocessed_path, GCM, run, reanalysis, grid_coords)
     sev_ref = sev_ref.where(xr.DataArray(mask, dims=['lat', 'lon'], coords={'lat': sev_ref.lat, 'lon': sev_ref.lon}))
 
     years = sev_ref.year.values
@@ -593,22 +609,21 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
     Bootstrap trend CI of the ERA5 reference severity, per region.
 
     Streams straight from each GCM-threshold's own reference-period severity
-    grid to a masked regional-mean annual series, instead of going through
-    make_annual_freq_ref's grid_ref_annual_sev_*.nc (a (realization, year,
-    lat, lon) grid for every GCM, concatenated and held in memory all at
-    once before being written to disk) -- that intermediate is what was
-    running this out of memory. No (realization, year, lat, lon) grid is
-    ever built, on disk or off: each realization's grid is reduced to a
-    handful of per-region 1-D series and discarded immediately.
+    grid to a masked regional-mean annual series, rather than ever building
+    a (realization, year, lat, lon) grid for every GCM at once (the way
+    make_grid_ref_trend_ci's per-cell CI needs to, and the way this used to
+    -- via a since-removed grid_ref_annual_sev_*.nc intermediate -- before
+    being rewritten to run out of memory less). Each realization's grid is
+    reduced to a handful of per-region 1-D series and discarded immediately.
 
-    make_annual_freq_ref()/preprocess_ref() average across GCM-threshold
-    realizations *before* the regional spatial mean; here that order is
-    flipped (regional mean first, then averaged across realizations below),
-    which gives the same composite regional series since both steps are
-    plain means over disjoint axes (grid cells vs. realizations) and so
-    commute -- but flipping the order is exactly what lets each realization
-    be reduced to a few numbers immediately instead of needing every
-    realization's full grid in memory at once.
+    make_grid_ref_trend_ci() averages across GCM-threshold realizations
+    *before* its per-cell trend fit; here that order is flipped (regional
+    mean first, then averaged across realizations below), which gives the
+    same composite regional series since both steps are plain means over
+    disjoint axes (grid cells vs. realizations) and so commute -- but
+    flipping the order is exactly what lets each realization be reduced to
+    a few numbers immediately instead of needing every realization's full
+    grid in memory at once.
 
     Each realization's grid+regrid work is independent of every other's, so
     it is embarrassingly parallel across GCMs -- distributed across
@@ -685,12 +700,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--era5-ref-only', action='store_true',
-        help="Only compute the ERA5 reference regional trend CI (preprocess_ref_boot -> "
-             "slopes_ic_ref_region_*.nc); skip the per-GCM uncertainty_range/slopes_samples passes.",
+        help="Only compute the ERA5 reference outputs (make_grid_ref_trend_ci -> grid_ic_ref.nc, "
+             "preprocess_ref_boot -> slopes_ic_ref_region_*.nc); skip the per-GCM "
+             "uncertainty_range/slopes_samples passes.",
     )
     parser.add_argument(
         '--max-workers', type=int, default=4,
-        help="Worker processes for preprocess_ref_boot's per-GCM regridding (default: 4).",
+        help="Worker processes for the ERA5 reference steps' per-GCM regridding (default: 4).",
     )
     args = parser.parse_args()
 
@@ -699,8 +715,7 @@ if __name__ == '__main__':
     out_dir            = os.path.join(config.PATH_PREPROCESSED, 'trend_evaluation')
     os.makedirs(out_dir, exist_ok=True)
 
-    # make_annual_freq_ref(preprocessed_path, out_dir)  # full-grid path -- only needed for preprocess_ref()'s map-panel grid_ic_ref.nc, not for the regional CI below
-    # preprocess_ref(out_dir, out_dir)
+    make_grid_ref_trend_ci(preprocessed_path, out_dir, max_workers=args.max_workers)
     preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, max_workers=args.max_workers)
 
     if not args.era5_ref_only:

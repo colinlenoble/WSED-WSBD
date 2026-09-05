@@ -434,23 +434,31 @@ def _reduce_to_2d(da):
 
 def from_ds_to_plot_decomp(ds_gwl, ds_ref):
     """
-    Align baseline (ds_ref) and projection (ds_gwl) datasets by common GCMs.
+    Align baseline (ds_ref) and projection (ds_gwl) datasets by common
+    (GCM, run) pairs -- not just GCM name, since a given GCM can have a
+    different set of available runs at different GWLs (e.g. one run may
+    not reach a higher warming level at all). Matching on name alone can
+    pick a different number of realizations from each dataset whenever
+    that happens, which then fails when they're recombined.
     Returns (ref_freq, ref_int, ref_dur, proj_freq, proj_int, proj_dur, weight).
     """
-    gcm_gwl = ds_gwl.GCM.values
-    gcm_ref = ds_ref.GCM.values
+    pairs_gwl = list(zip(ds_gwl.GCM.values, ds_gwl.run.values))
+    pairs_ref = list(zip(ds_ref.GCM.values, ds_ref.run.values))
 
-    # Find indices *separately* in each dataset, then sort both by GCM name
-    # so that paired realizations correspond to the same GCM.
-    common_gcms = set(gcm_ref) & set(gcm_gwl)
-    ref_indices = [i for i, g in enumerate(gcm_ref) if g in common_gcms]
-    gwl_indices = [i for i, g in enumerate(gcm_gwl) if g in common_gcms]
+    # Find indices *separately* in each dataset, then sort both by the same
+    # (GCM, run) key so that paired realizations correspond to the same
+    # GCM/run rather than just the same GCM.
+    common_pairs = set(pairs_ref) & set(pairs_gwl)
+    ref_indices = [i for i, p in enumerate(pairs_ref) if p in common_pairs]
+    gwl_indices = [i for i, p in enumerate(pairs_gwl) if p in common_pairs]
     ds_ref = ds_ref.isel(realization=ref_indices)
     ds_gwl = ds_gwl.isel(realization=gwl_indices)
 
-    # Sort both by GCM name so realizations are paired consistently
-    ref_order = np.argsort(ds_ref.GCM.values)
-    gwl_order = np.argsort(ds_gwl.GCM.values)
+    # Sort both by (GCM, run) so realizations are paired consistently
+    ref_order = sorted(range(ds_ref.sizes["realization"]),
+                        key=lambda i: (ds_ref.GCM.values[i], ds_ref.run.values[i]))
+    gwl_order = sorted(range(ds_gwl.sizes["realization"]),
+                        key=lambda i: (ds_gwl.GCM.values[i], ds_gwl.run.values[i]))
     ds_ref = ds_ref.isel(realization=ref_order)
     ds_gwl = ds_gwl.isel(realization=gwl_order)
 
