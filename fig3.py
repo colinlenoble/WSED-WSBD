@@ -312,6 +312,32 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea):
     return ds_final
 
 
+def _print_gcm_run_summary(label, ds):
+    """
+    Diagnostic: print every (GCM, run) pair in ds and flag any that appear
+    more than once. Duplicate (GCM, run) pairs within a single GWL's built
+    dataset break from_ds_to_plot_decomp's alignment (a "common" pair would
+    then be counted multiple times on one side but not the other).
+    """
+    gcms = ds.GCM.values
+    runs = ds.run.values
+    pairs = list(zip(gcms, runs))
+    print(f"    [{label}] {len(pairs)} realizations:")
+    for g, r in pairs:
+        print(f"      {g} : {r}")
+
+    counts = {}
+    for p in pairs:
+        counts[p] = counts.get(p, 0) + 1
+    dupes = {p: c for p, c in counts.items() if c > 1}
+    if dupes:
+        print(f"    [{label}] DUPLICATE (GCM, run) pairs found:")
+        for (g, r), c in dupes.items():
+            print(f"      {g} : {r}  (x{c})")
+    else:
+        print(f"    [{label}] no duplicate (GCM, run) pairs ({len(counts)} unique).")
+
+
 def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclude_gcm_run=None):
     """
     Build the aggregated gridded dataset for every requested GWL, entirely in
@@ -379,6 +405,7 @@ def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclud
         gwl_ds = xr.concat(gcm_datasets, dim="realization")
         gwl_ds["realization"] = np.arange(len(gcm_datasets))
         built[gwl] = gwl_ds
+        _print_gcm_run_summary(gwl, gwl_ds)
         del gcm_datasets
         gc.collect()
 
@@ -451,6 +478,21 @@ def from_ds_to_plot_decomp(ds_gwl, ds_ref):
     common_pairs = set(pairs_ref) & set(pairs_gwl)
     ref_indices = [i for i, p in enumerate(pairs_ref) if p in common_pairs]
     gwl_indices = [i for i, p in enumerate(pairs_gwl) if p in common_pairs]
+
+    if len(ref_indices) != len(gwl_indices):
+        def _dupes(pairs, indices):
+            counts = {}
+            for i in indices:
+                counts[pairs[i]] = counts.get(pairs[i], 0) + 1
+            return {p: c for p, c in counts.items() if c > 1}
+        raise ValueError(
+            f"GCM/run alignment mismatch: {len(ref_indices)} baseline realizations "
+            f"vs {len(gwl_indices)} projection realizations share a common (GCM, run) pair. "
+            f"This means one side lists the same (GCM, run) more than once. "
+            f"Duplicate pairs on baseline side: {_dupes(pairs_ref, ref_indices)}. "
+            f"Duplicate pairs on projection side: {_dupes(pairs_gwl, gwl_indices)}."
+        )
+
     ds_ref = ds_ref.isel(realization=ref_indices)
     ds_gwl = ds_gwl.isel(realization=gwl_indices)
 
