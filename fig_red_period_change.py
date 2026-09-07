@@ -184,7 +184,7 @@ def plot_red_period_change(
     fig_width_in = FIG_WIDTH_IN * 1.7
     fig_height_in = fig_width_in * 0.95
     fig, axes = plt.subplots(3, 3, figsize=(fig_width_in, fig_height_in), dpi=300,
-                              subplot_kw={"projection": ccrs.Robinson()})
+                              subplot_kw={"projection": ccrs.EqualEarth()})
 
     for r, (hist_da, comp_da, diff_da) in enumerate(row_data):
         if r == 0:

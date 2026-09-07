@@ -450,7 +450,7 @@ def plot_valuebyalpha_persistent(
     fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
     gs = GridSpec(2, ncols_total, height_ratios=[2.9, 1],
                   hspace=0.30, wspace=0.45, figure=fig)
-    ax_map = fig.add_subplot(gs[0, :], projection=ccrs.Robinson())
+    ax_map = fig.add_subplot(gs[0, :], projection=ccrs.EqualEarth())
 
     # --- 7. Draw map ---
     shp = gpd.read_file(shapefile_path)
@@ -609,7 +609,7 @@ def plot_valuebyalpha_decomposition(
     fig_width_in = FIG_WIDTH_IN * 1.6
     fig_height_in = fig_width_in * 0.95
     fig, axes = plt.subplots(2, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
-                              subplot_kw={"projection": ccrs.Robinson()})
+                              subplot_kw={"projection": ccrs.EqualEarth()})
     axes_flat = axes.flatten()
 
     for i, (da_full, label) in enumerate(zip(indices.values(), class_labels)):
@@ -730,7 +730,7 @@ def plot_freq_by_duration_change_persistent(
     fig_width_in = FIG_WIDTH_IN * 1.6
     fig_height_in = fig_width_in * 0.62
     fig, axes = plt.subplots(2, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
-                              subplot_kw={"projection": ccrs.Robinson()})
+                              subplot_kw={"projection": ccrs.EqualEarth()})
     axes_flat = axes.flatten()
     panellabels = list(ascii_lowercase[:len(thresholds)])
 
@@ -830,7 +830,7 @@ def plot_reference_persistent_drought(
     fig_width_in = FIG_WIDTH_IN
     fig_height_in = fig_width_in * 0.55
     fig, axes = plt.subplots(2, 3, figsize=(fig_width_in, fig_height_in), dpi=300,
-                              subplot_kw={"projection": ccrs.Robinson()})
+                              subplot_kw={"projection": ccrs.EqualEarth()})
     axes_flat = axes.flatten()
 
     for idx, ax in enumerate(axes_flat):

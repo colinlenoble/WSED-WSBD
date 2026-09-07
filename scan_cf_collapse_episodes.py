@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Scan every scf_day_* file across all GCMs/runs/GWLs for the kind of
+Scan every scf_day_*/wcf_day_* file across all GCMs/runs/GWLs for the kind of
 collapse-episode anomaly found in EC-Earth3-Veg-LR r2i1p1f1's GWL1 scf:
 domain-mean solar capacity factor crashing to near-zero for a multi-month
 stretch (2013-10-05 .. 2014-01-29), traced to that window's MBCn
 bias-adjusted rsds collapsing to ~1/6 of its normal level while the raw GCM
 rsds for the same days was completely normal -- i.e. a bias-adjustment bug,
 not a GCM data problem (see diagnostics/check_ec_earth_scf_wcf.py, and the
-conversation that led to this script).
+conversation that led to this script). wcf is scanned with the same logic
+since it's subject to the same bias-adjustment pipeline and file layout.
 
-No xesmf import needed -- this only reads already-computed scf_day_* files
-via io_utils (xesmf-free), so it's safe to run standalone on the server
+No xesmf import needed -- this only reads already-computed scf_day_*/wcf_day_*
+files via io_utils (xesmf-free), so it's safe to run standalone on the server
 without the full xesmf_env pipeline.
 
-For every scf file found under PREPROCESSED_PATH:
+For every scf/wcf file found under PREPROCESSED_PATH:
   1. Reduce to a domain-mean daily series (skipna).
   2. Flag "collapse days": domain-mean scf below FLOOR_FRAC of that run's
      own median. A global-domain solar CF should never be a tiny fraction
@@ -43,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + r"/..")
 import config
 from io_utils import glob_any, open_dataset_any
 
-VAR = "scf"
+VARS = ["scf", "wcf"]
 REANALYSIS = config.REANALYSIS
 PREPROCESSED_PATH = config.PATH_PREPROCESSED
 GWLS = config.GWL_LIST  # ['GWL0-61', 'GWL1', 'GWL1-5', 'GWL2', 'GWL3']
@@ -76,8 +77,8 @@ def find_episodes(dates, is_low):
     return [(dates[s], dates[e], e - s + 1) for s, e in episodes if (e - s + 1) >= MIN_EPISODE_DAYS]
 
 
-def check_file(path):
-    da = open_dataset_any(path, chunks={})[VAR]
+def check_file(path, var):
+    da = open_dataset_any(path, chunks={})[var]
     spatial_dims = [d for d in da.dims if d != "time"]
     s = da.mean(dim=spatial_dims, skipna=True).compute().to_series()
     dates = s.index
@@ -95,35 +96,36 @@ def check_file(path):
 
 if __name__ == "__main__":
     flagged = []
-    for gwl in GWLS:
-        pattern = os.path.join(PREPROCESSED_PATH, "*", f"{VAR}_day_*_{gwl}_{REANALYSIS}")
-        files = sorted(glob_any(pattern))
-        print(f"\n=== {gwl}: {len(files)} {VAR} file(s) found ===")
-        for f in files:
-            # {var}_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.{nc,zarr} -- GCM
-            # names use hyphens not underscores, so counting from the end
-            # (as trend_sev_eval.py does) is robust to that.
-            stem = os.path.basename(f.rstrip("/\\")).rsplit(".", 1)[0]
-            parts = stem.split("_")
-            gcm, run = parts[-5], parts[-3]
-            try:
-                median, episodes, bad_years = check_file(f)
-            except Exception as exc:
-                print(f"  ERROR checking {os.path.basename(f)}: {exc}")
-                continue
-            if episodes or bad_years:
-                print(f"\n<<<< FLAGGED: {gcm} {run} {gwl} (median {VAR}={median:.3f}) >>>>")
-                for start, end, n in episodes:
-                    print(f"    collapse episode: {start.date()} .. {end.date()} "
-                          f"({n} days, floor={FLOOR_FRAC * median:.3f})")
-                for yr, mean_val, zval in bad_years:
-                    print(f"    anomalous year {yr}: mean={mean_val:.3f}  (robust z={zval:.1f})")
-                flagged.append((gcm, run, gwl))
+    for var in VARS:
+        for gwl in GWLS:
+            pattern = os.path.join(PREPROCESSED_PATH, "*", f"{var}_day_*_{gwl}_{REANALYSIS}")
+            files = sorted(glob_any(pattern))
+            print(f"\n=== {var} {gwl}: {len(files)} file(s) found ===")
+            for f in files:
+                # {var}_day_{GCM}_{ssp}_{run}_{gwl}_{reanalysis}.{nc,zarr} -- GCM
+                # names use hyphens not underscores, so counting from the end
+                # (as trend_sev_eval.py does) is robust to that.
+                stem = os.path.basename(f.rstrip("/\\")).rsplit(".", 1)[0]
+                parts = stem.split("_")
+                gcm, run = parts[-5], parts[-3]
+                try:
+                    median, episodes, bad_years = check_file(f, var)
+                except Exception as exc:
+                    print(f"  ERROR checking {os.path.basename(f)}: {exc}")
+                    continue
+                if episodes or bad_years:
+                    print(f"\n<<<< FLAGGED: {var} {gcm} {run} {gwl} (median {var}={median:.3f}) >>>>")
+                    for start, end, n in episodes:
+                        print(f"    collapse episode: {start.date()} .. {end.date()} "
+                              f"({n} days, floor={FLOOR_FRAC * median:.3f})")
+                    for yr, mean_val, zval in bad_years:
+                        print(f"    anomalous year {yr}: mean={mean_val:.3f}  (robust z={zval:.1f})")
+                    flagged.append((var, gcm, run, gwl))
 
     print("\n" + "=" * 60)
     if flagged:
-        print(f"{len(flagged)} (GCM, run, GWL) combination(s) flagged:")
-        for gcm, run, gwl in flagged:
-            print(f"  {gcm:20s} {run:12s} {gwl}")
+        print(f"{len(flagged)} (var, GCM, run, GWL) combination(s) flagged:")
+        for var, gcm, run, gwl in flagged:
+            print(f"  {var:4s} {gcm:20s} {run:12s} {gwl}")
     else:
         print("No collapse episodes or anomalous years found.")

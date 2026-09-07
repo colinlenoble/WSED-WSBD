@@ -688,7 +688,7 @@ def plot_gwl_valuebyalpha_discrete(
     ncols  = max(1, len(regions))
     fig    = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
     gs     = GridSpec(2, ncols, height_ratios=[2.9, 1], hspace=0.4, wspace=0.5, figure=fig)
-    ax_map = fig.add_subplot(gs[0, :], projection=ccrs.Robinson())
+    ax_map = fig.add_subplot(gs[0, :], projection=ccrs.EqualEarth())
 
     # --- 7. Draw map ---
     shp = gpd.read_file(shapefile_path)
@@ -927,7 +927,7 @@ def plot_supp_valuebyalpha_stacked(
         legend_rgba[ic, :,  3] = alpha_levels
 
     for i, item in enumerate(gwl_items):
-        ax        = fig.add_subplot(gs[i, 0], projection=ccrs.Robinson())
+        ax        = fig.add_subplot(gs[i, 0], projection=ccrs.EqualEarth())
         rgba_map  = item["rgba_map"]
         extent    = item["extent"]
         gwl_label = item["gwl_label"]

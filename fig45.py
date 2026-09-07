@@ -483,7 +483,7 @@ def _three_panel_map(df_gwl15, df_gwl2, df_gwl3,
                      value_fn, value_col,
                      title_gwl2, title_gwl15, title_gwl3,
                      cbar_label, dpi):
-    proj = ccrs.Robinson()
+    proj = ccrs.EqualEarth()
     # 1 large top + 2 smaller bottom ? width = 2 � FIG_WIDTH_IN, height proportional
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (8 / 14)
@@ -751,7 +751,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (7 / 14)
     fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h), dpi=dpi,
-                           subplot_kw={"projection": ccrs.Robinson()})
+                           subplot_kw={"projection": ccrs.EqualEarth()})
 
     vals     = gdf["ratio"].to_numpy()
     nan_mask = ~np.isfinite(vals)
@@ -831,7 +831,7 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
     last_ax = None
     for idx, demand_name in enumerate(names):
         row, col   = divmod(idx, ncols)
-        ax         = fig.add_subplot(gs[row, col], projection=ccrs.Robinson())
+        ax         = fig.add_subplot(gs[row, col], projection=ccrs.EqualEarth())
         last_ax    = ax
         is_ref     = (demand_name == "default")
         label, params = _meta.get(demand_name, (demand_name, ""))
@@ -966,7 +966,7 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
     fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
     gs    = fig.add_gridspec(1, 2, width_ratios=[0.8, 1.4])
     ax1   = fig.add_subplot(gs[0, 0])
-    ax2   = fig.add_subplot(gs[0, 1], projection=ccrs.Robinson())
+    ax2   = fig.add_subplot(gs[0, 1], projection=ccrs.EqualEarth())
 
     ax1.annotate(
         "$\\mathbf{a}$",
@@ -1089,7 +1089,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (7 / 14)
     fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h), dpi=dpi,
-                           subplot_kw={"projection": ccrs.Robinson()})
+                           subplot_kw={"projection": ccrs.EqualEarth()})
 
     vals     = gdf["ratio"].to_numpy()
     nan_mask = ~np.isfinite(vals)
@@ -1160,7 +1160,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (7 / 14)
     fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h), dpi=dpi,
-                           subplot_kw={"projection": ccrs.Robinson()})
+                           subplot_kw={"projection": ccrs.EqualEarth()})
 
     vals     = gdf["RE_Std"].to_numpy()
     nan_mask = ~np.isfinite(vals)
@@ -1223,7 +1223,7 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
     panel = 0
     for row, gwl_idx in enumerate([0, 1, 2]):
         for col, tot_re in enumerate(TOT_RE_VALS):
-            ax     = fig.add_subplot(gs[row, col], projection=ccrs.Robinson())
+            ax     = fig.add_subplot(gs[row, col], projection=ccrs.EqualEarth())
             df_gwl = gwl_dfs_by_share[tot_re][gwl_idx]
             mmm    = _mmm_combined(df_gwl, share_re="current", vmax=800)
             gdf    = gdf_base.copy().merge(mmm, on="poly_idx", how="left")
@@ -1275,7 +1275,7 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
 
 def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
                                       output_dir, share_re="current", dpi=300):
-    proj  = ccrs.Robinson()
+    proj  = ccrs.EqualEarth()
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (12 / 20)
     fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)

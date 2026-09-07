@@ -466,7 +466,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
     fig  = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
     gs   = GridSpec(2, ncols_total, height_ratios=[2.9, 1],
                     hspace=0.30, wspace=0.45, figure=fig)
-    ax_map = fig.add_subplot(gs[0, :], projection=ccrs.Robinson())
+    ax_map = fig.add_subplot(gs[0, :], projection=ccrs.EqualEarth())
 
     # --- 7. Draw map ---
     shp = gpd.read_file(shapefile_path)
@@ -606,7 +606,7 @@ def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
     fig_width_in  = FIG_WIDTH_IN
     fig_height_in = fig_width_in * (6 / 12)
     fig, ax = plt.subplots(figsize=(fig_width_in, fig_height_in),
-                           subplot_kw={"projection": ccrs.Robinson()})
+                           subplot_kw={"projection": ccrs.EqualEarth()})
     im = ax.pcolormesh(
         std_pdd.lon, std_pdd.lat, std_pdd.values,
         transform=ccrs.PlateCarree(),
@@ -710,7 +710,7 @@ def plot_mean_variables_6panel(
     fig_width_in  = FIG_WIDTH_IN
     fig_height_in = fig_width_in * 0.6
     fig, axes = plt.subplots(3, 3, figsize=(fig_width_in, fig_height_in), dpi=300,
-                             subplot_kw={"projection": ccrs.Robinson()})
+                             subplot_kw={"projection": ccrs.EqualEarth()})
     axes_flat = axes.flatten()
 
 
@@ -813,7 +813,7 @@ def plot_valuebyalpha_sensitivity(
     fig_width_in  = FIG_WIDTH_IN  # 2 side-by-side panels double width
     fig_height_in = FIG_WIDTH_IN * 1.5
     fig, axes = plt.subplots(1, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
-                             subplot_kw={"projection": ccrs.Robinson()})
+                             subplot_kw={"projection": ccrs.EqualEarth()})
 
     panel_configs = [
         (axes[0], rgba_005, sev_005, ds_005, "a",
@@ -937,7 +937,7 @@ def plot_combined_threshold_sensitivity(
     # 3-row 2-col layout left: value-by-alpha, right: WSBD
     fig_width_in  = FIG_WIDTH_IN        # same column width as all other figures
     fig_height_in = fig_width_in   # 3 rows: approx 3� single-map height
-    proj = ccrs.Robinson()
+    proj = ccrs.EqualEarth()
     fig  = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=dpi)
     gs   = fig.add_gridspec(3, 2, hspace=0.25, wspace=0.05,
                             left=0.01, right=0.99, top=0.97, bottom=0.07)
