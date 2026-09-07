@@ -496,8 +496,8 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     _log_mem("after materializing dref/dhist (single one-time compute)")
 
     # Jitter lower bounds set to a fixed safe value
-    rsds_low = 1
-    wind_low = 1e-3
+    rsds_low = 2
+    wind_low = 1
 
     def remove_constant_locations(da, dim='time'):
         """Drop locations where any single variable is constant or entirely
@@ -608,9 +608,9 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     ADJ = sdba.MBCn.train(
         ref, hist,
         base_kws={"nquantiles": 30, "group": "time"},
-        adj_kws={"interp": "linear", "extrapolation": "constant"},
+        adj_kws={"interp": "linear", "extrapolation": "linear"},
         n_iter=20,
-        n_escore=500,
+        n_escore=1000,
         pts_dim='multivar',
     )
     _log_mem("after MBCn.train")
@@ -732,7 +732,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             hist=hist,
             sim=fut,
             base=sdba.QuantileDeltaMapping,
-            adj_kws={"interp": "linear", "extrapolation": "constant"},
+            adj_kws={"interp": "linear", "extrapolation": "linear"},
         )
 
         adj = sdba.unstack_variables(adj).compute()
@@ -2516,9 +2516,13 @@ if __name__ == "__main__":
     pv_cfg = DEFAULT_PVGIS_COEFFICIENTS
 
     # GCM, run = 'MRI-ESM2-0', 'r1i1p1f1'
-    # GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
+    GCM, run = 'ACCESS-CM2', 'r1i1p1f1'
     #GCM, run = 'CMCC-ESM2', 'r1i1p1f1'
-    GCM, run = 'CanESM5', 'r11i1p1f1'
+    #GCM, run = 'CanESM5', 'r11i1p1f1'
+    GCM, run = 'EC-Earth3-Veg-LR', 'r2i1p1f1'
+    #GCM, run = 'IPSL-CM6A-LR', 'r2i1p1f1'
+    #GCM, run = 'MPI-ESM1-2-LR', 'r5i1p1f1'
+    
     
     # calculate_ds_cf_reanalysis(
     #     path_folder,
