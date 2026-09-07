@@ -34,6 +34,20 @@ def rasterize_shapefile(shapefile, shape, transform):
     )
 
 
+def _parse_exclude_gcm_run(exclude_gcm_run):
+    """
+    'GCM:run' strings -> a {(GCM, run), ...} set, same convention as
+    fig3.py's --exclude_gcm_run. None defaults to config.EXCLUDE_GCM_RUN
+    (e.g. 'EC-Earth3-Veg-LR:r3i1p1f1', whose rsds file under
+    preprocessed_gwl1_aligned/ is truncated to 365 days instead of the
+    expected 7305 -- a data bug, not a borderline trend, confirmed by
+    inspecting that run's raw GWL1 input files directly).
+    """
+    if exclude_gcm_run is None:
+        exclude_gcm_run = config.EXCLUDE_GCM_RUN
+    return set(tuple(x.split(':')) for x in exclude_gcm_run)
+
+
 def _pos_quantile(da, q):
     """q-th quantile of strictly positive values; returns 0 where no positive values exist."""
     pos = da.where(da > 0)
@@ -503,15 +517,19 @@ def stationary_bootstrap_ci_grid(da, n_boot=1000, block_size=5, ci=95,
 # Spatial uncertainty aggregation
 # ---------------------------------------------------------------------------
 
-def uncertainty_range(preprocessed_path, out_dir, reanalysis=None):
+def uncertainty_range(preprocessed_path, out_dir, reanalysis=None, exclude_gcm_run=None):
     """Compute per-GCM bootstrap trend CI on the reanalysis target grid."""
     reanalysis = reanalysis or config.REANALYSIS
+    exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
     wcf_paths = glob_any(os.path.join(preprocessed_path, f'*/wcf_day*_GWL1_{reanalysis}'))
     grid = _target_grid(preprocessed_path, reanalysis)
 
     ds_final = []
     for i, p in enumerate(wcf_paths):
         GCM, run = p.split('_')[-5], p.split('_')[-3]
+        if (GCM, run) in exclude_gcm_run:
+            print(f'    [excluded] {GCM} {run}')
+            continue
         sev = preprocess_single_sev(preprocessed_path, GCM, run, reanalysis)
         low, up, mean = stationary_bootstrap_ci_grid(sev)
         ds = low.to_dataset(name='low_trend')
@@ -527,9 +545,10 @@ def uncertainty_range(preprocessed_path, out_dir, reanalysis=None):
     )
 
 
-def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
+def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None, exclude_gcm_run=None):
     """Bootstrap slope samples for each GCM * region combination."""
     reanalysis = reanalysis or config.REANALYSIS
+    exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
     wcf_paths = sorted(glob_any(os.path.join(preprocessed_path, f'*/wcf_day*_GWL1_{reanalysis}')))
     grid = _target_grid(preprocessed_path, reanalysis)
 
@@ -543,6 +562,9 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None):
     ds_final = []
     for i, p in enumerate(wcf_paths):
         GCM, run = p.split('_')[-5], p.split('_')[-3]
+        if (GCM, run) in exclude_gcm_run:
+            print(f'    [excluded] {GCM} {run}')
+            continue
         sev = preprocess_single_sev(preprocessed_path, GCM, run, reanalysis)
 
         for r in regions:
@@ -708,6 +730,11 @@ if __name__ == '__main__':
         '--max-workers', type=int, default=4,
         help="Worker processes for the ERA5 reference steps' per-GCM regridding (default: 4).",
     )
+    parser.add_argument(
+        '--exclude_gcm_run', nargs='+', default=config.EXCLUDE_GCM_RUN,
+        help="GCM:run pairs to exclude from uncertainty_range/slopes_samples, same convention "
+             "as fig3.py's flag of the same name (default: config.EXCLUDE_GCM_RUN).",
+    )
     args = parser.parse_args()
 
     preprocessed_path = config.PATH_PREPROCESSED
@@ -719,5 +746,5 @@ if __name__ == '__main__':
     preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, max_workers=args.max_workers)
 
     if not args.era5_ref_only:
-        uncertainty_range(preprocessed_path, out_dir)
-        slopes_samples(preprocessed_path, out_dir, shapefile_path)
+        uncertainty_range(preprocessed_path, out_dir, exclude_gcm_run=args.exclude_gcm_run)
+        slopes_samples(preprocessed_path, out_dir, shapefile_path, exclude_gcm_run=args.exclude_gcm_run)
