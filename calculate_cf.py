@@ -1,6 +1,7 @@
 # -*- coding: cp1252 -*-
 import os
 import shutil
+import hashlib
 import config
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 import xesmf as xe
@@ -30,6 +31,7 @@ def _log_mem(msg):
     print(f"[mem] peak RSS so far: {peak_gb:.1f} GB -- {msg}", flush=True)
 from xclim import sdba
 from dask import delayed, compute
+import dask.array.random as dask_random
 import geopandas as gpd
 import xagg as xa
 import rioxarray as rxr
@@ -48,7 +50,9 @@ from io_utils import (
 )
 
 from fit_local_shear import fit_local_shear
-from compute_solar_cf import compute_solar_cf, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS
+from compute_solar_cf import (
+    compute_solar_cf, build_valid_mask, PVGISCoefficients, DEFAULT_PVGIS_COEFFICIENTS,
+)
 
 # Wind capacity-factor physics (power curve + the three wind_method
 # extrapolation strategies) -- kept dependency-light (numpy/xarray only,
@@ -72,6 +76,32 @@ from make_grid_files import compute_severity, duration_xr
 # (_match_files / open_dataset_any / open_mfdataset_any / safe_to_netcdf /
 # safe_to_zarr now live in io_utils.py, imported above, so fig*.py scripts
 # can reuse them without importing this whole module.)
+
+def seed_jitter_rng(*key_parts):
+    """
+    Seed both RNGs sdba.processing.jitter can draw from -- numpy's global
+    state (used when the array being jittered is already materialized, e.g.
+    dref/dhist) and dask.array's default random state (used when it's still
+    lazy, e.g. dfut inside process_gwl_delayed) -- deterministically from
+    `key_parts` (e.g. (GCM, run, ssp) or (GCM, run, ssp, gwl)).
+
+    jitter() is never seeded anywhere upstream (neither numpy nor dask
+    expose a seed argument through xclim's public API), so without this,
+    rerunning the exact same GCM/run/GWL draws different random jitter
+    values each time. Beyond breaking reproducibility, that made the
+    ZeroDivisionError seen in MBCn's escore step (degenerate-reference
+    locations, see build_valid_mask above) look intermittent: whether a
+    borderline location's jittered covariance tips into near-singular
+    depends on which random draws happen to land. Seeding per (GCM, run,
+    ssp[, gwl]) keeps different cases from sharing one fixed pattern while
+    making any single case's own output reproducible across reruns.
+
+    32-bit int required by both np.random.seed and dask's RandomState.seed.
+    """
+    seed = int(hashlib.sha256("|".join(map(str, key_parts)).encode()).hexdigest(), 16) % (2**32)
+    np.random.seed(seed)
+    dask_random.seed(seed)
+
 
 def load_variable(var, GCM, ssp, run, path_folder, gwl, chunks):
     """
@@ -463,6 +493,21 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
 
     mask_array = create_mask_from_shapefile(ref_grid, shapefile)
 
+    # Guard against degenerate ERA5-Land ssrd coverage: conservative_normed
+    # regridding with skipna=True (above) gives a GCM cell a finite rsds
+    # value as long as *any* overlapping ERA5 sub-cell is valid, even if
+    # that's a sliver of coverage near a coastline. MBCn's training then
+    # treats that cell's degenerate reference sample as a real distribution
+    # -- producing physically-impossible bias-adjusted rsds (see
+    # diagnostics/scf_anomaly_diagnosis.ipynb) and, for some GCM grids
+    # (e.g. EC-Earth3-Veg-LR), crashing MBCn's escore with a
+    # ZeroDivisionError. build_valid_mask's erosion buffer catches these:
+    # a cell with zero valid sub-cells (fully-NaN post-regrid rsds) marks
+    # itself *and* its neighbors invalid, which is what actually excludes
+    # the degenerate-but-technically-finite cells next to it.
+    ref_valid = build_valid_mask(dref['rsds'].isel(time=0), buffer_cells=1)
+    mask_array = mask_array & ref_valid
+
     var_units = {'sfcWind': 'm s-1', 'tas': 'K', 'rsds': 'W m-2'}
     dref = dref.where(mask_array)
     dhist = dhist.where(mask_array)
@@ -498,6 +543,11 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     # Jitter lower bounds set to a fixed safe value
     rsds_low = 2
     wind_low = 1
+
+    # See seed_jitter_rng's docstring: dref/dhist are already materialized
+    # above, so their jitter() calls below draw from numpy's global RNG --
+    # seed it here, once, before either call.
+    seed_jitter_rng(GCM, run, ssp, 'ref_hist')
 
     def remove_constant_locations(da, dim='time'):
         """Drop locations where any single variable is constant or entirely
@@ -547,12 +597,12 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             rsds=sdba.processing.to_additive_space(
                 sdba.processing.jitter(ds_obj.rsds,
                                        lower=f"{rsds_low} W m-2", minimum="0 W m-2"),
-                lower_bound=f"{rsds_low} W m-2", trans="log",
+                lower_bound="0 W m-2", trans="log",
             ),
             sfcWind=sdba.processing.to_additive_space(
                 sdba.processing.jitter(ds_obj.sfcWind,
                                        lower=f"{wind_low} m s-1", minimum="0 m s-1"),
-                lower_bound=f"{wind_low} m s-1", trans="log",
+                lower_bound="0 m s-1", trans="log",
             )
         )
         if ds_name == 'dref':
@@ -671,16 +721,28 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
         dfut = dfut.sortby('lat').sortby('lon').sortby('time')
         dfut = dfut.stack(location=("lat", "lon"))
 
+        # dfut is still lazy here (not materialized until the .compute() at
+        # the end of this delayed task), so jitter() below draws from dask's
+        # random state rather than numpy's -- see seed_jitter_rng's
+        # docstring. Seeded per-GWL (not just per GCM/run/ssp) so concurrent
+        # GWL tasks don't share one draw sequence; kept immediately before
+        # the two jitter() calls to minimize the window in which another
+        # concurrently-running GWL task's own seed_jitter_rng call could
+        # race with dask's shared global random state (harmless if it
+        # happens -- both sides still seed with a real value, it would just
+        # cost bit-for-bit reproducibility for that one rerun, not
+        # correctness).
+        seed_jitter_rng(GCM, run, ssp, gwl)
         dfut = dfut.assign(
             rsds=sdba.processing.to_additive_space(
                 sdba.processing.jitter(dfut.rsds,
                                        lower=f"{rsds_low} W m-2", minimum="0 W m-2"),
-                lower_bound=f"{rsds_low} W m-2", trans="log",
+                lower_bound="0 W m-2", trans="log",
             ),
             sfcWind=sdba.processing.to_additive_space(
                 sdba.processing.jitter(dfut.sfcWind,
                                        lower=f"{wind_low} m s-1", minimum="0 m s-1"),
-                lower_bound=f"{wind_low} m s-1", trans="log",
+                lower_bound="0 m s-1", trans="log",
             )
         )
 
