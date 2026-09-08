@@ -547,12 +547,12 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             rsds=sdba.processing.to_additive_space(
                 sdba.processing.jitter(ds_obj.rsds,
                                        lower=f"{rsds_low} W m-2", minimum="0 W m-2"),
-                lower_bound="0 W m-2", trans="log",
+                lower_bound=f"{rsds_low} W m-2", trans="log",
             ),
             sfcWind=sdba.processing.to_additive_space(
                 sdba.processing.jitter(ds_obj.sfcWind,
                                        lower=f"{wind_low} m s-1", minimum="0 m s-1"),
-                lower_bound="0 m s-1", trans="log",
+                lower_bound=f"{wind_low} m s-1", trans="log",
             )
         )
         if ds_name == 'dref':
@@ -675,12 +675,12 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             rsds=sdba.processing.to_additive_space(
                 sdba.processing.jitter(dfut.rsds,
                                        lower=f"{rsds_low} W m-2", minimum="0 W m-2"),
-                lower_bound="0 W m-2", trans="log",
+                lower_bound=f"{rsds_low} W m-2", trans="log",
             ),
             sfcWind=sdba.processing.to_additive_space(
                 sdba.processing.jitter(dfut.sfcWind,
                                        lower=f"{wind_low} m s-1", minimum="0 m s-1"),
-                lower_bound="0 m s-1", trans="log",
+                lower_bound=f"{wind_low} m s-1", trans="log",
             )
         )
 
