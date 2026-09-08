@@ -48,6 +48,19 @@ import cmocean as cmo
 # =============================================================================
 FIG_WIDTH_IN = 5.15   # single column width pt fontsizes match LaTeX
 
+# Latitude band shown on EqualEarth maps in this module (matches the
+# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
+# and 58S were excluded due to artifacts in the duration metric"). Applied
+# by masking data/shapefiles to this band and calling ax.set_global() --
+# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
+# it clips to the bounding rectangle of the extent box's own corners, whose
+# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
+# themselves, sitting well short of it at other latitudes -- slicing
+# through real land (e.g. eastern Australia) even though it's nominally
+# within +/-180 deg longitude.
+MAP_LAT_SOUTH = -58
+MAP_LAT_NORTH = 68
+
 # =============================================================================
 # CLI arguments
 # =============================================================================
@@ -470,6 +483,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
 
     # --- 7. Draw map ---
     shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     ax_map.imshow(
         rgba_map,
         extent=[sev.lon.min().item(), sev.lon.max().item(),
@@ -478,13 +492,14 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         interpolation="nearest", rasterized=True,
     )
 
-    da_mask = ds_final.frequency.isel(year=0)
+    da_mask = ds_final.frequency.isel(year=0).sel(
+        lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
     t_mask  = rasterio.transform.from_bounds(
         da_mask.lon.min().item(), da_mask.lat.min().item(),
         da_mask.lon.max().item(), da_mask.lat.max().item(),
         len(da_mask.lon), len(da_mask.lat),
     )
-    land_mask  = rasterize_shapefile(shp, da_mask.shape, t_mask)
+    land_mask  = rasterize_shapefile(shp_band, da_mask.shape, t_mask)
     land_mask  = land_mask[::-1, :]
     ocean_mask = land_mask & (da_mask.isnull())
     ax_map.contourf(
@@ -492,8 +507,8 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         levels=[0.5, 1], colors=["gray"],
         transform=ccrs.PlateCarree(), zorder=5,
     )
-    shp.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
-                      transform=ccrs.PlateCarree(), zorder=10)
+    shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
+                           transform=ccrs.PlateCarree(), zorder=10)
     ax_map.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
     ax_map.annotate(
         "$\\mathbf{a}$",
@@ -589,7 +604,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         #ax_ts.set_title(rinfo['name'], fontsize=6)
 
     ax_map.spines["geo"].set_visible(False)
-    ax_map.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax_map.set_global()
     plt.tight_layout()
     return fig
 
@@ -600,8 +615,9 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
 
 def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
     shapefile = gpd.read_file(shapefile_path)
+    shapefile_band = shapefile.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     pdd     = (ds_final.frequency * ds_final.severity * ds_final.duration).where(mask)
-    std_pdd = pdd.std(dim="year")
+    std_pdd = pdd.std(dim="year").sel(lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
 
     fig_width_in  = FIG_WIDTH_IN
     fig_height_in = fig_width_in * (6 / 12)
@@ -612,26 +628,26 @@ def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
         transform=ccrs.PlateCarree(),
         cmap=cmo.cm.amp, vmin=0, vmax=0.25, rasterized=True,
     )
-    da_mask = ds_final.frequency.isel(year=0)
+    da_mask = ds_final.frequency.isel(year=0).sel(
+        lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
     t_mask  = rasterio.transform.from_bounds(
         da_mask.lon.min().item(), da_mask.lat.min().item(),
         da_mask.lon.max().item(), da_mask.lat.max().item(),
         len(da_mask.lon), len(da_mask.lat),
     )
-    mask_plot = rasterize_shapefile(shapefile, da_mask.shape, t_mask)
+    mask_plot = rasterize_shapefile(shapefile_band, da_mask.shape, t_mask)
     mask_plot = mask_plot[::-1, :] & (da_mask.isnull())
     ax.contourf(mask_plot.lon, mask_plot.lat, mask_plot.values.astype(float),
                 levels=[0.5, 1], colors=["gray"],
                 transform=ccrs.PlateCarree(), zorder=5)
-    shapefile.boundary.plot(ax=ax, color="black", linewidth=0.15,
-                            transform=ccrs.PlateCarree(), zorder=10)
+    shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                                 transform=ccrs.PlateCarree(), zorder=10)
     ax.set_global()
     cbar = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.6, aspect=40)
     cbar.set_label("Interannual variability", fontsize=6)
     cbar.ax.tick_params(labelsize=5)
     ax.set_title("Interannual variability of annual severity (1982-2021)",
                  fontsize=8, fontweight="bold")
-    ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
     plt.tight_layout()
     return fig
 
@@ -644,29 +660,35 @@ def plot_mean_variables_6panel(
     ds_final, mask, shapefile_path, path_preprocessed, reanalysis,
     ref_start="1982-01-01", ref_end="2001-12-31",
 ):
+    lat_south, lat_north = -60, 68
     shapefile      = gpd.read_file(shapefile_path)
+    shapefile_band = shapefile.cx[:, lat_south:lat_north]
     ref_label      = f"{pd.Timestamp(ref_start).year}-{pd.Timestamp(ref_end).year}"
     ref_start_year = pd.Timestamp(ref_start).year
     ref_end_year   = pd.Timestamp(ref_end).year
 
     freq_mean    = ds_final.frequency.where(mask == 1).sel(
-        year=slice(ref_start_year, ref_end_year)).mean("year")
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
     dur_mean     = ds_final.duration.where(mask == 1).sel(
-        year=slice(ref_start_year, ref_end_year)).mean("year")
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
     int_mean     = ds_final.severity.where(mask == 1).sel(
-        year=slice(ref_start_year, ref_end_year)).mean("year")
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
     ann_sev_mean = (ds_final.frequency * ds_final.severity * ds_final.duration).where(
-        mask == 1).sel(year=slice(ref_start_year, ref_end_year)).mean("year")
+        mask == 1).sel(year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
     std_pdd = (ds_final.frequency * ds_final.severity * ds_final.duration).where(
-        mask == 1).std(dim="year")
+        mask == 1).std(dim="year").sel(lat=slice(lat_south, lat_north))
 
-    da_comp = ds_final.frequency.isel(year=0)
+    da_comp = ds_final.frequency.isel(year=0).sel(lat=slice(lat_south, lat_north))
     t_comp  = rasterio.transform.from_bounds(
         da_comp.lon.min().item(), da_comp.lat.min().item(),
         da_comp.lon.max().item(), da_comp.lat.max().item(),
         len(da_comp.lon), len(da_comp.lat),
     )
-    land_mask_comp  = rasterize_shapefile(shapefile, da_comp.shape, t_comp)[::-1, :]
+    land_mask_comp  = rasterize_shapefile(shapefile_band, da_comp.shape, t_comp)[::-1, :]
     ocean_mask_comp = land_mask_comp & (da_comp.isnull())
 
     print(f"  Loading wcf/scf for 6-panel map (ref: {ref_start}-{ref_end})  ")
@@ -674,16 +696,16 @@ def plot_mean_variables_6panel(
     scf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "scf_day_*"))
     chunks   = {"time": 1000, "lat": -1, "lon": -1}
     wcf_ref  = open_dataset_any(wcf_files[0], chunks=chunks).sel(
-        lat=slice(-58, 68), time=slice(ref_start, ref_end))
+        lat=slice(lat_south, lat_north), time=slice(ref_start, ref_end))
     scf_ref  = open_dataset_any(scf_files[0], chunks=chunks).sel(
-        lat=slice(-58, 68), time=slice(ref_start, ref_end))
+        lat=slice(lat_south, lat_north), time=slice(ref_start, ref_end))
     da_wcf   = wcf_ref.wcf.isel(time=0)
     t_wcf    = rasterio.transform.from_bounds(
         da_wcf.lon.min().item(), da_wcf.lat.min().item(),
         da_wcf.lon.max().item(), da_wcf.lat.max().item(),
         len(da_wcf.lon), len(da_wcf.lat),
     )
-    land_mask_wcf = rasterize_shapefile(shapefile, da_wcf.shape, t_wcf)[::-1, :]
+    land_mask_wcf = rasterize_shapefile(shapefile_band, da_wcf.shape, t_wcf)[::-1, :]
     wcf_mean = wcf_ref.wcf.mean(dim="time").where(land_mask_wcf)
     scf_mean = scf_ref.scf.mean(dim="time").where(land_mask_wcf)
 
@@ -691,12 +713,12 @@ def plot_mean_variables_6panel(
     title_list = [
         "Frequency", "Duration",
         "Intensity", "Annual WSED severity",
-        "Wind capacity\nfactor",     "Solar capacity\nfactor",
+        "Wind Capacity\nFactor",     "Solar Capacity\nFactor",
         "Interannual variability of\nannual severity",
     ]
     legend_list = [
         "Events/yr", "Days/event", "Intensity/day of event",
-        "Annual WSED severity", "Wind CF", "Solar CF", "Std of annual severity",
+        "Annual WSED severity", "Wind Capacity Factor", "Solar Capacity Factor", "Std of annual severity",
     ]
     cmap_list = [
         cmo.cm.solar.reversed(), cmo.cm.matter, cmo.cm.dense,
@@ -738,8 +760,8 @@ def plot_mean_variables_6panel(
                          "pad": 0.05, "label": legend_list[idx]},
             rasterized=True, linewidth=0,
         )
-        shapefile.boundary.plot(ax=ax, color="black", linewidth=0.1,
-                                transform=ccrs.PlateCarree())
+        shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.1,
+                                     transform=ccrs.PlateCarree())
         ax.annotate(
             f"$\\mathbf{{{panellabels[idx]}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
@@ -750,7 +772,6 @@ def plot_mean_variables_6panel(
         cbar_ax = fig.axes[-1]
         cbar_ax.set_xlabel(legend_list[idx], fontsize=5)
         cbar_ax.tick_params(labelsize=5)
-        ax.set_extent([-180, 180, -60, 68], crs=ccrs.PlateCarree())
         ax.spines["geo"].set_visible(False)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -803,6 +824,7 @@ def plot_valuebyalpha_sensitivity(
     n_bins_change=5, n_bins_sev=5,
 ):
     shapefile = gpd.read_file(shapefile_path)
+    shapefile_band = shapefile.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     rgba_005, _, sev_005, color_levels, alpha_levels, sev_edges, change_edges = \
         _compute_valuebyalpha_rgba(ds_005, mask_005, period_hist, period_comp,
                                    n_bins_change, n_bins_sev)
@@ -829,19 +851,20 @@ def plot_valuebyalpha_sensitivity(
             origin="lower", transform=ccrs.PlateCarree(),
             interpolation="nearest", rasterized=True,
         )
-        da_m  = ds_src.frequency.isel(year=0)
+        da_m  = ds_src.frequency.isel(year=0).sel(
+            lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
         t_m   = rasterio.transform.from_bounds(
             da_m.lon.min().item(), da_m.lat.min().item(),
             da_m.lon.max().item(), da_m.lat.max().item(),
             len(da_m.lon), len(da_m.lat),
         )
-        land_m  = rasterize_shapefile(shapefile, da_m.shape, t_m)[::-1, :]
+        land_m  = rasterize_shapefile(shapefile_band, da_m.shape, t_m)[::-1, :]
         ocean_m = land_m & (da_m.isnull())
         ax.contourf(ocean_m.lon, ocean_m.lat, ocean_m.values.astype(float),
                     levels=[0.5, 1], colors=["gray"],
                     transform=ccrs.PlateCarree(), zorder=5)
-        shapefile.boundary.plot(ax=ax, color="black", linewidth=0.15,
-                                transform=ccrs.PlateCarree(), zorder=10)
+        shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                                     transform=ccrs.PlateCarree(), zorder=10)
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
@@ -849,7 +872,7 @@ def plot_valuebyalpha_sensitivity(
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
         ax.set_title(title, fontsize=8)
-        ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+        ax.set_global()
         ax.spines["geo"].set_visible(False)
 
     # Shared bivariate legend
@@ -909,6 +932,7 @@ def plot_combined_threshold_sensitivity(
     n_bins_change=5, n_bins_sev=5, dpi=300,
 ):
     shapefile = gpd.read_file(shapefile_path)
+    shapefile_band = shapefile.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
 
     rgba_005, _, sev_005, color_levels, alpha_levels, sev_edges, change_edges = \
         _compute_valuebyalpha_rgba(ds_005, mask_005, period_hist, period_comp,
@@ -933,6 +957,7 @@ def plot_combined_threshold_sensitivity(
     norm_wsbd = mcolors.Normalize(vmin=-100, vmax=800)
     gdf_re   = gpd.read_file(shapefile_path)
     gdf_re["poly_idx"] = gdf_re.index
+    gdf_re_band = gdf_re.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
 
     # 3-row 2-col layout left: value-by-alpha, right: WSBD
     fig_width_in  = FIG_WIDTH_IN        # same column width as all other figures
@@ -961,19 +986,20 @@ def plot_combined_threshold_sensitivity(
             origin="lower", transform=ccrs.PlateCarree(),
             interpolation="nearest", rasterized=True,
         )
-        da_m = ds_src.frequency.isel(year=0)
+        da_m = ds_src.frequency.isel(year=0).sel(
+            lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
         t_m  = rasterio.transform.from_bounds(
             da_m.lon.min().item(), da_m.lat.min().item(),
             da_m.lon.max().item(), da_m.lat.max().item(),
             len(da_m.lon), len(da_m.lat),
         )
-        land_m  = rasterize_shapefile(shapefile, da_m.shape, t_m)[::-1, :]
+        land_m  = rasterize_shapefile(shapefile_band, da_m.shape, t_m)[::-1, :]
         ocean_m = land_m & (da_m.isnull())
         ax.contourf(ocean_m.lon, ocean_m.lat, ocean_m.values.astype(float),
                     levels=[0.5, 1], colors=["gray"],
                     transform=ccrs.PlateCarree(), zorder=5)
-        shapefile.boundary.plot(ax=ax, color="black", linewidth=0.15,
-                                transform=ccrs.PlateCarree(), zorder=10)
+        shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                                     transform=ccrs.PlateCarree(), zorder=10)
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
@@ -983,7 +1009,7 @@ def plot_combined_threshold_sensitivity(
         )
         ax.set_title(f"{thr_label}", fontsize=6,
                      color=REF_COLOR if is_ref else "black")
-        ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+        ax.set_global()
         ax.spines["geo"].set_visible(False)
         if is_ref:
             try:
@@ -1020,7 +1046,7 @@ def plot_combined_threshold_sensitivity(
         (axes_right[2], mmm_995, "f", "RL thr = 0.995",             False),
     ]
     for ax, mmm, letter, thr_label, is_ref in right_cfgs:
-        gdf  = gdf_re.copy().merge(mmm, on="poly_idx", how="left")
+        gdf  = gdf_re_band.copy().merge(mmm, on="poly_idx", how="left")
         vals = gdf["Combined_Effect"].to_numpy()
         fcs  = [cmap_wsbd(norm_wsbd(v)) if np.isfinite(v) else (0.8, 0.8, 0.8, 1.0)
                 for v in vals]
@@ -1029,9 +1055,9 @@ def plot_combined_threshold_sensitivity(
                 continue
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
                               facecolor=fc, edgecolor="none", zorder=2)
-        shapefile.boundary.plot(ax=ax, color="black", linewidth=0.15,
-                                transform=ccrs.PlateCarree(), zorder=10)
-        ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+        shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                                     transform=ccrs.PlateCarree(), zorder=10)
+        ax.set_global()
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",

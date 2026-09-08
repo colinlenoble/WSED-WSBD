@@ -43,6 +43,19 @@ import cmocean as cmo
 # =============================================================================
 FIG_WIDTH_IN = 5.15   # column width - fontsizes in pt will match LaTeX
 
+# Latitude band shown on EqualEarth maps in this module (matches the
+# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
+# and 58S were excluded due to artifacts in the duration metric"). Applied
+# by masking data/shapefiles to this band and calling ax.set_global() --
+# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
+# it clips to the bounding rectangle of the extent box's own corners, whose
+# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
+# themselves, sitting well short of it at other latitudes -- slicing
+# through real land (e.g. eastern Australia) even though it's nominally
+# within +/-180 deg longitude.
+MAP_LAT_SOUTH = -58
+MAP_LAT_NORTH = 68
+
 # =============================================================================
 # CLI arguments
 # =============================================================================
@@ -692,6 +705,7 @@ def plot_gwl_valuebyalpha_discrete(
 
     # --- 7. Draw map ---
     shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     ax_map.imshow(
         rgba_map,
         extent=[severity.lon.min().item(), severity.lon.max().item(),
@@ -702,13 +716,14 @@ def plot_gwl_valuebyalpha_discrete(
         rasterized=True,
     )
 
-    da_mask = da_ref_freq.isel(realization=0)
+    da_mask = da_ref_freq.isel(realization=0).sel(
+        lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
     t_mask  = rasterio.transform.from_bounds(
         da_mask.lon.min().item(), da_mask.lat.min().item(),
         da_mask.lon.max().item(), da_mask.lat.max().item(),
         len(da_mask.lon), len(da_mask.lat),
     )
-    land_shp   = rasterize_shapefile(shp, da_mask.shape, t_mask)
+    land_shp   = rasterize_shapefile(shp_band, da_mask.shape, t_mask)
     land_shp   = land_shp[::-1, :]
     # Dark grey layer: land pixels with no wind potential
     # Prefer the ERA5 historical null mask (hist_null_da); fall back to GCM baseline mask.
@@ -727,13 +742,14 @@ def plot_gwl_valuebyalpha_discrete(
         levels=[0.5, 1], colors=["#404040"],
         transform=ccrs.PlateCarree(), zorder=5,
     )
-    shp.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
-                      transform=ccrs.PlateCarree(), zorder=10)
+    shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
+                           transform=ccrs.PlateCarree(), zorder=10)
 
     if hatchings is not None:
+        hatchings_band = hatchings.sel(lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
         ax_map.contourf(
-            hatchings.lon, hatchings.lat,
-            (hatchings <= agreement_threshold).values.astype(float),
+            hatchings_band.lon, hatchings_band.lat,
+            (hatchings_band <= agreement_threshold).values.astype(float),
             transform=ccrs.PlateCarree(),
             colors="none", levels=[0.5, 1.5],
             hatches=[21 * "/", 21 * "/"], zorder=8,
@@ -751,7 +767,7 @@ def plot_gwl_valuebyalpha_discrete(
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_map.set_title(map_title, fontsize=7, pad=6)
-    ax_map.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax_map.set_global()
     ax_map.spines["geo"].set_visible(False)
 
     # --- 8. Legend block ---
@@ -912,6 +928,9 @@ def plot_supp_valuebyalpha_stacked(
         sev_edges = np.linspace(0, 1.0, n_bins_sev + 1) ** 2
 
     shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
+    lat_ok = (da_mask_ref.lat >= MAP_LAT_SOUTH) & (da_mask_ref.lat <= MAP_LAT_NORTH)
+    no_wind_mask_band = no_wind_mask.astype(float) * lat_ok.values[:, None]
     n   = len(gwl_items)
 
     # LaTeX-compatible width; height scales with number of rows
@@ -941,17 +960,18 @@ def plot_supp_valuebyalpha_stacked(
             rasterized=True,
         )
         ax.contourf(
-            da_mask_ref.lon, da_mask_ref.lat, no_wind_mask.astype(float),
+            da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
             levels=[0.5, 1], colors=["#404040"],
             transform=ccrs.PlateCarree(), zorder=5,
         )
-        shp.boundary.plot(ax=ax, color="black", linewidth=0.15,
-                          transform=ccrs.PlateCarree(), zorder=10)
+        shp_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                               transform=ccrs.PlateCarree(), zorder=10)
 
         if hatchings is not None:
+            hatchings_band = hatchings.sel(lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
             ax.contourf(
-                hatchings.lon, hatchings.lat,
-                (hatchings <= agreement_threshold).values.astype(float),
+                hatchings_band.lon, hatchings_band.lat,
+                (hatchings_band <= agreement_threshold).values.astype(float),
                 transform=ccrs.PlateCarree(),
                 colors="none", levels=[0.5, 1.5],
                 hatches=[21 * "/", 21 * "/"], zorder=8,
@@ -967,7 +987,7 @@ def plot_supp_valuebyalpha_stacked(
             zorder=1000,
         )
         ax.set_title(panel_gwl, fontsize=8)
-        ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+        ax.set_global()
         ax.spines["geo"].set_visible(False)
 
         # Inset legend

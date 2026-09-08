@@ -36,6 +36,19 @@ import cartopy.feature as cfeature
 # =============================================================================
 FIG_WIDTH_IN = 5.15   # single column width � pt fontsizes match LaTeX
 
+# Latitude band shown on EqualEarth maps in this module (matches the
+# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
+# and 58S were excluded due to artifacts in the duration metric"). Applied
+# by masking data/shapefiles to this band and calling ax.set_global() --
+# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
+# it clips to the bounding rectangle of the extent box's own corners, whose
+# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
+# themselves, sitting well short of it at other latitudes -- slicing
+# through real land (e.g. eastern Australia) even though it's nominally
+# within +/-180 deg longitude.
+MAP_LAT_SOUTH = -58
+MAP_LAT_NORTH = 68
+
 # =============================================================================
 # PATHS
 # =============================================================================
@@ -384,7 +397,13 @@ def _make_cmap(vmin=-100, vmax=800):
 
 def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
               title, panel_letter, density=7, title_fontsize=8):
-    gdf2 = gdf.copy()
+    # Restrict to the analysis's latitude band here (rather than trusting
+    # every caller to have already done so) -- this is the single chokepoint
+    # all _draw_map() callers go through, and set_extent() below has been
+    # replaced with set_global(), so nothing but this filter keeps
+    # Antarctica (which has no data, so would draw as a hatched/white "no
+    # data" polygon) out of the figure. See MAP_LAT_SOUTH/NORTH above.
+    gdf2 = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH].copy()
     if "var" not in gdf2.columns:
         gdf2 = gdf2.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
     gdf2["do_hatch"] = gdf2["var"].lt(16).fillna(False)
@@ -406,7 +425,7 @@ def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
                               facecolor="none", edgecolor="black",
                               linewidth=0.0, hatch=hp, zorder=4)
-    ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax.set_global()
     try:
         ax.spines["geo"].set_visible(False)
     except KeyError:
@@ -744,6 +763,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
     gdf = (gdf.merge(df[["poly_idx", "ratio"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
     gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+    gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
 
     cmap_c = plt.get_cmap("PiYG_r")
     norm_c = mcolors.Normalize(vmin=0, vmax=1)
@@ -772,7 +792,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
                               facecolor="none", edgecolor="black",
                               linewidth=0.0, hatch=hp, zorder=4)
-    ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax.set_global()
     try:
         ax.spines["geo"].set_visible(False)
     except KeyError:
@@ -1014,6 +1034,7 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
     df_mix["map_color"] = df_mix.apply(_assign_color, axis=1)
     gdf_diff = gpd.read_file(shapefile_path)
     gdf_diff["poly_idx"] = gdf_diff.index
+    gdf_diff = gdf_diff.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     color_map = dict(zip(df_mix["poly_idx"], df_mix["map_color"]))
     no_data_mask = gdf_diff["poly_idx"].map(color_map).isna()
     gdf_diff["color"] = gdf_diff["poly_idx"].map(color_map).fillna("white")
@@ -1034,7 +1055,7 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
                                facecolor="none", edgecolor="black",
                                linewidth=0.0, hatch=7 * "///", zorder=4)
 
-    ax2.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax2.set_global()
     try:
         ax2.spines["geo"].set_visible(False)
     except KeyError:
@@ -1083,6 +1104,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
     gdf = (gdf.merge(df_unc[["poly_idx", "ratio"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
     gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+    gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     cmap_c = plt.get_cmap("PiYG_r")
     norm_c = mcolors.Normalize(vmin=0, vmax=1)
 
@@ -1110,7 +1132,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
                               facecolor="none", edgecolor="black",
                               linewidth=0.0, hatch=hp, zorder=4)
-    ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax.set_global()
     try:
         ax.spines["geo"].set_visible(False)
     except KeyError:
@@ -1153,6 +1175,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     gdf = (gdf.merge(df_var[["poly_idx", "RE_Std"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
     gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+    gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     cmap_c = plt.get_cmap("Reds")
     vmax   = np.nanpercentile(df_var["RE_Std"].dropna().values, 95)
     norm_c = mcolors.Normalize(vmin=0, vmax=vmax)
@@ -1181,7 +1204,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
                               facecolor="none", edgecolor="black",
                               linewidth=0.0, hatch=hp, zorder=4)
-    ax.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax.set_global()
     try:
         ax.spines["geo"].set_visible(False)
     except KeyError:
@@ -1341,6 +1364,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
              .merge(df_dec[["poly_idx", "ratio"]], on="poly_idx", how="left")
              .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
     gdf_c["do_hatch"] = gdf_c["var"].lt(16).fillna(False)
+    gdf_c = gdf_c.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     vals_c   = gdf_c["ratio"].to_numpy()
     nan_c    = ~np.isfinite(vals_c)
     fcs_c    = [(1.0, 1.0, 1.0, 1.0) if n else cmap_ratio(norm_ratio(v))
@@ -1360,7 +1384,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
             ax_c.add_geometries([geom], crs=ccrs.PlateCarree(),
                                 facecolor="none", edgecolor="black",
                                 linewidth=0.0, hatch=hp, zorder=4)
-    ax_c.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax_c.set_global()
     try:
         ax_c.spines["geo"].set_visible(False)
     except KeyError:
@@ -1397,6 +1421,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
              .merge(df_unc[["poly_idx", "ratio"]], on="poly_idx", how="left")
              .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
     gdf_d["do_hatch"] = gdf_d["var"].lt(16).fillna(False)
+    gdf_d = gdf_d.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     vals_d   = gdf_d["ratio"].to_numpy()
     nan_d    = ~np.isfinite(vals_d)
     fcs_d    = [(1.0, 1.0, 1.0, 1.0) if n else cmap_ratio(norm_ratio(v))
@@ -1416,7 +1441,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
             ax_d.add_geometries([geom], crs=ccrs.PlateCarree(),
                                 facecolor="none", edgecolor="black",
                                 linewidth=0.0, hatch=hp, zorder=4)
-    ax_d.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax_d.set_global()
     try:
         ax_d.spines["geo"].set_visible(False)
     except KeyError:

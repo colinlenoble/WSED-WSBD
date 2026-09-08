@@ -370,7 +370,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     Each GWL is processed as a true Dask delayed task; all tasks are submitted
     before any computation starts, so they can run in parallel on the cluster.
     """
-    print("Starting unbias_GCM function")
+    print(f"Starting unbias_GCM function for GCM={GCM}, run={run}")
     _log_mem("start of unbias_GCM")
 
     gwl_unbias = []
@@ -541,8 +541,8 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     _log_mem("after materializing dref/dhist (single one-time compute)")
 
     # Jitter lower bounds set to a fixed safe value
-    rsds_low = 2
-    wind_low = 1
+    rsds_low = 1
+    wind_low = 1e-3
 
     # See seed_jitter_rng's docstring: dref/dhist are already materialized
     # above, so their jitter() calls below draw from numpy's global RNG --
@@ -658,9 +658,9 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
     ADJ = sdba.MBCn.train(
         ref, hist,
         base_kws={"nquantiles": 30, "group": "time"},
-        adj_kws={"interp": "linear", "extrapolation": "linear"},
+        adj_kws={"interp": "linear", "extrapolation": "constant"},
         n_iter=20,
-        n_escore=1000,
+        n_escore=500,
         pts_dim='multivar',
     )
     _log_mem("after MBCn.train")
@@ -794,7 +794,7 @@ def unbias_GCM(GCM, run, ssp, path_preprocessed, shapefile_path, path_folder, gw
             hist=hist,
             sim=fut,
             base=sdba.QuantileDeltaMapping,
-            adj_kws={"interp": "linear", "extrapolation": "linear"},
+            adj_kws={"interp": "linear", "extrapolation": "constant"},
         )
 
         adj = sdba.unstack_variables(adj).compute()

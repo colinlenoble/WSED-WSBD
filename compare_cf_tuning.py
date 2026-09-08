@@ -54,11 +54,21 @@ docstring) -- config.ERA5_REGRID_ZARR2_DIR, dependency-light imports
 geopandas or cartopy -- this script has no maps).
 
 Outputs (under --out_dir):
-  cf_tuning_severity_summary.csv          -- one row per non-default config
-                                              (group, R2, MAE, RMSE,
-                                              relative_RMSE_pct, Spearman
-                                              rho/p-value, n_pixels,
-                                              axis-mismatch counts)
+  cf_tuning_severity_summary.csv          -- one row per non-default config,
+                                              each compared against its
+                                              `reference` config (group,
+                                              config, reference, R2, MAE,
+                                              RMSE, relative_RMSE_pct,
+                                              Spearman rho/p-value, n_pixels,
+                                              axis-mismatch counts), plus a
+                                              "wind_pairwise" group of extra
+                                              wind-alternative-vs-alternative
+                                              rows (currently just
+                                              shear_uniform vs. wind100 --
+                                              shear_local vs. wind100 is
+                                              already the "wind" group's
+                                              "wind100" row, since
+                                              shear_local is the default)
   cf_tuning_severity_effect_summary.png   -- 2-panel bar chart (RMSE,
                                               relative RMSE) of every config
                                               vs. its family default,
@@ -326,8 +336,11 @@ def _rel_change(sev, ref_start_year, ref_end_year):
 
 
 def compute_group_summary(group, severities, other_names, reference, ref_period, axis_thr=1e-6):
-    """One summary row per non-default config in `other_names`, all compared
-    against `severities[reference]` (that group's own family default)."""
+    """One summary row per config in `other_names`, all compared against
+    `severities[reference]` -- usually that group's own family default, but
+    `reference` can be any other key in `severities` (see
+    compute_wind_pairwise_summary, which compares two non-default wind
+    configs directly instead of each against "default")."""
     mean_severity = {n: severities[n].mean(dim="year") for n in [reference, *other_names]}
     ref_start_year = int(pd.Timestamp(ref_period[0]).year)
     ref_end_year = int(pd.Timestamp(ref_period[1]).year)
@@ -347,7 +360,7 @@ def compute_group_summary(group, severities, other_names, reference, ref_period,
         rho, pval = stats.spearmanr(x[valid], y[valid]) if valid.sum() > 1 else (np.nan, np.nan)
 
         rows.append(dict(
-            group=group, config=name,
+            group=group, config=name, reference=reference,
             R2_mean_severity=r2,
             MAE_mean_severity=_mae(ref_vals, pred_vals),
             RMSE_mean_severity=_rmse(ref_vals, pred_vals),
@@ -359,6 +372,19 @@ def compute_group_summary(group, severities, other_names, reference, ref_period,
             n_axis_y_ref_gt0_config0=axis_y,
         ))
     return pd.DataFrame(rows)
+
+
+def compute_wind_pairwise_summary(severities_wind, ref_period):
+    """Extra rows comparing wind hub-height extrapolation alternatives
+    directly against each other, in addition to each-vs-"default"
+    (shear_local) already covered by the "wind" group:
+      - "uniform_vs_wind100": shear_uniform vs. wind100 (neither is the
+        pipeline default; both are alternatives to shear_local).
+    "local vs 100m" is NOT recomputed here -- DEFAULT_DS_CF_CONFIG already
+    uses wind_method="shear_local", so it's exactly the "wind" group's
+    existing config="wind100" row (reference="default")."""
+    return compute_group_summary(
+        "wind_pairwise", severities_wind, ["wind100"], "shear_uniform", ref_period)
 
 
 # =============================================================================
@@ -441,15 +467,18 @@ def analyze_all(ds, alpha, ref_period, quantile, out_dir, skip_zero_diagnostics=
     df_solar = compute_group_summary("solar", severities_solar, solar_names, REFERENCE, ref_period)
 
     summary = pd.concat([df_wind, df_zero, df_solar], ignore_index=True)
-    summary_path = os.path.join(out_dir, "cf_tuning_severity_summary.csv")
-    summary.to_csv(summary_path, index=False)
-    print("\n" + summary.to_string(index=False))
-    print("Wrote", summary_path)
 
     plot_severity_effect_summary(
         summary, os.path.join(out_dir, "cf_tuning_severity_effect_summary.png"))
 
-    return summary
+    df_wind_pairwise = compute_wind_pairwise_summary(severities_wind, ref_period)
+    summary_full = pd.concat([summary, df_wind_pairwise], ignore_index=True)
+    summary_path = os.path.join(out_dir, "cf_tuning_severity_summary.csv")
+    summary_full.to_csv(summary_path, index=False)
+    print("\n" + summary_full.to_string(index=False))
+    print("Wrote", summary_path)
+
+    return summary_full
 
 
 # =============================================================================

@@ -144,29 +144,32 @@ def plot_red_period_change(
     Column 3 of every row is the absolute difference (comp minus hist).
     """
     shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, lat_min:lat_max]
     y0, y1 = period_hist
     y2, y3 = period_comp
 
-    template_da = ds_final["frequency"].isel(year=0)
+    template_da = ds_final["frequency"].isel(year=0).sel(lat=slice(lat_min, lat_max))
     t_ref = rasterio.transform.from_bounds(
         template_da.lon.min().item(), template_da.lat.min().item(),
         template_da.lon.max().item(), template_da.lat.max().item(),
         len(template_da.lon), len(template_da.lat),
     )
-    land_mask_full = rasterize_shapefile(shp, template_da.shape, t_ref)[::-1, :]
-    ocean_mask = land_mask_full & (mask == 0)
+    land_mask_full = rasterize_shapefile(shp_band, template_da.shape, t_ref)[::-1, :]
+    mask_band = mask.sel(lat=template_da.lat, lon=template_da.lon)
+    ocean_mask = land_mask_full & (mask_band.values == 0)
 
     # --- Row 0: longest single event ---
     longest_hist = compute_longest_event_duration(df_events_dedup, template_da, period_hist)
     longest_comp = compute_longest_event_duration(df_events_dedup, template_da, period_comp)
-    longest_hist = longest_hist.where(mask == 1)
-    longest_comp = longest_comp.where(mask == 1)
+    longest_hist = longest_hist.where(mask_band == 1)
+    longest_comp = longest_comp.where(mask_band == 1)
     longest_diff = longest_comp - longest_hist
 
     # --- Rows 1-2: event count per decade above each duration threshold ---
     freq_rows = []
     for thr in duration_thresholds:
-        da_thr = ds_final["n_events_gt_duration"].sel(duration_threshold=thr).where(mask == 1)
+        da_thr = ds_final["n_events_gt_duration"].sel(duration_threshold=thr).sel(
+            lat=slice(lat_min, lat_max)).where(mask_band == 1)
         f_hist = da_thr.sel(year=slice(y0, y1)).mean("year") * 10.0
         f_comp = da_thr.sel(year=slice(y2, y3)).mean("year") * 10.0
         freq_rows.append((f_hist, f_comp, f_comp - f_hist))
@@ -230,8 +233,8 @@ def plot_red_period_change(
                 transform=ccrs.PlateCarree(), cmap=cmap, norm=norm,
                 rasterized=True, zorder=3,
             )
-            shp.boundary.plot(ax=ax, color="black", linewidth=0.1,
-                               transform=ccrs.PlateCarree(), zorder=6)
+            shp_band.boundary.plot(ax=ax, color="black", linewidth=0.1,
+                                   transform=ccrs.PlateCarree(), zorder=6)
             if ticks is not None:
                 cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", shrink=0.7,
                                      pad=0.05, ticks=ticks)
@@ -249,7 +252,6 @@ def plot_red_period_change(
             )
             if r == 0:
                 ax.set_title(col_titles[c], fontsize=6)
-            ax.set_extent([-180, 180, lat_min, lat_max], crs=ccrs.PlateCarree())
             ax.spines["geo"].set_visible(False)
 
     fig.suptitle(

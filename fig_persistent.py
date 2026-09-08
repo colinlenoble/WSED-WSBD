@@ -66,6 +66,19 @@ import cmocean as cmo
 # =============================================================================
 FIG_WIDTH_IN = 5.15   # single column width : pt fontsizes match LaTeX
 
+# Latitude band shown on EqualEarth maps in this module (matches the
+# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
+# and 58S were excluded due to artifacts in the duration metric"). Applied
+# by masking data/shapefiles to this band and calling ax.set_global() --
+# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
+# it clips to the bounding rectangle of the extent box's own corners, whose
+# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
+# themselves, sitting well short of it at other latitudes -- slicing
+# through real land (e.g. eastern Australia) even though it's nominally
+# within +/-180 deg longitude.
+MAP_LAT_SOUTH = -58
+MAP_LAT_NORTH = 68
+
 # =============================================================================
 # CLI arguments
 # =============================================================================
@@ -454,6 +467,7 @@ def plot_valuebyalpha_persistent(
 
     # --- 7. Draw map ---
     shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     ax_map.imshow(
         rgba_map,
         extent=[sev.lon.min().item(), sev.lon.max().item(),
@@ -462,22 +476,24 @@ def plot_valuebyalpha_persistent(
         interpolation="nearest", rasterized=True,
     )
 
-    da_mask = ds_final.frequency.isel(year=0)
+    da_mask = ds_final.frequency.isel(year=0).sel(
+        lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
+    mask_band = mask.sel(lat=da_mask.lat, lon=da_mask.lon)
     t_mask = rasterio.transform.from_bounds(
         da_mask.lon.min().item(), da_mask.lat.min().item(),
         da_mask.lon.max().item(), da_mask.lat.max().item(),
         len(da_mask.lon), len(da_mask.lat),
     )
-    land_mask = rasterize_shapefile(shp, da_mask.shape, t_mask)
+    land_mask = rasterize_shapefile(shp_band, da_mask.shape, t_mask)
     land_mask = land_mask[::-1, :]
-    ocean_mask = land_mask & (mask == 0)
+    ocean_mask = land_mask & (mask_band.values == 0)
     ax_map.contourf(
         da_mask.lon, da_mask.lat, ocean_mask.astype(float),
         levels=[0.5, 1], colors=["gray"],
         transform=ccrs.PlateCarree(), zorder=5,
     )
-    shp.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
-                       transform=ccrs.PlateCarree(), zorder=10)
+    shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
+                           transform=ccrs.PlateCarree(), zorder=10)
     ax_map.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
     ax_map.annotate(
         "$\\mathbf{a}$",
@@ -572,7 +588,7 @@ def plot_valuebyalpha_persistent(
         )
 
     ax_map.spines["geo"].set_visible(False)
-    ax_map.set_extent([-180, 180, -58, 68], crs=ccrs.PlateCarree())
+    ax_map.set_global()
     plt.tight_layout()
     return fig
 
@@ -604,6 +620,7 @@ def plot_valuebyalpha_decomposition(
     names whatever quantity `indices` holds in the caption/legend.
     """
     shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, lat_min:lat_max]
     panellabels = list(ascii_lowercase[:len(class_labels)])
 
     fig_width_in = FIG_WIDTH_IN * 1.6
@@ -628,8 +645,9 @@ def plot_valuebyalpha_decomposition(
             da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
             len(da_mask_ref.lon), len(da_mask_ref.lat),
         )
-        land_mask = rasterize_shapefile(shp, da_mask_ref.shape, t_mask)[::-1, :]
-        ocean_mask = land_mask & (mask == 0)
+        land_mask = rasterize_shapefile(shp_band, da_mask_ref.shape, t_mask)[::-1, :]
+        mask_band = mask.sel(lat=da_mask_ref.lat, lon=da_mask_ref.lon)
+        ocean_mask = land_mask & (mask_band.values == 0)
 
         ax.set_global()
         ax.imshow(
@@ -644,8 +662,8 @@ def plot_valuebyalpha_decomposition(
             levels=[0.5, 1], colors=["gray"],
             transform=ccrs.PlateCarree(), zorder=5,
         )
-        shp.boundary.plot(ax=ax, color="black", linewidth=0.15,
-                           transform=ccrs.PlateCarree(), zorder=10)
+        shp_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                               transform=ccrs.PlateCarree(), zorder=10)
         ax.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
         ax.annotate(
             f"$\\mathbf{{{panellabels[i]}}}$",
@@ -654,7 +672,6 @@ def plot_valuebyalpha_decomposition(
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
         ax.set_title(label, fontsize=7, pad=6)
-        ax.set_extent([-180, 180, lat_min, lat_max], crs=ccrs.PlateCarree())
         ax.spines["geo"].set_visible(False)
 
         legend_rgba = np.zeros((n_bins_change, n_bins_sev, 4))
@@ -697,6 +714,7 @@ def plot_freq_by_duration_change_persistent(
     the 4 thresholds.
     """
     shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, lat_min:lat_max]
     y0, y1 = period_hist
     y2, y3 = period_comp
 
@@ -704,14 +722,15 @@ def plot_freq_by_duration_change_persistent(
     da_full = da_full.sel(lat=slice(-60, 68))
     da_full = da_full.where(da_full.lat > lat_min, drop=True).where(da_full.lat < lat_max, drop=True)
 
-    da_mask_ref = ds_final.frequency.isel(year=0)
+    da_mask_ref = ds_final.frequency.isel(year=0).sel(lat=da_full.lat, lon=da_full.lon)
     t_mask = rasterio.transform.from_bounds(
         da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
         da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
         len(da_mask_ref.lon), len(da_mask_ref.lat),
     )
-    land_mask = rasterize_shapefile(shp, da_mask_ref.shape, t_mask)[::-1, :]
-    ocean_mask = land_mask & (mask == 0)
+    land_mask = rasterize_shapefile(shp_band, da_mask_ref.shape, t_mask)[::-1, :]
+    mask_band = mask.sel(lat=da_full.lat, lon=da_full.lon)
+    ocean_mask = land_mask & (mask_band.values == 0)
 
     lon_vals = da_full.lon.values
     lat_vals = da_full.lat.values
@@ -748,8 +767,8 @@ def plot_freq_by_duration_change_persistent(
             transform=ccrs.PlateCarree(), cmap=cmap,
             vmin=-vabs, vmax=vabs, rasterized=True, zorder=3,
         )
-        shp.boundary.plot(ax=ax, color="black", linewidth=0.1,
-                           transform=ccrs.PlateCarree(), zorder=6)
+        shp_band.boundary.plot(ax=ax, color="black", linewidth=0.1,
+                               transform=ccrs.PlateCarree(), zorder=6)
         cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", shrink=0.7, pad=0.05)
         cbar.set_label(f"$\\Delta$ events/yr lasting > {thr} d", fontsize=5)
         cbar.ax.tick_params(labelsize=5)
@@ -760,7 +779,6 @@ def plot_freq_by_duration_change_persistent(
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
         ax.set_title(f"> {thr} days", fontsize=6)
-        ax.set_extent([-180, 180, lat_min, lat_max], crs=ccrs.PlateCarree())
         ax.spines["geo"].set_visible(False)
 
     fig.suptitle(
@@ -787,27 +805,36 @@ def plot_reference_persistent_drought(
     WSE drought events during the reference period, plus the mean
     reference-period rolling wind and solar capacity factor.
     """
+    lat_south, lat_north = -60, 68
     shapefile = gpd.read_file(shapefile_path)
+    shapefile_band = shapefile.cx[:, lat_south:lat_north]
 
     freq_mean = ds_final.frequency.where(mask == 1).sel(
-        year=slice(ref_start_year, ref_end_year)).mean("year")
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
     dur_mean = ds_final.duration.where(mask == 1).sel(
-        year=slice(ref_start_year, ref_end_year)).mean("year")
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
     int_mean = ds_final.severity.where(mask == 1).sel(
-        year=slice(ref_start_year, ref_end_year)).mean("year")
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
     ann_sev_mean = (ds_final.frequency * ds_final.severity * ds_final.duration).where(
-        mask == 1).sel(year=slice(ref_start_year, ref_end_year)).mean("year")
-    wcf_mean = ds_final["wcf_ref_mean"].where(mask == 1)
-    scf_mean = ds_final["scf_ref_mean"].where(mask == 1)
+        mask == 1).sel(year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
+    wcf_mean = ds_final["wcf_ref_mean"].where(mask == 1).sel(
+        lat=slice(lat_south, lat_north))
+    scf_mean = ds_final["scf_ref_mean"].where(mask == 1).sel(
+        lat=slice(lat_south, lat_north))
 
-    da_comp = ds_final.frequency.isel(year=0)
+    da_comp = ds_final.frequency.isel(year=0).sel(lat=slice(lat_south, lat_north))
     t_comp = rasterio.transform.from_bounds(
         da_comp.lon.min().item(), da_comp.lat.min().item(),
         da_comp.lon.max().item(), da_comp.lat.max().item(),
         len(da_comp.lon), len(da_comp.lat),
     )
-    land_mask_comp = rasterize_shapefile(shapefile, da_comp.shape, t_comp)[::-1, :]
-    ocean_mask_comp = land_mask_comp & (mask == 0)
+    land_mask_comp = rasterize_shapefile(shapefile_band, da_comp.shape, t_comp)[::-1, :]
+    mask_comp = mask.sel(lat=da_comp.lat, lon=da_comp.lon)
+    ocean_mask_comp = land_mask_comp & (mask_comp.values == 0)
 
     datasets = [freq_mean, dur_mean, int_mean, ann_sev_mean, wcf_mean, scf_mean]
     title_list = [
@@ -853,8 +880,8 @@ def plot_reference_persistent_drought(
                          "pad": 0.05, "label": legend_list[idx]},
             rasterized=True, linewidth=0,
         )
-        shapefile.boundary.plot(ax=ax, color="black", linewidth=0.1,
-                                transform=ccrs.PlateCarree())
+        shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.1,
+                                     transform=ccrs.PlateCarree())
         ax.annotate(
             f"$\\mathbf{{{panellabels[idx]}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
@@ -864,7 +891,6 @@ def plot_reference_persistent_drought(
         cbar_ax = fig.axes[-1]
         cbar_ax.set_xlabel(legend_list[idx], fontsize=5)
         cbar_ax.tick_params(labelsize=5)
-        ax.set_extent([-180, 180, -60, 68], crs=ccrs.PlateCarree())
         ax.spines["geo"].set_visible(False)
 
     fig.suptitle(
