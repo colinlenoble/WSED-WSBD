@@ -14,6 +14,7 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+from shapely.geometry import Polygon
 import rasterio
 from rasterio.features import geometry_mask
 from scipy import stats
@@ -55,6 +56,31 @@ FIG_WIDTH_IN = 5.15   # column width - fontsizes in pt will match LaTeX
 # within +/-180 deg longitude.
 MAP_LAT_SOUTH = -58
 MAP_LAT_NORTH = 68
+
+
+def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
+    """
+    White out everything poleward of [lat_south, lat_north] on a set_global()
+    EqualEarth map. Needed because cfeature.COASTLINE/ax.coastlines() draw
+    the *entire* globe's coastlines (Antarctica, remote Arctic islands)
+    regardless of how the data/shapefile were masked to this band, and
+    shp.cx[:, lat_south:lat_north] keeps whole country geometries (e.g.
+    Russia, Canada, Greenland) rather than clipping them at the band's edge
+    -- both leak real content poleward of the intended crop (see
+    MAP_LAT_SOUTH/NORTH above). Draws a white cap over each pole, in
+    PlateCarree and densely sampled in longitude so it follows the
+    projection's own curved boundary, on top of coastlines/boundaries but
+    below panel labels/region boxes (zorder 20+ elsewhere in this module).
+    """
+    lons = np.linspace(-180.0, 180.0, 361)
+    for lat_edge, lat_pole in ((lat_south, -90.0), (lat_north, 90.0)):
+        cap = Polygon(
+            list(zip(lons, np.full_like(lons, lat_edge))) +
+            list(zip(lons[::-1], np.full_like(lons, lat_pole)))
+        )
+        ax.add_geometries([cap], crs=ccrs.PlateCarree(),
+                          facecolor="white", edgecolor="none", zorder=zorder)
+
 
 # =============================================================================
 # CLI arguments
@@ -768,6 +794,7 @@ def plot_gwl_valuebyalpha_discrete(
     )
     ax_map.set_title(map_title, fontsize=7, pad=6)
     ax_map.set_global()
+    mask_poles(ax_map)
     ax_map.spines["geo"].set_visible(False)
 
     # --- 8. Legend block ---
@@ -988,6 +1015,7 @@ def plot_supp_valuebyalpha_stacked(
         )
         ax.set_title(panel_gwl, fontsize=8)
         ax.set_global()
+        mask_poles(ax)
         ax.spines["geo"].set_visible(False)
 
         # Inset legend

@@ -37,6 +37,7 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+from shapely.geometry import Polygon
 import rasterio
 from rasterio.features import geometry_mask
 
@@ -78,6 +79,31 @@ FIG_WIDTH_IN = 5.15   # single column width : pt fontsizes match LaTeX
 # within +/-180 deg longitude.
 MAP_LAT_SOUTH = -58
 MAP_LAT_NORTH = 68
+
+
+def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
+    """
+    White out everything poleward of [lat_south, lat_north] on a set_global()
+    EqualEarth map. Needed because cfeature.COASTLINE/ax.coastlines() draw
+    the *entire* globe's coastlines (Antarctica, remote Arctic islands)
+    regardless of how the data/shapefile were masked to this band, and
+    shp.cx[:, lat_south:lat_north] keeps whole country geometries (e.g.
+    Russia, Canada, Greenland) rather than clipping them at the band's edge
+    -- both leak real content poleward of the intended crop (see
+    MAP_LAT_SOUTH/NORTH above). Draws a white cap over each pole, in
+    PlateCarree and densely sampled in longitude so it follows the
+    projection's own curved boundary, on top of coastlines/boundaries but
+    below panel labels/region boxes (zorder 20+ elsewhere in this module).
+    """
+    lons = np.linspace(-180.0, 180.0, 361)
+    for lat_edge, lat_pole in ((lat_south, -90.0), (lat_north, 90.0)):
+        cap = Polygon(
+            list(zip(lons, np.full_like(lons, lat_edge))) +
+            list(zip(lons[::-1], np.full_like(lons, lat_pole)))
+        )
+        ax.add_geometries([cap], crs=ccrs.PlateCarree(),
+                          facecolor="white", edgecolor="none", zorder=zorder)
+
 
 # =============================================================================
 # CLI arguments
@@ -589,6 +615,7 @@ def plot_valuebyalpha_persistent(
 
     ax_map.spines["geo"].set_visible(False)
     ax_map.set_global()
+    mask_poles(ax_map)
     plt.tight_layout()
     return fig
 
@@ -658,6 +685,7 @@ def plot_valuebyalpha_decomposition(
         ocean_mask = land_mask & (mask_band.values == 0)
 
         ax.set_global()
+        mask_poles(ax, lat_min, lat_max)
         ax.imshow(
             rgba_map,
             extent=[sev.lon.min().item(), sev.lon.max().item(),
@@ -764,6 +792,7 @@ def plot_freq_by_duration_change_persistent(
     for i, (thr, ax) in enumerate(zip(thresholds, axes_flat)):
         diff = results[i]
         ax.set_global()
+        mask_poles(ax, lat_min, lat_max)
         ax.coastlines(resolution="50m", linewidth=0.15, color="black")
         ax.contourf(
             da_mask_ref.lon, da_mask_ref.lat, ocean_mask.astype(float),
@@ -873,6 +902,7 @@ def plot_reference_persistent_drought(
         if hasattr(ds, "load"):
             ds = ds.load()
         ax.set_global()
+        mask_poles(ax, lat_south, lat_north)
         ax.coastlines(resolution="50m", linewidth=0.15, color="black")
         ax.contourf(
             da_comp.lon, da_comp.lat,

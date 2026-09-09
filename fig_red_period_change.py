@@ -39,7 +39,7 @@ import cmocean as cmo
 
 from fig_persistent import (
     FIG_WIDTH_IN, MAP_LAT_SOUTH, MAP_LAT_NORTH,
-    build_ds_final_persistent, build_land_mask, rasterize_shapefile,
+    build_ds_final_persistent, build_land_mask, rasterize_shapefile, mask_poles,
 )
 
 DURATION_THRESHOLDS = (4, 6)
@@ -223,6 +223,7 @@ def plot_red_period_change(
         for c, (da, cmap, norm, ticks) in enumerate(panel_specs):
             ax = axes[r, c]
             ax.set_global()
+            mask_poles(ax, lat_min, lat_max)
             ax.coastlines(resolution="50m", linewidth=0.15, color="black")
             ax.contourf(
                 template_da.lon, template_da.lat, ocean_mask.astype(float),

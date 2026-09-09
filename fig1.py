@@ -13,6 +13,7 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+from shapely.geometry import Polygon
 import rasterio
 from rasterio.features import geometry_mask
 from scipy import stats
@@ -60,6 +61,31 @@ FIG_WIDTH_IN = 5.15   # single column width pt fontsizes match LaTeX
 # within +/-180 deg longitude.
 MAP_LAT_SOUTH = -58
 MAP_LAT_NORTH = 68
+
+
+def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
+    """
+    White out everything poleward of [lat_south, lat_north] on a set_global()
+    EqualEarth map. Needed because cfeature.COASTLINE/ax.coastlines() draw
+    the *entire* globe's coastlines (Antarctica, remote Arctic islands)
+    regardless of how the data/shapefile were masked to this band, and
+    shp.cx[:, lat_south:lat_north] keeps whole country geometries (e.g.
+    Russia, Canada, Greenland) rather than clipping them at the band's edge
+    -- both leak real content poleward of the intended crop (see
+    MAP_LAT_SOUTH/NORTH above). Draws a white cap over each pole, in
+    PlateCarree and densely sampled in longitude so it follows the
+    projection's own curved boundary, on top of coastlines/boundaries but
+    below panel labels/region boxes (zorder 20+ elsewhere in this module).
+    """
+    lons = np.linspace(-180.0, 180.0, 361)
+    for lat_edge, lat_pole in ((lat_south, -90.0), (lat_north, 90.0)):
+        cap = Polygon(
+            list(zip(lons, np.full_like(lons, lat_edge))) +
+            list(zip(lons[::-1], np.full_like(lons, lat_pole)))
+        )
+        ax.add_geometries([cap], crs=ccrs.PlateCarree(),
+                          facecolor="white", edgecolor="none", zorder=zorder)
+
 
 # =============================================================================
 # CLI arguments
@@ -605,6 +631,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
 
     ax_map.spines["geo"].set_visible(False)
     ax_map.set_global()
+    mask_poles(ax_map)
     plt.tight_layout()
     return fig
 
@@ -643,6 +670,7 @@ def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
     shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                  transform=ccrs.PlateCarree(), zorder=10)
     ax.set_global()
+    mask_poles(ax)
     cbar = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.05, shrink=0.6, aspect=40)
     cbar.set_label("Interannual variability", fontsize=6)
     cbar.ax.tick_params(labelsize=5)
@@ -744,6 +772,7 @@ def plot_mean_variables_6panel(
         if hasattr(ds, "load"):
             ds = ds.load()
         ax.set_global()
+        mask_poles(ax, lat_south, lat_north)
         ax.coastlines(resolution="50m", linewidth=0.15, color="black")
         if idx in (0, 1, 2, 3, 6):
             ax.contourf(
@@ -873,6 +902,7 @@ def plot_valuebyalpha_sensitivity(
         )
         ax.set_title(title, fontsize=8)
         ax.set_global()
+        mask_poles(ax)
         ax.spines["geo"].set_visible(False)
 
     # Shared bivariate legend
@@ -1010,6 +1040,7 @@ def plot_combined_threshold_sensitivity(
         ax.set_title(f"{thr_label}", fontsize=6,
                      color=REF_COLOR if is_ref else "black")
         ax.set_global()
+        mask_poles(ax)
         ax.spines["geo"].set_visible(False)
         if is_ref:
             try:
@@ -1058,6 +1089,7 @@ def plot_combined_threshold_sensitivity(
         shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                      transform=ccrs.PlateCarree(), zorder=10)
         ax.set_global()
+        mask_poles(ax)
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
