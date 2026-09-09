@@ -38,7 +38,8 @@ from string import ascii_lowercase
 import cmocean as cmo
 
 from fig_persistent import (
-    FIG_WIDTH_IN, build_ds_final_persistent, build_land_mask, rasterize_shapefile,
+    FIG_WIDTH_IN, MAP_LAT_SOUTH, MAP_LAT_NORTH,
+    build_ds_final_persistent, build_land_mask, rasterize_shapefile,
 )
 
 DURATION_THRESHOLDS = (4, 6)
@@ -134,7 +135,7 @@ def plot_red_period_change(
     ds_final, df_events_dedup, mask, shapefile_path,
     period_hist=(1982, 2001), period_comp=(2002, 2021),
     duration_thresholds=DURATION_THRESHOLDS,
-    lat_min=-60, lat_max=72,
+    lat_min=MAP_LAT_SOUTH, lat_max=MAP_LAT_NORTH,
 ):
     """
     3x3 panel figure comparing `period_hist` and `period_comp` for:
@@ -324,7 +325,7 @@ def main():
         shapefile_path=args.shapefile,
         period_hist=period_hist, period_comp=period_comp,
         duration_thresholds=DURATION_THRESHOLDS,
-        lat_min=-60, lat_max=75,
+        lat_min=MAP_LAT_SOUTH, lat_max=MAP_LAT_NORTH,
     )
     out_path = os.path.join(
         args.output_dir, "main",

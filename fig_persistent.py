@@ -623,6 +623,14 @@ def plot_valuebyalpha_decomposition(
     shp_band = shp.cx[:, lat_min:lat_max]
     panellabels = list(ascii_lowercase[:len(class_labels)])
 
+    if not isinstance(mask, xr.DataArray):
+        # build_land_mask() (fig1.py / fig_persistent.py) returns a plain
+        # ndarray on the same (lat, lon) grid as `indices` -- wrap it so
+        # mask.sel(...) below can subset it the same way as `da`.
+        first_da = next(iter(indices.values()))
+        mask = xr.DataArray(mask, coords={"lat": first_da.lat, "lon": first_da.lon},
+                             dims=["lat", "lon"])
+
     fig_width_in = FIG_WIDTH_IN * 1.6
     fig_height_in = fig_width_in * 0.95
     fig, axes = plt.subplots(2, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
