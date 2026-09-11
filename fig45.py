@@ -867,7 +867,40 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
     names = list(DEMAND_CONFIGS.keys())
     ncols = 3
     nrows = int(np.ceil(len(names) / ncols))
-    cmap, norm = _make_cmap(vmin=-100, vmax=800)
+    cmap_ref, norm_ref = _make_cmap(vmin=-100, vmax=800)
+    diff_colors = ["#08519c", "#f7f7f7", "#d94801"]
+    cmap_diff = LinearSegmentedColormap.from_list("diff_cmap", diff_colors, N=300)
+
+    # First pass: load each demand config's Combined_Effect, then take the
+    # difference against "default" so non-reference panels show how much the
+    # change in demand parameters shifts the GWL2-vs-GWL0.61 effect.
+    effect_by_name = {}
+    for demand_name in names:
+        csv = os.path.join(
+            agg_datasets_dir,
+            (f"rl_agg_adaptation_{period}_{MAIN_THR}"
+             f"_ren_pen_{MAIN_TOT_RE}_{MAIN_MIX}"
+             f"_demand-{demand_name}_v2.csv"),
+        )
+        if not os.path.exists(csv):
+            effect_by_name[demand_name] = None
+            continue
+        _, df_gwl2, _ = load_gwl_dfs(csv)
+        effect_by_name[demand_name] = (
+            _mmm_combined(df_gwl2, MAIN_MIX).set_index("poly_idx")["Combined_Effect"])
+
+    default_eff = effect_by_name.get("default")
+    diff_by_name = {}
+    max_abs_diff = 0.0
+    for demand_name in names:
+        if demand_name == "default" or default_eff is None or effect_by_name[demand_name] is None:
+            continue
+        diff = (effect_by_name[demand_name] - default_eff).dropna()
+        diff_by_name[demand_name] = diff
+        if len(diff):
+            max_abs_diff = max(max_abs_diff, diff.abs().max())
+    vmax_diff = max(10.0, np.ceil(max_abs_diff / 10.0) * 10.0)
+    norm_diff = mcolors.TwoSlopeNorm(vmin=-vmax_diff, vcenter=0, vmax=vmax_diff)
 
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * ((5.5 * nrows + 1.2) / (8 * 3)) * 1.05
@@ -889,13 +922,9 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
         if is_ref:
             ref_ax = ax
 
-        csv = os.path.join(
-            agg_datasets_dir,
-            (f"rl_agg_adaptation_{period}_{MAIN_THR}"
-             f"_ren_pen_{MAIN_TOT_RE}_{MAIN_MIX}"
-             f"_demand-{demand_name}_v2.csv"),
-        )
-        if not os.path.exists(csv):
+        eff = effect_by_name.get(demand_name)
+        missing = (eff is None) or (not is_ref and demand_name not in diff_by_name)
+        if missing:
             ax.text(0.5, 0.5, "[CSV missing]", transform=ax.transAxes,
                     ha="center", va="center", fontsize=6, color="gray")
             ax.annotate(
@@ -908,9 +937,14 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
             ax.set_axis_off()
             continue
 
-        _, df_gwl2, _ = load_gwl_dfs(csv)
-        gdf = _build_gdf(shapefile_path, _mmm_combined(df_gwl2, MAIN_MIX), hatch_df)
-        _draw_map(ax, gdf, "Combined_Effect", cmap, norm, hatch_df,
+        if is_ref:
+            value_col, panel_cmap, panel_norm = "Combined_Effect", cmap_ref, norm_ref
+            df_plot = eff.reset_index()
+        else:
+            value_col, panel_cmap, panel_norm = "Diff_Effect", cmap_diff, norm_diff
+            df_plot = diff_by_name[demand_name].reset_index(name="Diff_Effect")
+        gdf = _build_gdf(shapefile_path, df_plot, hatch_df)
+        _draw_map(ax, gdf, value_col, panel_cmap, panel_norm, hatch_df,
                   title="", panel_letter="")
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
@@ -950,12 +984,19 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
         row, col = divmod(extra, ncols)
         fig.add_subplot(gs[row, col]).set_visible(False)
 
-    cbar_ax = fig.add_axes([0.18, 0.025, 0.64, 0.020])
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cb = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend="max")
-    cb.set_label("Combined effect on WSBDs (%)  �  GWL 2.0�C", fontsize=6)
-    cb.ax.tick_params(labelsize=5)
+    cbar_ref_ax = fig.add_axes([0.09, 0.025, 0.36, 0.020])
+    sm_ref = plt.cm.ScalarMappable(cmap=cmap_ref, norm=norm_ref)
+    sm_ref.set_array([])
+    cb_ref = fig.colorbar(sm_ref, cax=cbar_ref_ax, orientation="horizontal", extend="max")
+    cb_ref.set_label("Combined effect on WSBDs (%), default - GWL 2.0C", fontsize=6)
+    cb_ref.ax.tick_params(labelsize=5)
+
+    cbar_diff_ax = fig.add_axes([0.55, 0.025, 0.36, 0.020])
+    sm_diff = plt.cm.ScalarMappable(cmap=cmap_diff, norm=norm_diff)
+    sm_diff.set_array([])
+    cb_diff = fig.colorbar(sm_diff, cax=cbar_diff_ax, orientation="horizontal", extend="both")
+    cb_diff.set_label("Change vs default (percentage points)", fontsize=6)
+    cb_diff.ax.tick_params(labelsize=5)
 
     fig.text(0.5, 0.962, "Sensitivity to demand-model parameters",
              ha="center", va="bottom", fontsize=8, fontweight="bold")

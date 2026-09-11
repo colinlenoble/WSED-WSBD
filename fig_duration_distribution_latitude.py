@@ -27,20 +27,46 @@ y-axis, rather than as a continuous KDE -- a Gaussian KDE would fabricate
 density between integers that cannot occur and, with a bandwidth narrow
 enough to resolve the dominant 1-day spike, oscillates between them.
 
-Three figures are produced:
+Every (zone, GWL) group is pooled with *equal GCM weighting*, not a plain
+sum over every contributing (GCM, run) realization: each GCM's own runs are
+averaged together first, then every GCM counts equally regardless of how
+many runs or how many GCMs happen to be available (see _gcm_weights). This
+project's ensemble is uneven enough that this matters a lot -- e.g. CanESM5
+contributes 10 runs and MPI-ESM1-2-LR 9, out of ~33 realizations at
+GWL0-61/1.5/2, while GWL3 drops to 18 realizations from only 8 GCMs (several,
+including MPI-ESM1-2-LR, absent entirely). A plain sum would let those two
+GCMs dominate every GWL and would make GWL3 look artificially low purely
+from having fewer contributing GCMs, not from any real change in event
+frequency.
+
+Two figures are produced, both on the normalized *share* scale (each
+duration's share of that (zone, GWL) group's GCM-weighted total events,
+summing to 1) rather than raw/GCM-weighted counts -- shape-of-distribution
+comparisons across GWLs are what these figures are for, and the share scale
+keeps that comparison legible across zones whose absolute event counts differ
+by orders of magnitude (see per-row independent y-axis ranges below):
   1. fig_duration_distribution_by_latitude_share.png
-     Each duration's *share* of that (zone, GWL) group's total events (sums
-     to 1) -- shows how the duration mix changes with warming, but two GWLs
-     with the same mix and different overall event counts look identical.
-  2. fig_duration_distribution_by_latitude_counts.png
-     Same, but the raw event count at each duration instead of its share --
-     so a GWL with more events overall (a frequency change, not just a
-     duration-mix change) visibly sits above one with fewer.
-  3. fig_duration_distribution_by_latitude_counts_bootstrap.png
-     Same as (2), with a shaded confidence band from bootstrap-resampling
-     which (GCM, run) realizations contribute, instead of drawing each
-     realization's own line -- see _bootstrap_band_from_counts.
+     Only the pooled line -- shows how the duration mix changes with
+     warming.
+  2. fig_duration_distribution_by_latitude_share_bootstrap.png
+     Same, with a shaded confidence band from bootstrap-resampling which
+     GCMs contribute (each GCM's runs pre-averaged, same weighting), instead
+     of drawing each realization's own line -- see
+     _bootstrap_band_from_counts.
 Every figure carries a vertical dashed line at each GWL's mean duration.
+
+Each of the 5 latitude-zone rows (panels b-f; panel a is the locator map) is
+itself split into two side-by-side, independently-autoscaled log-scale
+panels: a wide main panel (days 1-DURATION_SPLIT_DAY) and a narrower zoomed
+panel (DURATION_SPLIT_DAY onward, to max_duration_days). Both panels plot
+only their own window's data, so each y-range reflects only what's visible
+there instead of the full pooled range -- this matters a lot for the zoomed
+panel, whose own value range is much narrower than the main panel's, so
+sharing one axis would flatten GWL differences in the tail almost to
+invisibility. Row-to-row (and now panel-to-panel within a row) the y-range is
+always independent, since amplitude varies strongly between e.g. the tropics
+and Midlatitude (S). Day DURATION_SPLIT_DAY is marked with a thin vertical
+line in the main panel where the split occurs.
 """
 import os
 import config
@@ -62,7 +88,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker
-from matplotlib.gridspec import GridSpec
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 from matplotlib.patches import ConnectionPatch
 
 # Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py /
@@ -75,9 +101,30 @@ from io_utils import match_files, glob_any, open_dataset_any
 from duration_decomposition import compute_event_table
 
 # =============================================================================
-# Figure size / latitude-band constants (match fig1.py/fig3.py conventions)
+# Figure size / fontsize / latitude-band constants (match fig1.py/fig3.py's
+# and classify_gcm_trend_agreement.py's build_wasserstein_composite_figure
+# convention: one FIG_WIDTH_IN constant drives every figsize, and text gets
+# named, purpose-specific fontsize constants instead of ad hoc numbers at
+# each call site)
 # =============================================================================
-FIG_WIDTH_IN = 5.15   # single column width -- fontsizes match LaTeX
+FIG_WIDTH_IN = 5.15   # single column width -- matches fig1.py's LaTeX width
+
+XLABEL_FONTSIZE = 8     # shared x-axis label
+LEGEND_FONTSIZE = 7     # bottom GWL legend
+LETTER_FONTSIZE = 8     # bold panel letters (a, b, c, ...)
+ZONE_TITLE_FONTSIZE = 8  # per-panel zone name, next to its letter
+AXIS_LABEL_FONTSIZE = 7.5  # per-panel y-axis label
+TICK_FONTSIZE = 7       # per-panel tick labels
+
+# Each latitude-zone row is split into a wide main panel (duration <=
+# DURATION_SPLIT_DAY) and a narrower zoomed panel (duration >
+# DURATION_SPLIT_DAY) sharing one log-scale y-axis, so the long thinning tail
+# isn't crushed flat by the dominant short-duration spike. The split point
+# itself (DURATION_SPLIT_DAY) is included in both panels' visible range, so
+# the two halves visually connect.
+DURATION_SPLIT_DAY = 5
+DURATION_ZOOM_WIDTH_RATIOS = [65, 35]
+DURATION_SPLIT_LINE_COLOR = "#777777"
 
 MAP_LAT_SOUTH = -58.0
 MAP_LAT_NORTH = 68.0
@@ -93,14 +140,18 @@ ZONE_BOUNDS = {
     label: (LAT_ZONE_EDGES[i], LAT_ZONE_EDGES[i + 1])
     for i, label in enumerate(LAT_ZONE_LABELS)
 }
-# One distinct colour per zone (Paul Tol "bright" qualitative palette) --
-# unrelated to GWL_COLORS, used only to tie each map band to its panel.
+# One distinct colour per zone (5 of ColorBrewer's "Dark2" qualitative
+# palette), used only to tie each map band to its panel (spine tab,
+# connector line, zone-name text) -- deliberately avoids GWL_COLORS' whole
+# blue/light-blue/orange/red hue range below, since both color sets appear
+# together in every panel and a zone color that reads as "blue" or "red"
+# could be mistaken for a particular GWL line.
 ZONE_MAP_COLORS = {
-    "Midlatitude (S)": "#4477AA",
-    "Subtropical (S)": "#66CCEE",
-    "Tropical":        "#CCBB44",
-    "Subtropical (N)": "#EE6677",
-    "Midlatitude (N)": "#AA3377",
+    "Midlatitude (S)": "#1B9E77",  # teal-green
+    "Subtropical (S)": "#66A61E",  # green
+    "Tropical":        "#A6761D",  # brown
+    "Subtropical (N)": "#E7298A",  # magenta
+    "Midlatitude (N)": "#7570B3",  # purple
 }
 
 GWL_KEYS = ["GWL0-61", "GWL1-5", "GWL2", "GWL3"]
@@ -461,60 +512,92 @@ def _weighted_percentile(values, weights, pct):
     return float(values[idx])
 
 
+def _gcm_weights(sub):
+    """
+    Per-row weight giving each GCM equal total weight (1 / n_GCM), split
+    evenly across however many runs that GCM happens to contribute -- same
+    inverse-run-count convention as fig3.py's align_realizations_and_weight /
+    add_severity_and_weights. Without this, a GCM sampled with many runs
+    (e.g. CanESM5's 10 runs vs. most GCMs' single run in this project's
+    ensemble) dominates a plain pooled sum, and a GWL missing some GCMs
+    entirely (e.g. GWL3 dropping from 14 to 8 GCMs once MPI-ESM1-2-LR and
+    others drop out) ends up on a different, non-comparable scale purely
+    from having fewer contributors -- not from any real change in event
+    frequency. Weights always sum to 1 over `sub`.
+    """
+    runs_per_gcm = sub.groupby("GCM")["run"].transform("nunique")
+    n_gcm = sub["GCM"].nunique()
+    return 1.0 / (runs_per_gcm * n_gcm)
+
+
 def _group_counts(counts_df, gwl, zone, x_int):
     """
-    (count_array over x_int, mean_duration, total_count) for one (gwl, zone),
-    pooled (summed) over every contributing (GCM, run) realization. Returns
-    None if there is no data for this (gwl, zone). `total_count` covers every
-    duration on record, not just those within x_int, so a normalized share
-    computed from it can legitimately sum to less than 1 over x_int alone
-    (see module docstring).
+    (count_array over x_int, mean_duration, weighted_total, raw_total) for
+    one (gwl, zone), pooled with equal GCM weighting (_gcm_weights) rather
+    than a plain sum over every contributing (GCM, run) realization -- see
+    _gcm_weights for why. Returns None if there is no data for this
+    (gwl, zone).
+
+    `weighted_total` is on a "mean events per GCM" scale (weights sum to 1)
+    and is what the plotted arr/mean_dur are normalized against; it covers
+    every duration on record, not just those within x_int, so a normalized
+    share computed from it can legitimately sum to less than 1 over x_int
+    alone (see module docstring). `raw_total` is the true pooled event
+    count, kept separately only to gate min_events on actual sample size
+    rather than the reweighted scale.
     """
     sub = counts_df[(counts_df["gwl"] == gwl) & (counts_df["zone"] == zone)]
     if sub.empty:
         return None
-    agg = sub.groupby("duration")["count"].sum()
-    total = float(agg.sum())
+    w = _gcm_weights(sub)
+    agg = (sub["count"] * w).groupby(sub["duration"]).sum()
+    weighted_total = float(agg.sum())
+    raw_total = float(sub["count"].sum())
     arr = np.array([agg.get(d, 0) for d in x_int], dtype=float)
-    mean_dur = float((agg.index.to_numpy() * agg.to_numpy()).sum() / total) if total > 0 else np.nan
-    return arr, mean_dur, total
+    mean_dur = (float((agg.index.to_numpy() * agg.to_numpy()).sum() / weighted_total)
+                if weighted_total > 0 else np.nan)
+    return arr, mean_dur, weighted_total, raw_total
 
 
 def _bootstrap_band_from_counts(counts_df, gwl, zone, x_int, normalize, n_boot=500, ci=90, rng=None):
     """
     (lo, hi) envelope at each integer duration in x_int from resampling
-    *realizations* (GCM, run) with replacement, n_boot times -- the
-    appropriate bootstrap unit here, since events within one realization are
-    not independent draws but different GCM/runs plausibly are. Works
-    directly off the aggregated counts table (no raw per-event data needed).
-    Returns (None, None) if fewer than 2 realizations are available.
+    *GCMs* (not raw realizations) with replacement, n_boot times, each GCM's
+    own runs averaged together first -- the same equal-GCM-weighting as the
+    pooled line in _group_counts (see _gcm_weights). Resampling raw
+    (GCM, run) pairs instead would let a heavily-resampled GCM dominate the
+    bootstrap draws too, not just the pooled sum, and would understate
+    uncertainty. Works directly off the aggregated counts table (no raw
+    per-event data needed). Returns (None, None) if fewer than 2 GCMs are
+    available.
     """
     sub = counts_df[(counts_df["gwl"] == gwl) & (counts_df["zone"] == zone)]
     if sub.empty:
         return None, None
-    keys = list(sub[["GCM", "run"]].drop_duplicates().itertuples(index=False, name=None))
-    n_keys = len(keys)
-    if n_keys < 2:
+    gcms = sorted(sub["GCM"].unique())
+    n_gcm = len(gcms)
+    if n_gcm < 2:
         return None, None
 
-    key_idx = {k: i for i, k in enumerate(keys)}
     dur_idx = {d: j for j, d in enumerate(x_int)}
-    M = np.zeros((n_keys, len(x_int)))
-    totals = np.zeros(n_keys)
-    for gcm, run, dur, cnt in zip(sub["GCM"], sub["run"], sub["duration"], sub["count"]):
-        i = key_idx[(gcm, run)]
-        totals[i] += cnt
-        j = dur_idx.get(dur)
-        if j is not None:
-            M[i, j] += cnt
+    M = np.zeros((n_gcm, len(x_int)))
+    totals = np.zeros(n_gcm)
+    for gi, gcm in enumerate(gcms):
+        gsub = sub[sub["GCM"] == gcm]
+        n_runs = gsub["run"].nunique()
+        for dur, cnt in zip(gsub["duration"], gsub["count"]):
+            j = dur_idx.get(dur)
+            if j is not None:
+                M[gi, j] += cnt / n_runs
+        totals[gi] = gsub["count"].sum() / n_runs
 
     rng = rng if rng is not None else np.random.default_rng(12345)
     boot = np.empty((n_boot, len(x_int)))
     for b in range(n_boot):
-        idx = rng.integers(0, n_keys, size=n_keys)
-        arr = M[idx].sum(axis=0)
+        idx = rng.integers(0, n_gcm, size=n_gcm)
+        arr = M[idx].mean(axis=0)
         if normalize:
-            tot = totals[idx].sum()
+            tot = totals[idx].mean()
             arr = arr / tot if tot > 0 else arr
         boot[b] = arr
     alpha = (100.0 - ci) / 2.0
@@ -553,18 +636,23 @@ def _add_locator_map(fig, gs_column, zone_order):
 
 def plot_distributions(counts_df, pixel_counts, gwl_list, output_path, dpi=300,
                         max_duration_days=None, normalize=True, uncertainty=None,
-                        n_boot=500, ci=90, min_events=5, title=None, subtitle=None):
+                        n_boot=500, ci=90, min_events=5):
     """
     normalize=True plots each duration's share of that (zone, GWL) group's
-    total events (sums to 1); normalize=False plots the raw event count, so
-    a GWL with more events overall visibly sits above one with fewer, which
-    the normalized share alone cannot show. uncertainty=None draws only the
+    GCM-weighted total events (sums to 1); normalize=False plots the
+    GCM-weighted event count itself, so a GWL with more events overall
+    visibly sits above one with fewer, which the normalized share alone
+    cannot show. Both are pooled with equal GCM weighting (_group_counts /
+    _gcm_weights), not a plain sum over every (GCM, run) realization, so a
+    heavily-resampled GCM (or a GWL missing some GCMs entirely) doesn't
+    distort the result -- see _gcm_weights. uncertainty=None draws only the
     pooled line; uncertainty='bootstrap' additionally shades a `ci`%
-    envelope from n_boot resamples of the contributing (GCM, run)
-    realizations (see _bootstrap_band_from_counts) instead of drawing each
-    realization's own line. `counts_df` is the aggregated event-duration
-    counts table (see build_counts_table / load_counts_cache): one row per
-    (gwl, GCM, run, zone, duration) with that combination's event count.
+    envelope from n_boot resamples of the contributing GCMs (see
+    _bootstrap_band_from_counts), each on the same equal-weighting, instead
+    of drawing each realization's own line. `counts_df` is the aggregated
+    event-duration counts table (see build_counts_table / load_counts_cache):
+    one row per (gwl, GCM, run, zone, duration) with that combination's
+    event count.
     """
     counts_in_scope = counts_df[counts_df["gwl"].isin(gwl_list)]
     if max_duration_days is None:
@@ -584,53 +672,152 @@ def plot_distributions(counts_df, pixel_counts, gwl_list, output_path, dpi=300,
     # connector lines bridge the two scales.
     zone_order = list(reversed(LAT_ZONE_LABELS))
 
-    fig = plt.figure(figsize=(FIG_WIDTH_IN * 1.9, FIG_WIDTH_IN * 1.7))
-    gs = GridSpec(len(zone_order), 2, width_ratios=[1.0, 2.4],
-                  left=0.14, right=0.97, top=0.85, bottom=0.08,
-                  hspace=0.25, wspace=0.55, figure=fig)
+    fig = plt.figure(figsize=(FIG_WIDTH_IN, FIG_WIDTH_IN))
+    
+    # wspace is the blank gap between the locator-map column and the
+    # distribution-panel column -- kept small so the panels (and their
+    # xticks) get as much of the figure width as possible. top/bottom are
+    # taller than that gap alone would need: no fig-level title/subtitle
+    # anymore (top), and the shared GWL legend now lives below the panels
+    # (bottom) instead of above them.
+    gs = GridSpec(len(zone_order), 2, width_ratios=[1.0, 2.6],
+                  left=0.14, right=0.97, top=0.96, bottom=0.13,
+                  hspace=0.5, wspace=0.15, figure=fig)
 
     ax_map, lat_mid = _add_locator_map(fig, gs[:, 0], zone_order)
+    ax_map.text(-0.02, 1.03, "a", transform=ax_map.transAxes,
+                fontsize=LETTER_FONTSIZE, fontweight="bold")
 
-    dist_axes = []
+    # Split each row into a wide main panel (duration <= DURATION_SPLIT_DAY)
+    # and a narrower zoomed panel (duration > DURATION_SPLIT_DAY). Only worth
+    # doing if the requested range actually extends past the split day.
+    do_split = max_duration_days > DURATION_SPLIT_DAY
+    split_idx = DURATION_SPLIT_DAY  # x_int[:split_idx] == days 1..DURATION_SPLIT_DAY
+
+    dist_axes = []       # main-panel axis per row -- sharex anchor + legend handles
+    dist_axes_zoom = []  # zoomed-panel axis per row (None if do_split is False)
     for i, zlabel in enumerate(zone_order):
-        ax = fig.add_subplot(gs[i, 1], sharex=dist_axes[0] if dist_axes else None)
+        if do_split:
+            inner_gs = GridSpecFromSubplotSpec(
+                1, 2, subplot_spec=gs[i, 1], width_ratios=DURATION_ZOOM_WIDTH_RATIOS, wspace=0.08)
+            ax = fig.add_subplot(inner_gs[0], sharex=dist_axes[0] if dist_axes else None)
+            # No sharey: the zoomed panel autoscales to only its own (much
+            # smaller) value range instead of inheriting the main panel's
+            # multi-decade span, so GWL differences in the thinning tail are
+            # actually visible instead of flattened against a shared axis.
+            ax_zoom = fig.add_subplot(
+                inner_gs[1], sharex=dist_axes_zoom[0] if dist_axes_zoom else None)
+        else:
+            ax = fig.add_subplot(gs[i, 1], sharex=dist_axes[0] if dist_axes else None)
+            ax_zoom = None
         dist_axes.append(ax)
+        dist_axes_zoom.append(ax_zoom)
+        row_axes = [ax] if ax_zoom is None else [ax, ax_zoom]
+
         for gwl in gwl_list:
             color = GWL_COLORS.get(gwl, "gray")
             group = _group_counts(counts_df, gwl, zlabel, x_int)
             if group is None:
                 continue
-            arr, mean_dur, total = group
-            if total < min_events:
+            arr, mean_dur, weighted_total, raw_total = group
+            if raw_total < min_events:
                 continue
 
+            y_pooled = _for_line(arr / weighted_total if normalize else arr)
+            lo = hi = None
             if uncertainty == "bootstrap":
                 lo, hi = _bootstrap_band_from_counts(
                     counts_df, gwl, zlabel, x_int, normalize, n_boot=n_boot, ci=ci)
+
+            if do_split:
+                # Each panel plots only its own window's slice (day
+                # DURATION_SPLIT_DAY repeated at the start of the zoom slice,
+                # so the line still reads as continuous across the break) --
+                # this is what lets each panel's y-autoscale reflect only its
+                # own window instead of the pooled full-range data.
+                windows = [(ax, slice(0, split_idx)), (ax_zoom, slice(split_idx - 1, None))]
+            else:
+                windows = [(ax, slice(None))]
+
+            for a, sl in windows:
                 if lo is not None:
-                    ax.fill_between(x_int, lo, hi, color=color, alpha=0.22,
-                                     linewidth=0, zorder=2)
+                    a.fill_between(x_int[sl], lo[sl], hi[sl], color=color, alpha=0.22,
+                                    linewidth=0, zorder=2)
+                a.plot(x_int[sl], y_pooled[sl], color=color, marker="o", markersize=2.5,
+                       linewidth=1.4, zorder=3, label=GWL_LABELS.get(gwl, gwl))
+                a.axvline(mean_dur, color=color, linestyle="--", linewidth=1.2, zorder=4)
 
-            y_pooled = _for_line(arr / total if normalize else arr)
-            ax.plot(x_int, y_pooled, color=color, marker="o", markersize=2.5,
-                    linewidth=1.4, zorder=3, label=GWL_LABELS.get(gwl, gwl))
-            ax.axvline(mean_dur, color=color, linestyle="--", linewidth=1.2, zorder=4)
-
+        # "Share of events" is the same quantity in every row -- only the
+        # top panel spells it out; the rest keep just their tick numbers, so
+        # the narrower (square-figure) panels aren't spending width on five
+        # repeats of the same label.
+        base_label = "Share of events" if normalize else "Mean events per GCM"
+        if i == 0:
+            ax.set_ylabel(base_label, fontsize=AXIS_LABEL_FONTSIZE)
+        # Panel letter directly beside the zone name (not a separate corner
+        # label) -- built from two ax.text calls rather than set_title so the
+        # letter (black) and zone name (zone-coloured) can carry different
+        # colors on the same line. Pixel count folds into this same line
+        # (rather than the ylabel) so it survives even on rows with no
+        # ylabel text.
         n_px = pixel_counts.get(zlabel)
-        base_label = "Share of events" if normalize else "Number of events"
-        ylabel = f"{base_label}\n(n={n_px:,} px)" if n_px is not None else base_label
-        ax.set_ylabel(ylabel, fontsize=6.5)
-        ax.set_title(zlabel, fontsize=7, loc="left", color=ZONE_MAP_COLORS[zlabel],
-                     fontweight="bold", pad=2)
-        ax.set_yscale("log")
-        ax.tick_params(labelsize=6)
-        if i < len(zone_order) - 1:
-            ax.tick_params(labelbottom=False)
-        ax.set_xlim(0.5, max_duration_days + 0.5)
-        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
-        ax.grid(True, linestyle="--", alpha=0.3)
-        for spine in ax.spines.values():
-            spine.set_linewidth(0.4)
+        zone_label_text = f"{zlabel} (n={n_px:,} px)" if n_px is not None else zlabel
+        ax.text(0.0, 1.03, chr(ord("b") + i), transform=ax.transAxes,
+                ha="left", va="bottom", fontsize=LETTER_FONTSIZE, fontweight="bold")
+        ax.text(0.05, 1.03, zone_label_text, transform=ax.transAxes,
+                ha="left", va="bottom", fontsize=ZONE_TITLE_FONTSIZE, fontweight="bold",
+                color=ZONE_MAP_COLORS[zlabel])
+        for a in row_axes:
+            a.set_yscale("log")  # independent per panel now (no sharey) -- see ax_zoom comment above
+            a.tick_params(labelsize=TICK_FONTSIZE)
+            a.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+            a.grid(True, linestyle="--", alpha=0.3)
+            for spine in a.spines.values():
+                spine.set_linewidth(0.4)
+
+        if do_split:
+            ax.axvline(DURATION_SPLIT_DAY, color=DURATION_SPLIT_LINE_COLOR,
+                       linewidth=0.8, linestyle="-", zorder=1)
+            ax.set_xlim(0.5, DURATION_SPLIT_DAY + 0.5)
+            ax_zoom.set_xlim(DURATION_SPLIT_DAY - 0.5, max_duration_days + 0.5)
+            # The zoomed panel has its own (tighter) y-range now, not the
+            # main panel's -- moved to the right edge (rather than hidden)
+            # so its scale reads as clearly distinct from the main panel's
+            # left-side labels instead of looking like a missing duplicate.
+            # Only label the power-of-ten major ticks: with a narrow
+            # autoscaled range matplotlib often falls back to also labeling
+            # in-between minor ticks (2e-2, 6e-3, ...), which reads as
+            # cluttered next to a plain "10^n" scale.
+            ax_zoom.yaxis.tick_right()
+            ax_zoom.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+
+            # Visual bridge between the two windows: dotted lines from the
+            # day-DURATION_SPLIT_DAY level in the main panel (matched to the
+            # zoomed panel's own y-max/y-min, i.e. where its curves start/
+            # end) to the top-left and bottom-left corners of the zoomed
+            # panel, so the break reads as a continuation rather than two
+            # unrelated plots -- plus the classic diagonal hash marks on
+            # both spines at the break itself, the standard "broken axis"
+            # convention, as an extra unambiguous sign of a discontinuity.
+            y_lo_zoom, y_hi_zoom = ax_zoom.get_ylim()
+            y_lo_main, y_hi_main = sorted(ax.get_ylim())
+            for y_zoom, y_frac_zoom in ((y_hi_zoom, 1), (y_lo_zoom, 0)):
+                y_anchor = min(max(y_zoom, y_lo_main), y_hi_main)
+                zoom_link = ConnectionPatch(
+                    xyA=(DURATION_SPLIT_DAY, y_anchor), coordsA=ax.transData,
+                    xyB=(0, y_frac_zoom), coordsB=ax_zoom.transAxes,
+                    color=DURATION_SPLIT_LINE_COLOR, linewidth=0.7, linestyle=":", zorder=1,
+                )
+                fig.add_artist(zoom_link)
+
+            d = 0.02  # half-length (axes fraction) of each diagonal break mark
+            break_kwargs = dict(color="black", linewidth=0.8, clip_on=False, zorder=5)
+            for y0 in (0, 1):
+                ax.plot((1 - d, 1 + d), (y0 - d, y0 + d), transform=ax.transAxes, **break_kwargs)
+                ax_zoom.plot((-d, d), (y0 - d, y0 + d), transform=ax_zoom.transAxes, **break_kwargs)
+        else:
+            ax.set_xlim(0.5, max_duration_days + 0.5)
+
         # Colour-coded tab on the panel's own left edge, plus a dashed
         # connector back to this zone's band on the locator map, so the
         # correspondence is explicit rather than relying on stacking order.
@@ -644,14 +831,10 @@ def plot_distributions(counts_df, pixel_counts, gwl_list, output_path, dpi=300,
         )
         fig.add_artist(con)
 
-    dist_axes[-1].set_xlabel("WSED event duration (days)", fontsize=8)
-    if title:
-        fig.suptitle(title, fontsize=8, y=0.995)
-    if subtitle:
-        fig.text(0.5, 0.955, subtitle, fontsize=6.5, ha="center", style="italic")
+    dist_axes[-1].set_xlabel("WSED event duration (days)", fontsize=XLABEL_FONTSIZE)
     handles, labels = dist_axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(gwl_list), fontsize=7,
-               bbox_to_anchor=(0.5, 0.92), frameon=False)
+    fig.legend(handles, labels, loc="lower center", ncol=len(gwl_list), fontsize=LEGEND_FONTSIZE,
+               bbox_to_anchor=(0.5, 0.0), frameon=False)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return fig
@@ -702,36 +885,23 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 3 - Plotting")
     print("=" * 60)
-    base_title = "WSED event-duration distribution by latitude zone and GWL"
 
     out_share = os.path.join(args.output_dir, "fig_duration_distribution_by_latitude_share.png")
     plot_distributions(
         counts_df, pixel_counts, args.gwl_list, out_share, dpi=args.dpi,
         max_duration_days=args.max_duration_days, normalize=True, uncertainty=None,
-        min_events=args.min_events, title=base_title,
-        subtitle="(share of each group's events -- shape only, not overall frequency)",
+        min_events=args.min_events,
     )
     print(f"  Saved -> {out_share}")
 
-    out_counts = os.path.join(args.output_dir, "fig_duration_distribution_by_latitude_counts.png")
+    out_share_boot = os.path.join(
+        args.output_dir, "fig_duration_distribution_by_latitude_share_bootstrap.png")
     plot_distributions(
-        counts_df, pixel_counts, args.gwl_list, out_counts, dpi=args.dpi,
-        max_duration_days=args.max_duration_days, normalize=False, uncertainty=None,
-        min_events=args.min_events, title=base_title,
-        subtitle="(raw event counts -- also reflects overall frequency differences)",
+        counts_df, pixel_counts, args.gwl_list, out_share_boot, dpi=args.dpi,
+        max_duration_days=args.max_duration_days, normalize=True, uncertainty="bootstrap",
+        n_boot=args.n_boot, ci=args.ci, min_events=args.min_events,
     )
-    print(f"  Saved -> {out_counts}")
-
-    out_boot = os.path.join(
-        args.output_dir, "fig_duration_distribution_by_latitude_counts_bootstrap.png")
-    plot_distributions(
-        counts_df, pixel_counts, args.gwl_list, out_boot, dpi=args.dpi,
-        max_duration_days=args.max_duration_days, normalize=False, uncertainty="bootstrap",
-        n_boot=args.n_boot, ci=args.ci, min_events=args.min_events, title=base_title,
-        subtitle=f"(raw event counts; shaded band = {args.ci:.0f}% bootstrap CI "
-                 "over GCM-run realizations)",
-    )
-    print(f"  Saved -> {out_boot}")
+    print(f"  Saved -> {out_share_boot}")
 
 
 if __name__ == "__main__":
