@@ -20,12 +20,19 @@ low-production spell (event) at one pixel, not a per-pixel-year mean, so the
 resulting distribution reflects actual individual event lengths pooled over
 every land pixel in the zone and every available GCM/run realization.
 
+Duration is a small integer count (1, 2, 3, ... days), so each distribution
+is drawn as a discrete probability mass function (share of events with that
+*exact* length, on a log y-axis) rather than a continuous KDE -- a Gaussian
+KDE would fabricate density between integers that cannot occur and, with a
+bandwidth narrow enough to resolve the dominant 1-day spike, oscillates
+between them.
+
 Two figures are produced:
   1. fig_duration_distribution_by_latitude.png
-     One KDE curve per GWL (pooled over every GCM/run), one panel per zone,
-     with a vertical dashed line at each GWL's mean duration.
+     One PMF per GWL (pooled over every GCM/run), one panel per zone, with a
+     vertical dashed line at each GWL's mean duration.
   2. fig_duration_distribution_by_latitude_with_simulations.png
-     Same, with every individual GCM/run's own KDE drawn faintly in the
+     Same, with every individual GCM/run's own PMF drawn faintly in the
      background (same colour as its GWL, low alpha) behind the pooled curve.
 """
 import os
@@ -40,11 +47,11 @@ import xarray as xr
 import geopandas as gpd
 import rasterio
 from rasterio.features import geometry_mask
-from scipy.stats import gaussian_kde
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 
 # Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py /
 # every other fig*.py script.
@@ -118,9 +125,9 @@ def parse_args():
              "every pooled event duration across all requested GWLs).",
     )
     parser.add_argument(
-        "--min_events_for_kde", type=int, default=5,
+        "--min_events_per_sim", type=int, default=5,
         help="Minimum events a single GCM/run needs in a zone to get its own "
-             "background KDE curve in the 'with_simulations' figure.",
+             "background PMF line in the 'with_simulations' figure.",
     )
     return parser.parse_args()
 
@@ -322,27 +329,35 @@ def build_all_events(preprocessed_path, gwl_list, ssp, threshold, shapefile_path
 # Plotting
 # =============================================================================
 
-def _kde_curve(values, x_grid, min_events):
+def _discrete_pmf(values, x_int, min_events):
+    """
+    Probability mass at each integer duration in x_int (share of events with
+    that *exact* length, summing to 1) -- not a continuous KDE. Duration is a
+    small integer count (1, 2, 3, ... days), so a Gaussian KDE fabricates
+    density between integers that cannot physically occur and, with a
+    bandwidth narrow enough to resolve the 1-day spike, oscillates between
+    them; a PMF plotted directly at each integer avoids both problems and is
+    the honest representation of count data like this.
+    Returns None (skip) if there are fewer than min_events events.
+    """
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
-    if values.size < min_events or np.allclose(values, values[0]):
+    if values.size < min_events:
         return None
-    try:
-        kde = gaussian_kde(values)
-    except np.linalg.LinAlgError:
-        return None
-    return kde(x_grid)
+    counts = np.bincount(values.astype(int), minlength=int(x_int[-1]) + 1)[x_int]
+    pmf = counts / values.size
+    return np.where(pmf > 0, pmf, np.nan)  # NaN (not 0) so log-scale lines show real gaps
 
 
 def plot_distributions(events_by_gwl, pixel_counts, gwl_list, output_path, dpi=300,
                         max_duration_days=None, show_individual=False,
-                        min_events_for_kde=5, title=None):
+                        min_events_per_sim=5, title=None):
     all_durations = np.concatenate([
         events_by_gwl[g]["duration"].to_numpy() for g in gwl_list if not events_by_gwl[g].empty
     ]) if any(not events_by_gwl[g].empty for g in gwl_list) else np.array([])
     if max_duration_days is None:
         max_duration_days = float(max(5.0, np.percentile(all_durations, 99))) if all_durations.size else 20.0
-    x_grid = np.linspace(0.5, max_duration_days, 300)
+    x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
 
     fig, axes = plt.subplots(
         len(LAT_ZONE_LABELS), 1, figsize=(FIG_WIDTH_IN, FIG_WIDTH_IN * 1.7), sharex=True,
@@ -356,24 +371,26 @@ def plot_distributions(events_by_gwl, pixel_counts, gwl_list, output_path, dpi=3
 
             if show_individual and not df_zone.empty:
                 for (_gcm, _run), df_sim in df_zone.groupby(["GCM", "run"]):
-                    y_sim = _kde_curve(df_sim["duration"].to_numpy(), x_grid, min_events_for_kde)
+                    y_sim = _discrete_pmf(df_sim["duration"].to_numpy(), x_int, min_events_per_sim)
                     if y_sim is not None:
-                        ax.plot(x_grid, y_sim, color=color, alpha=0.15, linewidth=0.6, zorder=1)
+                        ax.plot(x_int, y_sim, color=color, alpha=0.2, linewidth=0.6, zorder=1)
 
             if df_zone.empty:
                 continue
             durations = df_zone["duration"].to_numpy()
-            y_pooled = _kde_curve(durations, x_grid, min_events=2)
+            y_pooled = _discrete_pmf(durations, x_int, min_events=1)
             if y_pooled is not None:
-                ax.plot(x_grid, y_pooled, color=color, linewidth=1.8, zorder=3,
-                        label=GWL_LABELS.get(gwl, gwl))
+                ax.plot(x_int, y_pooled, color=color, marker="o", markersize=2.5,
+                        linewidth=1.4, zorder=3, label=GWL_LABELS.get(gwl, gwl))
             ax.axvline(durations.mean(), color=color, linestyle="--", linewidth=1.2, zorder=4)
 
         n_px = pixel_counts.get(zlabel)
-        ylabel = zlabel + (f"\nDensity (n={n_px:,} px)" if n_px is not None else "\nDensity")
+        ylabel = zlabel + (f"\nShare of events (n={n_px:,} px)" if n_px is not None else "\nShare of events")
         ax.set_ylabel(ylabel, fontsize=7)
+        ax.set_yscale("log")
         ax.tick_params(labelsize=6)
-        ax.set_xlim(0, max_duration_days)
+        ax.set_xlim(0.5, max_duration_days + 0.5)
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
         ax.grid(True, linestyle="--", alpha=0.3)
         for spine in ax.spines.values():
             spine.set_linewidth(0.4)
@@ -432,7 +449,7 @@ def main():
     plot_distributions(
         events_by_gwl, pixel_counts, args.gwl_list, out2, dpi=args.dpi,
         max_duration_days=args.max_duration_days, show_individual=True,
-        min_events_for_kde=args.min_events_for_kde,
+        min_events_per_sim=args.min_events_per_sim,
         title=("WSED event-duration distribution by latitude zone and GWL\n"
                "(faint lines: individual GCM-run realizations)"),
     )
