@@ -6,12 +6,13 @@ available GCM/run realization.
 
 Latitude zones (5), using this project's own poleward exclusion band
 (MAP_LAT_SOUTH/MAP_LAT_NORTH -- see fig1.py/fig3.py: "Regions poleward of
-68N and 58S were excluded due to artifacts in the duration metric"):
-    Tropical          -23.5 .. 23.5
-    Subtropical (N)     23.5 .. 35
-    Subtropical (S)    -35 .. -23.5
-    Midlatitude (N)     35 .. MAP_LAT_NORTH
-    Midlatitude (S)     MAP_LAT_SOUTH .. -35
+68N and 58S were excluded due to artifacts in the duration metric"). Zone
+edges live in LAT_ZONE_EDGES below -- this docstring just names them:
+    Tropical          -20 .. 20
+    Subtropical (N)     20 .. 40
+    Subtropical (S)    -40 .. -20
+    Midlatitude (N)     40 .. MAP_LAT_NORTH
+    Midlatitude (S)     MAP_LAT_SOUTH .. -40
 
 Event durations come from duration_decomposition.compute_event_table, the
 same gap-free run-length encoding of the classic daily wind+solar
@@ -21,25 +22,33 @@ resulting distribution reflects actual individual event lengths pooled over
 every land pixel in the zone and every available GCM/run realization.
 
 Duration is a small integer count (1, 2, 3, ... days), so each distribution
-is drawn as a discrete probability mass function (share of events with that
-*exact* length, on a log y-axis) rather than a continuous KDE -- a Gaussian
-KDE would fabricate density between integers that cannot occur and, with a
-bandwidth narrow enough to resolve the dominant 1-day spike, oscillates
-between them.
+is drawn at each integer duration (share or raw count -- see below) on a log
+y-axis, rather than as a continuous KDE -- a Gaussian KDE would fabricate
+density between integers that cannot occur and, with a bandwidth narrow
+enough to resolve the dominant 1-day spike, oscillates between them.
 
-Two figures are produced:
-  1. fig_duration_distribution_by_latitude.png
-     One PMF per GWL (pooled over every GCM/run), one panel per zone, with a
-     vertical dashed line at each GWL's mean duration.
-  2. fig_duration_distribution_by_latitude_with_simulations.png
-     Same, with every individual GCM/run's own PMF drawn faintly in the
-     background (same colour as its GWL, low alpha) behind the pooled curve.
+Three figures are produced:
+  1. fig_duration_distribution_by_latitude_share.png
+     Each duration's *share* of that (zone, GWL) group's total events (sums
+     to 1) -- shows how the duration mix changes with warming, but two GWLs
+     with the same mix and different overall event counts look identical.
+  2. fig_duration_distribution_by_latitude_counts.png
+     Same, but the raw event count at each duration instead of its share --
+     so a GWL with more events overall (a frequency change, not just a
+     duration-mix change) visibly sits above one with fewer.
+  3. fig_duration_distribution_by_latitude_counts_bootstrap.png
+     Same as (2), with a shaded confidence band from bootstrap-resampling
+     which (GCM, run) realizations contribute, instead of drawing each
+     realization's own line -- see _bootstrap_band_from_counts.
+Every figure carries a vertical dashed line at each GWL's mean duration.
 """
 import os
 import config
+os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 
 import argparse
 import gc
+import json
 
 import numpy as np
 import pandas as pd
@@ -47,11 +56,14 @@ import xarray as xr
 import geopandas as gpd
 import rasterio
 from rasterio.features import geometry_mask
+import cartopy.crs as ccrs
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import ConnectionPatch
 
 # Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py /
 # every other fig*.py script.
@@ -70,10 +82,26 @@ FIG_WIDTH_IN = 5.15   # single column width -- fontsizes match LaTeX
 MAP_LAT_SOUTH = -58.0
 MAP_LAT_NORTH = 68.0
 
-LAT_ZONE_EDGES = [MAP_LAT_SOUTH, -35.0, -23.5, 23.5, 35.0, MAP_LAT_NORTH]
+LAT_ZONE_EDGES = [MAP_LAT_SOUTH, -40, -20, 20, 40, MAP_LAT_NORTH]
 LAT_ZONE_LABELS = [
     "Midlatitude (S)", "Subtropical (S)", "Tropical", "Subtropical (N)", "Midlatitude (N)",
 ]
+# (lat_lo, lat_hi) per zone, derived from LAT_ZONE_EDGES -- used both for the
+# locator-map bands and for sizing the distribution panels proportionally to
+# their true latitudinal extent.
+ZONE_BOUNDS = {
+    label: (LAT_ZONE_EDGES[i], LAT_ZONE_EDGES[i + 1])
+    for i, label in enumerate(LAT_ZONE_LABELS)
+}
+# One distinct colour per zone (Paul Tol "bright" qualitative palette) --
+# unrelated to GWL_COLORS, used only to tie each map band to its panel.
+ZONE_MAP_COLORS = {
+    "Midlatitude (S)": "#4477AA",
+    "Subtropical (S)": "#66CCEE",
+    "Tropical":        "#CCBB44",
+    "Subtropical (N)": "#EE6677",
+    "Midlatitude (N)": "#AA3377",
+}
 
 GWL_KEYS = ["GWL0-61", "GWL1-5", "GWL2", "GWL3"]
 GWL_LABELS = {
@@ -125,9 +153,33 @@ def parse_args():
              "every pooled event duration across all requested GWLs).",
     )
     parser.add_argument(
-        "--min_events_per_sim", type=int, default=5,
-        help="Minimum events a single GCM/run needs in a zone to get its own "
-             "background PMF line in the 'with_simulations' figure.",
+        "--min_events", type=int, default=5,
+        help="Minimum pooled events a (zone, GWL) group needs to be drawn at all "
+             "(default: 5).",
+    )
+    parser.add_argument(
+        "--n_boot", type=int, default=500,
+        help="Bootstrap resamples (over GCM/run realizations) for the bootstrap "
+             "figure's uncertainty band (default: 500).",
+    )
+    parser.add_argument(
+        "--ci", type=float, default=90.0,
+        help="Bootstrap confidence interval width in %% (default: 90).",
+    )
+    parser.add_argument(
+        "--cache_csv", default=None,
+        help=(
+            "Path to the event-duration-count cache CSV (one row per "
+            "gwl/GCM/run/zone/duration, with its event count). Default: "
+            "<output_dir>/event_duration_counts_cache.csv. If it exists (and "
+            "was built with the same latitude bands, threshold and ssp -- "
+            "checked automatically), it is loaded instead of rebuilding from "
+            "the raw wcf/scf files, which is by far the most expensive step."
+        ),
+    )
+    parser.add_argument(
+        "--recompute", action="store_true", default=False,
+        help="Ignore any existing cache and rebuild the event-duration counts from scratch.",
     )
     return parser.parse_args()
 
@@ -295,113 +347,311 @@ def build_events_for_realization(preprocessed_path, gwl, gcm, run, ssp, threshol
     return df
 
 
-def build_all_events(preprocessed_path, gwl_list, ssp, threshold, shapefile_path,
-                      exclude_gcm, exclude_gcm_run):
+COUNTS_CACHE_COLUMNS = ["gwl", "GCM", "run", "zone", "duration", "count"]
+
+
+def build_counts_table(preprocessed_path, gwl_list, ssp, threshold, shapefile_path,
+                        exclude_gcm, exclude_gcm_run):
     """
-    {gwl: DataFrame} of pooled per-event rows (lat, year, duration, zone,
-    GCM, run, gwl) across every available (GCM, run) realization for that GWL.
+    One row per (gwl, GCM, run, zone, duration) with the number of WSED
+    events of that exact duration -- built by aggregating each realization's
+    event table (build_events_for_realization) immediately, one at a time,
+    rather than concatenating every raw per-event row across every
+    realization first. This is the expensive step (opens and processes every
+    GCM/run's daily wcf/scf files); its result is what main() caches to CSV
+    (see save_counts_cache/load_counts_cache) so repeat plotting runs don't
+    have to redo it.
     """
-    events_by_gwl = {}
-    empty_cols = ["lat", "year", "duration", "zone", "GCM", "run", "gwl"]
+    rows = []
     for gwl in gwl_list:
         print(f"\n  -- {gwl} --")
         realizations = discover_realizations(preprocessed_path, gwl, ssp, exclude_gcm, exclude_gcm_run)
         if not realizations:
             print(f"    No files found for {gwl}, skipping.")
-            events_by_gwl[gwl] = pd.DataFrame(columns=empty_cols)
             continue
 
-        dfs = []
         for gcm, run in realizations:
             print(f"    {gcm} / {run}")
             try:
-                dfs.append(build_events_for_realization(
-                    preprocessed_path, gwl, gcm, run, ssp, threshold, shapefile_path))
+                df_events = build_events_for_realization(
+                    preprocessed_path, gwl, gcm, run, ssp, threshold, shapefile_path)
             except Exception as exc:
                 print(f"      [ERROR] {gcm}/{run}/{gwl}: {exc}")
+                continue
+            frag = (df_events.groupby(["zone", "duration"]).size()
+                    .reset_index(name="count"))
+            frag["gwl"] = gwl
+            frag["GCM"] = gcm
+            frag["run"] = run
+            rows.append(frag[COUNTS_CACHE_COLUMNS])
+            del df_events, frag
             gc.collect()
 
-        events_by_gwl[gwl] = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=empty_cols)
-    return events_by_gwl
+    if not rows:
+        return pd.DataFrame(columns=COUNTS_CACHE_COLUMNS)
+    return pd.concat(rows, ignore_index=True)
+
+
+def _cache_meta(threshold, ssp):
+    """Parameters that change the counts, guarded against on cache load."""
+    return {"lat_zone_edges": LAT_ZONE_EDGES, "threshold": threshold, "ssp": ssp}
+
+
+def save_counts_cache(counts_df, path, threshold, ssp):
+    """
+    Write the counts cache as a plain CSV with one leading '#'-commented
+    metadata line (latitude bands, threshold, ssp) that load_counts_cache
+    checks before trusting the cache -- so a later change to LAT_ZONE_EDGES
+    (or --threshold/--ssp) doesn't silently reuse counts binned under the
+    old definition.
+    """
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        f.write(f"# {json.dumps(_cache_meta(threshold, ssp))}\n")
+        counts_df.to_csv(f, index=False)
+
+
+def load_counts_cache(path, threshold, ssp):
+    """
+    Returns the cached counts DataFrame if `path` exists and its leading
+    metadata line matches the current latitude bands/threshold/ssp;
+    otherwise None (caller falls back to rebuilding from scratch).
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        first_line = f.readline()
+    if not first_line.startswith("#"):
+        print(f"  [cache] {path} has no metadata header -- ignoring stale/foreign cache.")
+        return None
+    try:
+        meta = json.loads(first_line[1:].strip())
+    except (json.JSONDecodeError, ValueError):
+        print(f"  [cache] {path} has an unreadable metadata header -- ignoring.")
+        return None
+    expected = _cache_meta(threshold, ssp)
+    if meta != expected:
+        print(f"  [cache] {path} was built with different settings {meta} "
+              f"than requested {expected} -- ignoring and rebuilding.")
+        return None
+    return pd.read_csv(path, comment="#")
 
 
 # =============================================================================
 # Plotting
 # =============================================================================
 
-def _discrete_pmf(values, x_int, min_events):
-    """
-    Probability mass at each integer duration in x_int (share of events with
-    that *exact* length, summing to 1) -- not a continuous KDE. Duration is a
-    small integer count (1, 2, 3, ... days), so a Gaussian KDE fabricates
-    density between integers that cannot physically occur and, with a
-    bandwidth narrow enough to resolve the 1-day spike, oscillates between
-    them; a PMF plotted directly at each integer avoids both problems and is
-    the honest representation of count data like this.
-    Returns None (skip) if there are fewer than min_events events.
-    """
+def _for_line(arr):
+    """NaN out zero bins (not drawn as 0) so a log-scale line shows real gaps as gaps."""
+    return np.where(arr > 0, arr, np.nan)
+
+
+def _weighted_percentile(values, weights, pct):
+    """pct-th percentile of `values` weighted by `weights` (e.g. event counts per duration)."""
     values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    if values.size < min_events:
+    weights = np.asarray(weights, dtype=float)
+    order = np.argsort(values)
+    values, weights = values[order], weights[order]
+    cum = np.cumsum(weights)
+    if cum.size == 0 or cum[-1] <= 0:
+        return float(values[-1]) if values.size else 0.0
+    idx = min(int(np.searchsorted(cum, pct / 100.0 * cum[-1])), len(values) - 1)
+    return float(values[idx])
+
+
+def _group_counts(counts_df, gwl, zone, x_int):
+    """
+    (count_array over x_int, mean_duration, total_count) for one (gwl, zone),
+    pooled (summed) over every contributing (GCM, run) realization. Returns
+    None if there is no data for this (gwl, zone). `total_count` covers every
+    duration on record, not just those within x_int, so a normalized share
+    computed from it can legitimately sum to less than 1 over x_int alone
+    (see module docstring).
+    """
+    sub = counts_df[(counts_df["gwl"] == gwl) & (counts_df["zone"] == zone)]
+    if sub.empty:
         return None
-    counts = np.bincount(values.astype(int), minlength=int(x_int[-1]) + 1)[x_int]
-    pmf = counts / values.size
-    return np.where(pmf > 0, pmf, np.nan)  # NaN (not 0) so log-scale lines show real gaps
+    agg = sub.groupby("duration")["count"].sum()
+    total = float(agg.sum())
+    arr = np.array([agg.get(d, 0) for d in x_int], dtype=float)
+    mean_dur = float((agg.index.to_numpy() * agg.to_numpy()).sum() / total) if total > 0 else np.nan
+    return arr, mean_dur, total
 
 
-def plot_distributions(events_by_gwl, pixel_counts, gwl_list, output_path, dpi=300,
-                        max_duration_days=None, show_individual=False,
-                        min_events_per_sim=5, title=None):
-    all_durations = np.concatenate([
-        events_by_gwl[g]["duration"].to_numpy() for g in gwl_list if not events_by_gwl[g].empty
-    ]) if any(not events_by_gwl[g].empty for g in gwl_list) else np.array([])
+def _bootstrap_band_from_counts(counts_df, gwl, zone, x_int, normalize, n_boot=500, ci=90, rng=None):
+    """
+    (lo, hi) envelope at each integer duration in x_int from resampling
+    *realizations* (GCM, run) with replacement, n_boot times -- the
+    appropriate bootstrap unit here, since events within one realization are
+    not independent draws but different GCM/runs plausibly are. Works
+    directly off the aggregated counts table (no raw per-event data needed).
+    Returns (None, None) if fewer than 2 realizations are available.
+    """
+    sub = counts_df[(counts_df["gwl"] == gwl) & (counts_df["zone"] == zone)]
+    if sub.empty:
+        return None, None
+    keys = list(sub[["GCM", "run"]].drop_duplicates().itertuples(index=False, name=None))
+    n_keys = len(keys)
+    if n_keys < 2:
+        return None, None
+
+    key_idx = {k: i for i, k in enumerate(keys)}
+    dur_idx = {d: j for j, d in enumerate(x_int)}
+    M = np.zeros((n_keys, len(x_int)))
+    totals = np.zeros(n_keys)
+    for gcm, run, dur, cnt in zip(sub["GCM"], sub["run"], sub["duration"], sub["count"]):
+        i = key_idx[(gcm, run)]
+        totals[i] += cnt
+        j = dur_idx.get(dur)
+        if j is not None:
+            M[i, j] += cnt
+
+    rng = rng if rng is not None else np.random.default_rng(12345)
+    boot = np.empty((n_boot, len(x_int)))
+    for b in range(n_boot):
+        idx = rng.integers(0, n_keys, size=n_keys)
+        arr = M[idx].sum(axis=0)
+        if normalize:
+            tot = totals[idx].sum()
+            arr = arr / tot if tot > 0 else arr
+        boot[b] = arr
+    alpha = (100.0 - ci) / 2.0
+    lo = np.percentile(boot, alpha, axis=0)
+    hi = np.percentile(boot, 100.0 - alpha, axis=0)
+    return lo, hi
+
+
+def _add_locator_map(fig, gs_column, zone_order):
+    """
+    Small PlateCarree map spanning the analysis band (MAP_LAT_SOUTH ..
+    MAP_LAT_NORTH), shaded and outlined at each zone boundary, occupying the
+    whole left-hand gridspec column (gs_column = gs[:, 0]) so it lines up
+    vertically with the stacked distribution panels in the right-hand
+    column. Returns (ax_map, {zone_label: lat_mid}) -- the latter consumed by
+    the caller to draw the connector lines to each panel.
+    """
+    ax_map = fig.add_subplot(gs_column, projection=ccrs.PlateCarree())
+    ax_map.set_extent([-180, 180, MAP_LAT_SOUTH - 2, MAP_LAT_NORTH + 2], crs=ccrs.PlateCarree())
+    ax_map.coastlines(resolution="110m", linewidth=0.3, color="#444444", zorder=3)
+
+    lat_mid = {}
+    for zlabel in zone_order:
+        lo, hi = ZONE_BOUNDS[zlabel]
+        lat_mid[zlabel] = (lo + hi) / 2.0
+        ax_map.axhspan(lo, hi, facecolor=ZONE_MAP_COLORS[zlabel], alpha=0.35, zorder=1)
+    for edge in LAT_ZONE_EDGES:
+        ax_map.axhline(edge, color="black", linewidth=0.5, zorder=2)
+
+    ax_map.set_xticks([])
+    ax_map.set_yticks([])
+    for spine in ax_map.spines.values():
+        spine.set_visible(False)
+    return ax_map, lat_mid
+
+
+def plot_distributions(counts_df, pixel_counts, gwl_list, output_path, dpi=300,
+                        max_duration_days=None, normalize=True, uncertainty=None,
+                        n_boot=500, ci=90, min_events=5, title=None, subtitle=None):
+    """
+    normalize=True plots each duration's share of that (zone, GWL) group's
+    total events (sums to 1); normalize=False plots the raw event count, so
+    a GWL with more events overall visibly sits above one with fewer, which
+    the normalized share alone cannot show. uncertainty=None draws only the
+    pooled line; uncertainty='bootstrap' additionally shades a `ci`%
+    envelope from n_boot resamples of the contributing (GCM, run)
+    realizations (see _bootstrap_band_from_counts) instead of drawing each
+    realization's own line. `counts_df` is the aggregated event-duration
+    counts table (see build_counts_table / load_counts_cache): one row per
+    (gwl, GCM, run, zone, duration) with that combination's event count.
+    """
+    counts_in_scope = counts_df[counts_df["gwl"].isin(gwl_list)]
     if max_duration_days is None:
-        max_duration_days = float(max(5.0, np.percentile(all_durations, 99))) if all_durations.size else 20.0
+        if counts_in_scope.empty:
+            max_duration_days = 20.0
+        else:
+            by_dur = counts_in_scope.groupby("duration")["count"].sum()
+            max_duration_days = float(max(
+                5.0, _weighted_percentile(by_dur.index.to_numpy(), by_dur.to_numpy(), 99)))
     x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
 
-    fig, axes = plt.subplots(
-        len(LAT_ZONE_LABELS), 1, figsize=(FIG_WIDTH_IN, FIG_WIDTH_IN * 1.7), sharex=True,
-    )
+    # North -> south so the panel stack (top to bottom) reads the same way as
+    # the locator map (north at the top) -- LAT_ZONE_LABELS itself stays
+    # south -> north since that's the order np.digitize needs. Panels are
+    # equal height for readability; the map's *own* y-axis (true latitude,
+    # via set_extent) already shows each zone's true width, and the
+    # connector lines bridge the two scales.
+    zone_order = list(reversed(LAT_ZONE_LABELS))
 
-    for ax, zlabel in zip(axes, LAT_ZONE_LABELS):
+    fig = plt.figure(figsize=(FIG_WIDTH_IN * 1.9, FIG_WIDTH_IN * 1.7))
+    gs = GridSpec(len(zone_order), 2, width_ratios=[1.0, 2.4],
+                  left=0.14, right=0.97, top=0.85, bottom=0.08,
+                  hspace=0.25, wspace=0.55, figure=fig)
+
+    ax_map, lat_mid = _add_locator_map(fig, gs[:, 0], zone_order)
+
+    dist_axes = []
+    for i, zlabel in enumerate(zone_order):
+        ax = fig.add_subplot(gs[i, 1], sharex=dist_axes[0] if dist_axes else None)
+        dist_axes.append(ax)
         for gwl in gwl_list:
             color = GWL_COLORS.get(gwl, "gray")
-            df_gwl = events_by_gwl[gwl]
-            df_zone = df_gwl[df_gwl["zone"] == zlabel] if not df_gwl.empty else df_gwl
-
-            if show_individual and not df_zone.empty:
-                for (_gcm, _run), df_sim in df_zone.groupby(["GCM", "run"]):
-                    y_sim = _discrete_pmf(df_sim["duration"].to_numpy(), x_int, min_events_per_sim)
-                    if y_sim is not None:
-                        ax.plot(x_int, y_sim, color=color, alpha=0.2, linewidth=0.6, zorder=1)
-
-            if df_zone.empty:
+            group = _group_counts(counts_df, gwl, zlabel, x_int)
+            if group is None:
                 continue
-            durations = df_zone["duration"].to_numpy()
-            y_pooled = _discrete_pmf(durations, x_int, min_events=1)
-            if y_pooled is not None:
-                ax.plot(x_int, y_pooled, color=color, marker="o", markersize=2.5,
-                        linewidth=1.4, zorder=3, label=GWL_LABELS.get(gwl, gwl))
-            ax.axvline(durations.mean(), color=color, linestyle="--", linewidth=1.2, zorder=4)
+            arr, mean_dur, total = group
+            if total < min_events:
+                continue
+
+            if uncertainty == "bootstrap":
+                lo, hi = _bootstrap_band_from_counts(
+                    counts_df, gwl, zlabel, x_int, normalize, n_boot=n_boot, ci=ci)
+                if lo is not None:
+                    ax.fill_between(x_int, lo, hi, color=color, alpha=0.22,
+                                     linewidth=0, zorder=2)
+
+            y_pooled = _for_line(arr / total if normalize else arr)
+            ax.plot(x_int, y_pooled, color=color, marker="o", markersize=2.5,
+                    linewidth=1.4, zorder=3, label=GWL_LABELS.get(gwl, gwl))
+            ax.axvline(mean_dur, color=color, linestyle="--", linewidth=1.2, zorder=4)
 
         n_px = pixel_counts.get(zlabel)
-        ylabel = zlabel + (f"\nShare of events (n={n_px:,} px)" if n_px is not None else "\nShare of events")
-        ax.set_ylabel(ylabel, fontsize=7)
+        base_label = "Share of events" if normalize else "Number of events"
+        ylabel = f"{base_label}\n(n={n_px:,} px)" if n_px is not None else base_label
+        ax.set_ylabel(ylabel, fontsize=6.5)
+        ax.set_title(zlabel, fontsize=7, loc="left", color=ZONE_MAP_COLORS[zlabel],
+                     fontweight="bold", pad=2)
         ax.set_yscale("log")
         ax.tick_params(labelsize=6)
+        if i < len(zone_order) - 1:
+            ax.tick_params(labelbottom=False)
         ax.set_xlim(0.5, max_duration_days + 0.5)
         ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
         ax.grid(True, linestyle="--", alpha=0.3)
         for spine in ax.spines.values():
             spine.set_linewidth(0.4)
+        # Colour-coded tab on the panel's own left edge, plus a dashed
+        # connector back to this zone's band on the locator map, so the
+        # correspondence is explicit rather than relying on stacking order.
+        ax.spines["left"].set_color(ZONE_MAP_COLORS[zlabel])
+        ax.spines["left"].set_linewidth(2.5)
+        con = ConnectionPatch(
+            xyA=(180, lat_mid[zlabel]), coordsA=ax_map.transData,
+            xyB=(0, 0.5), coordsB=ax.transAxes,
+            color=ZONE_MAP_COLORS[zlabel], linewidth=0.9, linestyle="--",
+            alpha=0.85, zorder=1,
+        )
+        fig.add_artist(con)
 
-    axes[-1].set_xlabel("WSED event duration (days)", fontsize=8)
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(gwl_list), fontsize=7,
-               bbox_to_anchor=(0.5, 1.02), frameon=False)
+    dist_axes[-1].set_xlabel("WSED event duration (days)", fontsize=8)
     if title:
-        fig.suptitle(title, fontsize=8, y=1.06)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.suptitle(title, fontsize=8, y=0.995)
+    if subtitle:
+        fig.text(0.5, 0.955, subtitle, fontsize=6.5, ha="center", style="italic")
+    handles, labels = dist_axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(gwl_list), fontsize=7,
+               bbox_to_anchor=(0.5, 0.92), frameon=False)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return fig
@@ -423,37 +673,65 @@ def main():
         print(f"  {z}: {n} pixels")
 
     print("\n" + "=" * 60)
-    print("STEP 2 - Building WSED event tables for every GCM/run x GWL")
+    print("STEP 2 - Event-duration counts per zone/GCM/run (cached)")
     print("=" * 60)
-    events_by_gwl = build_all_events(
-        args.preprocessed_path, args.gwl_list, args.ssp, args.threshold,
-        args.shapefile, args.exclude_gcm, args.exclude_gcm_run,
-    )
-    for gwl, df in events_by_gwl.items():
-        n_sims = df[["GCM", "run"]].drop_duplicates().shape[0] if not df.empty else 0
-        print(f"  {gwl}: {len(df)} events from {n_sims} GCM-run realizations")
+    cache_path = args.cache_csv or os.path.join(
+        args.output_dir, "event_duration_counts_cache.csv")
+    counts_df = None if args.recompute else load_counts_cache(
+        cache_path, args.threshold, args.ssp)
+    if counts_df is not None:
+        print(f"  Loaded cached counts from {cache_path} "
+              f"({len(counts_df)} rows) -- skipping the expensive rebuild.")
+        missing_gwl = set(args.gwl_list) - set(counts_df["gwl"].unique())
+        if missing_gwl:
+            print(f"  [warn] cache has no rows for {sorted(missing_gwl)} -- "
+                  "pass --recompute if these GWLs should have data.")
+    else:
+        counts_df = build_counts_table(
+            args.preprocessed_path, args.gwl_list, args.ssp, args.threshold,
+            args.shapefile, args.exclude_gcm, args.exclude_gcm_run,
+        )
+        save_counts_cache(counts_df, cache_path, args.threshold, args.ssp)
+        print(f"  Saved counts cache -> {cache_path}")
+
+    for gwl in args.gwl_list:
+        sub = counts_df[counts_df["gwl"] == gwl]
+        n_sims = sub[["GCM", "run"]].drop_duplicates().shape[0]
+        print(f"  {gwl}: {int(sub['count'].sum())} events from {n_sims} GCM-run realizations")
 
     print("\n" + "=" * 60)
     print("STEP 3 - Plotting")
     print("=" * 60)
-    out1 = os.path.join(args.output_dir, "fig_duration_distribution_by_latitude.png")
-    plot_distributions(
-        events_by_gwl, pixel_counts, args.gwl_list, out1, dpi=args.dpi,
-        max_duration_days=args.max_duration_days, show_individual=False,
-        title="WSED event-duration distribution by latitude zone and GWL",
-    )
-    print(f"  Saved -> {out1}")
+    base_title = "WSED event-duration distribution by latitude zone and GWL"
 
-    out2 = os.path.join(
-        args.output_dir, "fig_duration_distribution_by_latitude_with_simulations.png")
+    out_share = os.path.join(args.output_dir, "fig_duration_distribution_by_latitude_share.png")
     plot_distributions(
-        events_by_gwl, pixel_counts, args.gwl_list, out2, dpi=args.dpi,
-        max_duration_days=args.max_duration_days, show_individual=True,
-        min_events_per_sim=args.min_events_per_sim,
-        title=("WSED event-duration distribution by latitude zone and GWL\n"
-               "(faint lines: individual GCM-run realizations)"),
+        counts_df, pixel_counts, args.gwl_list, out_share, dpi=args.dpi,
+        max_duration_days=args.max_duration_days, normalize=True, uncertainty=None,
+        min_events=args.min_events, title=base_title,
+        subtitle="(share of each group's events -- shape only, not overall frequency)",
     )
-    print(f"  Saved -> {out2}")
+    print(f"  Saved -> {out_share}")
+
+    out_counts = os.path.join(args.output_dir, "fig_duration_distribution_by_latitude_counts.png")
+    plot_distributions(
+        counts_df, pixel_counts, args.gwl_list, out_counts, dpi=args.dpi,
+        max_duration_days=args.max_duration_days, normalize=False, uncertainty=None,
+        min_events=args.min_events, title=base_title,
+        subtitle="(raw event counts -- also reflects overall frequency differences)",
+    )
+    print(f"  Saved -> {out_counts}")
+
+    out_boot = os.path.join(
+        args.output_dir, "fig_duration_distribution_by_latitude_counts_bootstrap.png")
+    plot_distributions(
+        counts_df, pixel_counts, args.gwl_list, out_boot, dpi=args.dpi,
+        max_duration_days=args.max_duration_days, normalize=False, uncertainty="bootstrap",
+        n_boot=args.n_boot, ci=args.ci, min_events=args.min_events, title=base_title,
+        subtitle=f"(raw event counts; shaded band = {args.ci:.0f}% bootstrap CI "
+                 "over GCM-run realizations)",
+    )
+    print(f"  Saved -> {out_boot}")
 
 
 if __name__ == "__main__":
