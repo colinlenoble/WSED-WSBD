@@ -1,4 +1,4 @@
-# -*- coding: cp1252 -*-
+# -*- coding: utf-8 -*-
 import os
 import config
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
@@ -35,7 +35,7 @@ import cartopy.feature as cfeature
 # =============================================================================
 # Figure size constants (LaTeX-compatible)
 # =============================================================================
-FIG_WIDTH_IN = 5.15   # single column width � pt fontsizes match LaTeX
+FIG_WIDTH_IN = 5.15   # single column width -- pt fontsizes match LaTeX
 
 # Latitude band shown on EqualEarth maps in this module (matches the
 # analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
@@ -530,7 +530,7 @@ def _three_panel_map(df_gwl15, df_gwl2, df_gwl3,
                      title_gwl2, title_gwl15, title_gwl3,
                      cbar_label, dpi):
     proj = ccrs.EqualEarth()
-    # 1 large top + 2 smaller bottom ? width = 2 � FIG_WIDTH_IN, height proportional
+    # 1 large top + 2 smaller bottom -> width = 2x FIG_WIDTH_IN, height proportional
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (8 / 14)
     fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
@@ -562,10 +562,10 @@ def plot_main_gwl_maps(df_gwl15, df_gwl2, df_gwl3,
     fig = _three_panel_map(
         df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
         value_fn=_mmm_combined, value_col="Combined_Effect",
-        title_gwl2="2�C",
-        title_gwl15="1.5�C",
-        title_gwl3="3�C",
-        cbar_label="WSBDs change compared to 0.61�C (%)", dpi=dpi,
+        title_gwl2="2°C",
+        title_gwl15="1.5°C",
+        title_gwl3="3°C",
+        cbar_label="WSBDs change compared to 0.61°C (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "main", "fig_main_gwl_maps.png"), dpi)
 
@@ -595,7 +595,7 @@ def plot_main_dumbbell(df_gwl2, shapefile_path, dpi=300, share_re="current",
     demand_color, re_color = pal(0.8), pal(0.2)
     plt.style.use("seaborn-v0_8-whitegrid")
 
-    # Broken-axis layout � width = 2 � FIG_WIDTH_IN
+    # Broken-axis layout -- width = 2x FIG_WIDTH_IN
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (16 / 14)
     fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
@@ -711,9 +711,9 @@ def plot_supp_gwl_maps(df_gwl15, df_gwl2, df_gwl3,
     fig = _three_panel_map(
         df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
         value_fn=_mmm_combined, value_col="Combined_Effect",
-        title_gwl2="WSBDs change - 2.0�C warming",
-        title_gwl15="WSBDs change - 1.5�C warming",
-        title_gwl3="WSBDs change - 3.0�C warming",
+        title_gwl2="WSBDs change - 2.0°C warming",
+        title_gwl15="WSBDs change - 1.5°C warming",
+        title_gwl3="WSBDs change - 3.0°C warming",
         cbar_label="Combined effect on WSBDs (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "supp",
@@ -736,9 +736,9 @@ def plot_supp_re_effect(df_gwl15, df_gwl2, df_gwl3,
     fig = _three_panel_map(
         df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
         value_fn=_mmm_re, value_col="RE_Effect",
-        title_gwl2="RE supply effect - 2.0�C warming",
-        title_gwl15="RE supply effect - 1.5�C warming",
-        title_gwl3="RE supply effect - 3.0�C warming",
+        title_gwl2="RE supply effect - 2.0°C warming",
+        title_gwl15="RE supply effect - 1.5°C warming",
+        title_gwl3="RE supply effect - 3.0°C warming",
         cbar_label="RE supply effect on WSBDs (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "supp",
@@ -761,9 +761,9 @@ def plot_supp_tas_effect(df_gwl15, df_gwl2, df_gwl3,
     fig = _three_panel_map(
         df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
         value_fn=_mmm_tas, value_col="TAS_Effect",
-        title_gwl2="Demand effect - 2.0�C warming",
-        title_gwl15="Demand effect - 1.5�C warming",
-        title_gwl3="Demand effect - 3.0�C warming",
+        title_gwl2="Demand effect - 2.0°C warming",
+        title_gwl15="Demand effect - 1.5°C warming",
+        title_gwl3="Demand effect - 3.0°C warming",
         cbar_label="Demand effect on WSBDs (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "supp",
@@ -825,7 +825,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
         ax.spines["geo"].set_visible(False)
     except KeyError:
         ax.outline_patch.set_visible(False)
-    ax.set_title("Driver decomposition: RE vs. demand share of WSBD change (GWL 2.0�C)",
+    ax.set_title("Driver decomposition: RE vs. demand share of WSBD change (GWL 2.0°C)",
                  fontsize=8, fontweight="bold", pad=6)
 
     sm = plt.cm.ScalarMappable(cmap=cmap_c, norm=norm_c)
@@ -854,15 +854,15 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
     REF_COLOR = "#c0392b"
     ALT_COLOR = "#2c3e50"
     _meta = {
-        "default"  : ("Reference",            "Tc=12.5�C  �  Th=19.6�C  �  a=0.026/0.035"),
-        "cold_low" : ("Cold threshold -2�C",  "Tc=10.5�C"),
-        "cold_high": ("Cold threshold +2�C",  "Tc=14.5�C"),
-        "hot_low"  : ("Hot threshold -2�C",   "Th=17.6�C"),
-        "hot_high" : ("Hot threshold +2�C",   "Th=21.6�C"),
-        "coef_low" : ("Coefficients -20%",    "ac=0.021  �  ah=0.028"),
-        "coef_high": ("Coefficients +20%",    "ac=0.031  �  ah=0.042"),
-        "strict"   : ("Wide comfort zone",    "Tc=10.5�C  �  Th=21.6�C  �  a=0.021/0.028"),
-        "sensitive": ("Narrow comfort zone",  "Tc=14.5�C  �  Th=17.6�C  �  a=0.031/0.042"),
+        "default"  : ("Reference",            "Tc=12.5°C  ·  Th=19.6°C  ·  a=0.026/0.035"),
+        "cold_low" : ("Cold threshold -2°C",  "Tc=10.5°C"),
+        "cold_high": ("Cold threshold +2°C",  "Tc=14.5°C"),
+        "hot_low"  : ("Hot threshold -2°C",   "Th=17.6°C"),
+        "hot_high" : ("Hot threshold +2°C",   "Th=21.6°C"),
+        "coef_low" : ("Coefficients -20%",    "ac=0.021  ·  ah=0.028"),
+        "coef_high": ("Coefficients +20%",    "ac=0.031  ·  ah=0.042"),
+        "strict"   : ("Wide comfort zone",    "Tc=10.5°C  ·  Th=21.6°C  ·  a=0.021/0.028"),
+        "sensitive": ("Narrow comfort zone",  "Tc=14.5°C  ·  Th=17.6°C  ·  a=0.031/0.042"),
     }
     names = list(DEMAND_CONFIGS.keys())
     ncols = 3
@@ -1209,7 +1209,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
     except KeyError:
         ax.outline_patch.set_visible(False)
     ax.set_title(
-        "Inter-model uncertainty decomposition: RE supply share of total spread (GWL 2.0�C)",
+        "Inter-model uncertainty decomposition: RE supply share of total spread (GWL 2.0°C)",
         fontsize=8, fontweight="bold", pad=6)
 
     sm = plt.cm.ScalarMappable(cmap=cmap_c, norm=norm_c)
@@ -1282,7 +1282,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     except KeyError:
         ax.outline_patch.set_visible(False)
     ax.set_title(
-        "Inter-model spread in RE supply effect on WSBDs (std across GCMs, GWL 2.0�C)",
+        "Inter-model spread in RE supply effect on WSBDs (std across GCMs, GWL 2.0°C)",
         fontsize=8, fontweight="bold", pad=6)
     sm = plt.cm.ScalarMappable(cmap=cmap_c, norm=norm_c)
     sm.set_array([])
@@ -1389,7 +1389,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     norm_re  = mcolors.Normalize(vmin=-100, vmax=100)
     gdf_re   = _build_gdf(shapefile_path, _mmm_re(df_gwl2, share_re, vmax=100), hatch_df)
     _draw_map(ax_a, gdf_re, "RE_Effect", cmap_re, norm_re, hatch_df,
-              "RE supply effect\n� 2.0�C warming", "b", title_fontsize=6)
+              "RE supply effect\n— 2.0°C warming", "b", title_fontsize=6)
     sm_a = plt.cm.ScalarMappable(cmap=cmap_re, norm=norm_re)
     sm_a.set_array([])
     cb_a = fig.colorbar(sm_a, ax=ax_a, orientation="horizontal",
@@ -1398,7 +1398,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     cb_a.ax.tick_params(labelsize=5)
     cb_a.outline.set_linewidth(0.4)
 
-    # Panel b: Demand (TAS) effect � asymmetric cmap: 50 pts for [-100,0], 100 for [0,200]
+    # Panel b: Demand (TAS) effect -- asymmetric cmap: 50 pts for [-100,0], 100 for [0,200]
     base_tas = plt.get_cmap("RdYlBu_r")
     cols_tas = ([base_tas(v) for v in np.linspace(0.0, 0.45, 50)] +
                 [base_tas(v) for v in np.linspace(0.55, 1.0, 100)])
@@ -1406,7 +1406,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     norm_tas = mcolors.Normalize(vmin=-100, vmax=200)
     gdf_tas  = _build_gdf(shapefile_path, _mmm_tas(df_gwl2, share_re, vmax=200), hatch_df)
     _draw_map(ax_b, gdf_tas, "TAS_Effect", cmap_tas, norm_tas, hatch_df,
-              "Demand effect\n� 2.0�C warming", "c", title_fontsize=6)
+              "Demand effect\n— 2.0°C warming", "c", title_fontsize=6)
     sm_b = plt.cm.ScalarMappable(cmap=cmap_tas, norm=norm_tas)
     sm_b.set_array([])
     cb_b = fig.colorbar(sm_b, ax=ax_b, orientation="horizontal",
