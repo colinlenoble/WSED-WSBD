@@ -138,9 +138,10 @@ def parse_args():
         "--agreement_path",
         default=config.AGREEMENT_NC_PATH,
         help=(
-            "Path to a pre-computed model-agreement DataArray (.nc). "
-            "Values represent the percentage of models agreeing on the sign of change. "
-            "Cells with value <= agreement_threshold are hatched on the map. "
+            "Path to a pre-computed model-agreement DataArray (.nc), built by "
+            "trend_sev_eval.py's build_agreement_mask(). Values are agreement_pct: the %% "
+            "of GCM realizations whose bootstrap trend CI overlaps the ERA5 reference trend "
+            "CI at each cell. Cells with value <= agreement_threshold are hatched on the map. "
             "If not provided, no hatching is applied."
         ),
     )
@@ -148,7 +149,10 @@ def parse_args():
         "--agreement_threshold",
         type=float,
         default=config.AGREEMENT_THRESHOLD,
-        help="Threshold below which cells are hatched (default: 15 %% of models agreeing).",
+        help=(
+            "Threshold below which cells are hatched (default: config.AGREEMENT_THRESHOLD, "
+            "%.0f%% of models with an overlapping trend CI)." % config.AGREEMENT_THRESHOLD
+        ),
     )
 
     # --- Shapefile / output ---
@@ -659,7 +663,7 @@ def plot_gwl_valuebyalpha_discrete(
     df_regions,
     gwl_label,
     hatchings=None,
-    agreement_threshold=15.0,
+    agreement_threshold=config.AGREEMENT_THRESHOLD,
     map_title=None,
     relchange_label="Relative change (%)",
     sev_label="Average annual\nseverity (0.61 °C)",
@@ -925,7 +929,7 @@ def plot_supp_valuebyalpha_stacked(
     da_mask_ref,
     no_wind_mask,
     hatchings=None,
-    agreement_threshold=15.0,
+    agreement_threshold=config.AGREEMENT_THRESHOLD,
     change_edges=None,
     sev_edges=None,
     n_bins_change=5,

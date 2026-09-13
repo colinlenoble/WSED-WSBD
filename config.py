@@ -28,7 +28,17 @@ PATH_PREPROCESSED = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_p
 SHAPEFILE_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/shapefile_data/shp_re.shp"
 SHAPEFILE_PATH_LIGHT = "/gpfs/workdir/shared/juicce/RE_Colin/shapefile_data/ne_mix_adm0_adm1_light/ne_mix_adm0_adm1.shp"
 TEMP_FOLDER = "/gpfs/workdir/shared/juicce/RE_Colin/temp/"
-AGREEMENT_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/temp/trend_validation_masked.nc"
+
+# Model-agreement-with-ERA5 masks, built by trend_sev_eval.py's
+# build_agreement_mask() from its own grid_ic_ref.nc / agg_ic_ann_sev_GCMs_all_year_*.nc
+# outputs (see that module for the exact overlap test). AGREEMENT_NC_PATH is the
+# per-pixel (lat, lon) mask; AGREEMENT_AGGREGATED_NC_PATH is the polygon-native
+# twin built from wcf_agg_*/scf_agg_* (one value per poly_idx, same shapefile as
+# AGREEMENT_SUFFIX_SHP/fig45.py's RL pipeline) -- fig45.py prefers this one over
+# re-aggregating the pixel mask onto polygons on the fly.
+AGREEMENT_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/trend_agreement_mask_ERA5.nc"
+AGREEMENT_AGGREGATED_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/trend_agreement_mask_aggregated_ERA5_v1.nc"
+AGREEMENT_SUFFIX_SHP = "v1"  # shapefile-version suffix on wcf_agg_*/scf_agg_* files (see calculate_cf.py)
 SHARE_RENEWABLE_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/share_renewable.csv"
 POP_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ppp_2020_1km_Aggregated.tif"
 SUMMARY_FIGS_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures/"
@@ -64,4 +74,4 @@ GWL_LEVELS = ['1.5', '2.0', '3.0']  # projection-only subset (no GWL0-61/GWL1) u
 REANALYSIS = 'ERA5'
 SHEAR_REF_PERIOD = ('1982-01-01', '2001-12-31')  # local wind shear exponent fit period
 EXCLUDE_GCM_RUN = ['EC-Earth3-Veg-LR:r3i1p1f1']  # GCM:run pairs excluded from ensemble figures
-AGREEMENT_THRESHOLD = 15.0  # % of models agreeing below which cells are hatched on figures
+AGREEMENT_THRESHOLD = 50.0  # % of models whose trend CI overlaps the ERA5 reference CI, below which cells/polygons are hatched on figures

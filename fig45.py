@@ -84,6 +84,7 @@ PATHS = {
     "shapefile":          config.SHAPEFILE_PATH,
     "df_share_csv":       config.SHARE_RENEWABLE_CSV,
     "agreement_nc":       config.AGREEMENT_NC_PATH,
+    "agreement_aggregated_nc": config.AGREEMENT_AGGREGATED_NC_PATH,
     "out_dir":            config.PATH_PREPROCESSED + "agg_datasets/rl_out/",
     "ssp":                config.SSP,
     "reanalysis":         config.REANALYSIS,
@@ -399,13 +400,36 @@ def load_gwl_dfs(csv_path):
     return _sub("GWL1-5"), _sub("GWL2"), _sub("GWL3")
 
 
-def load_hatch_agg(agreement_nc, shapefile_path):
+def load_hatch_agg(agreement_nc, shapefile_path, agreement_threshold=None, agreement_aggregated_nc=None):
+    """
+    hatch_df/idxs_hatch: which shapefile polygons get hatched for low model
+    agreement with ERA5's observed trend (agreement_pct < agreement_threshold,
+    default config.AGREEMENT_THRESHOLD -- 50%% of models with an overlapping
+    trend CI, see trend_sev_eval.py's build_agreement_mask()).
+
+    `agreement_aggregated_nc` (recommended -- config.AGREEMENT_AGGREGATED_NC_PATH)
+    is a poly_idx-native agreement_pct DataArray built by trend_sev_eval.py's
+    aggregated pipeline (uncertainty_range_aggregated/make_ref_trend_ci_aggregated/
+    build_agreement_mask) straight from each polygon's own aggregated wcf/scf
+    trend, one value per polygon already -- pass it (once generated) to use
+    that directly instead of the `agreement_nc` fallback below, which
+    approximates a polygon score by area-weighting the *pixel*-level mask
+    onto the shapefile via xagg.
+    """
+    agreement_threshold = config.AGREEMENT_THRESHOLD if agreement_threshold is None else agreement_threshold
+
+    if agreement_aggregated_nc is not None and os.path.exists(agreement_aggregated_nc):
+        agreement_pct = xr.open_dataarray(agreement_aggregated_nc)
+        hatch_df = agreement_pct.to_dataframe(name="var").reset_index()
+        idxs_hatch = hatch_df[hatch_df["var"] <= agreement_threshold]["poly_idx"].values
+        return hatch_df, idxs_hatch
+
     hatchings  = xr.open_dataarray(agreement_nc)
     shapefile  = gpd.read_file(shapefile_path)
     weight_map = xa.pixel_overlaps(hatchings, shapefile)
     hatch_agg  = xa.aggregate(hatchings, weight_map).to_dataset()
     hatch_df   = hatch_agg[["poly_idx", "var"]].to_dataframe().reset_index()
-    idxs_hatch = hatch_df[hatch_df["var"] <= 15]["poly_idx"].values
+    idxs_hatch = hatch_df[hatch_df["var"] <= agreement_threshold]["poly_idx"].values
     return hatch_df, idxs_hatch
 
 
@@ -434,7 +458,7 @@ def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
     gdf2 = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH].copy()
     if "var" not in gdf2.columns:
         gdf2 = gdf2.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
-    gdf2["do_hatch"] = gdf2["var"].lt(16).fillna(False)
+    gdf2["do_hatch"] = gdf2["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
     vals     = gdf2[value_col].to_numpy()
     nan_mask = ~np.isfinite(vals)
     fcs      = [(1.0, 1.0, 1.0, 1.0) if n else cmap(norm(v))
@@ -487,7 +511,7 @@ def _build_gdf(shapefile_path, df_data, hatch_df):
     gdf["poly_idx"] = gdf.index
     gdf = gdf.merge(df_data, on="poly_idx", how="left")
     gdf = gdf.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
-    gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
     return gdf
 
 
@@ -829,7 +853,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
     gdf["poly_idx"] = gdf.index
     gdf = (gdf.merge(df[["poly_idx", "ratio"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
     gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
 
     cmap_c = plt.get_cmap("PiYG_r")
@@ -1395,7 +1419,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
     gdf["poly_idx"] = gdf.index
     gdf = (gdf.merge(df_unc[["poly_idx", "ratio"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
     gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     cmap_c = plt.get_cmap("PiYG_r")
     norm_c = mcolors.Normalize(vmin=0, vmax=1)
@@ -1467,7 +1491,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     gdf["poly_idx"] = gdf.index
     gdf = (gdf.merge(df_var[["poly_idx", "RE_Std"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
     gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     cmap_c = plt.get_cmap("Reds")
     vmax   = np.nanpercentile(df_var["RE_Std"].dropna().values, 95)
@@ -1545,7 +1569,7 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
             mmm    = _mmm_combined(df_gwl, share_re="current", vmax=800)
             gdf    = gdf_base.copy().merge(mmm, on="poly_idx", how="left")
             gdf    = gdf.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
-            gdf["do_hatch"] = gdf["var"].lt(16).fillna(False)
+            gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
             _draw_map(ax, gdf, "Combined_Effect", cmap, norm, hatch_df,
                       title="", panel_letter="")
             ax.annotate(
@@ -1657,7 +1681,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     gdf_c = (gdf_base.copy()
              .merge(df_dec[["poly_idx", "ratio"]], on="poly_idx", how="left")
              .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf_c["do_hatch"] = gdf_c["var"].lt(16).fillna(False)
+    gdf_c["do_hatch"] = gdf_c["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
     gdf_c = gdf_c.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     vals_c   = gdf_c["ratio"].to_numpy()
     nan_c    = ~np.isfinite(vals_c)
@@ -1715,7 +1739,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     gdf_d = (gdf_base.copy()
              .merge(df_unc[["poly_idx", "ratio"]], on="poly_idx", how="left")
              .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf_d["do_hatch"] = gdf_d["var"].lt(16).fillna(False)
+    gdf_d["do_hatch"] = gdf_d["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
     gdf_d = gdf_d.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     vals_d   = gdf_d["ratio"].to_numpy()
     nan_d    = ~np.isfinite(vals_d)
@@ -1796,7 +1820,10 @@ def main():
         print("\n[SKIP] RL computation skipped (--skip_rl).")
 
     print("\n=== STEP 2: Agreement mask ===")
-    hatch_df, idxs_to_hatch = load_hatch_agg(PATHS["agreement_nc"], PATHS["shapefile"])
+    hatch_df, idxs_to_hatch = load_hatch_agg(
+        PATHS["agreement_nc"], PATHS["shapefile"],
+        agreement_aggregated_nc=PATHS["agreement_aggregated_nc"],
+    )
 
     print("\n=== STEP 3: Main figure ===")
     csv_current = os.path.join(PATHS["out_dir"],
