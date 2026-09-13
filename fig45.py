@@ -582,6 +582,34 @@ def plot_main_gwl_maps(df_gwl15, df_gwl2, df_gwl3,
     _save_fig(fig, os.path.join(output_dir, "main", "fig_main_gwl_maps.png"), dpi)
 
 
+def plot_main_gwl_maps_absolute(df_gwl15, df_gwl2, df_gwl3,
+                                shapefile_path, hatch_df, output_dir,
+                                dpi=300, share_re="current"):
+    """Same 3-panel layout as plot_main_gwl_maps, but each panel plots the
+    absolute change in cumulative residual load (GWL - GWL0.61) normalized
+    by the region's non-thermosensitive baseline demand, so the anomaly
+    reads in units of "days of baseline demand" instead of percent."""
+    abs_vals = []
+    for df_gwl in (df_gwl15, df_gwl2, df_gwl3):
+        eff = (_mmm_absolute_days(df_gwl, share_re)["Absolute_Days"]
+               .replace([np.inf, -np.inf], np.nan).dropna())
+        if len(eff):
+            abs_vals.append(np.abs(eff.values))
+    vmax_days = (max(1.0, np.ceil(np.nanpercentile(np.concatenate(abs_vals), 95)))
+                 if abs_vals else 1.0)
+    cmap = plt.get_cmap("RdYlGn_r")
+    norm = mcolors.TwoSlopeNorm(vmin=-vmax_days, vcenter=0, vmax=vmax_days)
+    fig = _three_panel_map(
+        df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
+        value_fn=_mmm_absolute_days, value_col="Absolute_Days",
+        title_gwl2="2°C",
+        title_gwl15="1.5°C",
+        title_gwl3="3°C",
+        cbar_label="WSBDs change compared to 0.61°C (days of baseline demand)", dpi=dpi,
+    )
+    _save_fig(fig, os.path.join(output_dir, "main", "fig_main_gwl_maps_absolute_days.png"), dpi)
+
+
 def plot_main_dumbbell(df_gwl2, shapefile_path, dpi=300, share_re="current",
                        output_dir=None):
     shp      = gpd.read_file(shapefile_path)
@@ -941,11 +969,13 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
                     ha="center", va="center", fontsize=6, color="gray")
             ax.annotate(
                 f"$\\mathbf{{{letter}}}$",
-                xy=(0.02, 1.02), xycoords="axes fraction",
+                xy=(0.02, 1.10), xycoords="axes fraction",
                 ha="left", va="bottom", fontsize=5.5, color=title_color,
                 clip_on=False,
             )
-            ax.set_title(label, fontsize=5.5, color=title_color)
+            ax.text(0.5, 1.10, label, transform=ax.transAxes,
+                    ha="center", va="bottom", fontsize=5.5, color=title_color,
+                    clip_on=False)
             ax.set_axis_off()
             continue
 
@@ -960,12 +990,14 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
                   title="", panel_letter="")
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
-            xy=(0.02, 1.02), xycoords="axes fraction",
+            xy=(0.02, 1.10), xycoords="axes fraction",
             ha="left", va="bottom", fontsize=5.5, color=title_color,
             clip_on=False,
         )
-        ax.set_title(label, fontsize=5.5, color=title_color)
-        ax.text(0.5, 1.03, params, transform=ax.transAxes,
+        ax.text(0.5, 1.10, label, transform=ax.transAxes,
+                ha="center", va="bottom", fontsize=5.5, color=title_color,
+                clip_on=False)
+        ax.text(0.5, 1.02, params, transform=ax.transAxes,
                 ha="center", va="bottom", fontsize=5,
                 color="#444444", style="italic")
 
@@ -1114,11 +1146,13 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
                     ha="center", va="center", fontsize=6, color="gray")
             ax.annotate(
                 f"$\\mathbf{{{letter}}}$",
-                xy=(0.02, 1.02), xycoords="axes fraction",
+                xy=(0.02, 1.10), xycoords="axes fraction",
                 ha="left", va="bottom", fontsize=5.5, color=title_color,
                 clip_on=False,
             )
-            ax.set_title(label, fontsize=5.5, color=title_color)
+            ax.text(0.5, 1.10, label, transform=ax.transAxes,
+                    ha="center", va="bottom", fontsize=5.5, color=title_color,
+                    clip_on=False)
             ax.set_axis_off()
             continue
 
@@ -1133,12 +1167,14 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
                   title="", panel_letter="")
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
-            xy=(0.02, 1.02), xycoords="axes fraction",
+            xy=(0.02, 1.10), xycoords="axes fraction",
             ha="left", va="bottom", fontsize=5.5, color=title_color,
             clip_on=False,
         )
-        ax.set_title(label, fontsize=5.5, color=title_color)
-        ax.text(0.5, 1.03, params, transform=ax.transAxes,
+        ax.text(0.5, 1.10, label, transform=ax.transAxes,
+                ha="center", va="bottom", fontsize=5.5, color=title_color,
+                clip_on=False)
+        ax.text(0.5, 1.02, params, transform=ax.transAxes,
                 ha="center", va="bottom", fontsize=5,
                 color="#444444", style="italic")
 
@@ -1770,6 +1806,9 @@ def main():
         plot_main_gwl_maps(df_gwl15, df_gwl2, df_gwl3,
                            PATHS["shapefile"], hatch_df,
                            args.output_dir, dpi=args.dpi, share_re=MAIN_MIX)
+        plot_main_gwl_maps_absolute(df_gwl15, df_gwl2, df_gwl3,
+                                    PATHS["shapefile"], hatch_df,
+                                    args.output_dir, dpi=args.dpi, share_re=MAIN_MIX)
         plot_main_dumbbell(df_gwl2, PATHS["shapefile"], dpi=args.dpi,
                            share_re=MAIN_MIX, output_dir=args.output_dir)
 
