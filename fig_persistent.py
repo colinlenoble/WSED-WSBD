@@ -891,9 +891,11 @@ def plot_reference_persistent_drought(
     vmax_list = [3, roll_window + 8, 0.05, 0.3, 0.5, 0.5]
     panellabels = list(ascii_lowercase[:6])
 
+    # 2-column layout (3 rows), same width; height scales proportionally
+    # so each map panel is bigger than the previous 3-column layout
     fig_width_in = FIG_WIDTH_IN
-    fig_height_in = fig_width_in * 0.55
-    fig, axes = plt.subplots(2, 3, figsize=(fig_width_in, fig_height_in), dpi=300,
+    fig_height_in = fig_width_in * 1.2375
+    fig, axes = plt.subplots(3, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
                               subplot_kw={"projection": ccrs.EqualEarth()})
     axes_flat = axes.flatten()
 

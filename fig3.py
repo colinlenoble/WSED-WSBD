@@ -154,6 +154,20 @@ def parse_args():
             "%.0f%% of models with an overlapping trend CI)." % config.AGREEMENT_THRESHOLD
         ),
     )
+    parser.add_argument(
+        "--wasserstein_path",
+        default=config.WASSERSTEIN_NC_PATH,
+        help=(
+            "Path to a pre-computed per-(GCM, run), per-pixel empirical Wasserstein "
+            "trend-distance DataArray (.nc), built by trend_sev_eval_wasserstein.py's "
+            "wasserstein_empirical_grid() (variables w2_distance/w2_normalized, dims "
+            "realization/lat/lon, coords GCM/run). Used to build the "
+            "suppfig_projected_change_valuebyalpha_GWLxx_wasserstein figures, which "
+            "reweight each realization by 1/n_gcm times the inverse of its normalized "
+            "Wasserstein distance at each pixel instead of a flat multi-model mean. "
+            "If not provided, those figures are skipped."
+        ),
+    )
 
     # --- Shapefile / output ---
     parser.add_argument(
@@ -554,9 +568,14 @@ def from_ds_to_plot_decomp(ds_gwl, ds_ref):
 
     ds_gwl["realization"] = ds_ref.realization.astype(int)
 
-    # Promote GCM (data variable) to a coordinate so it is carried by every
-    # DataArray extracted from this dataset (needed by the GCM bootstrap).
-    ds_gwl = ds_gwl.assign_coords(GCM=("realization", ds_gwl.GCM.values))
+    # Promote GCM/run (data variables) to coordinates so they are carried by
+    # every DataArray extracted from this dataset (GCM is needed by the GCM
+    # bootstrap; run is needed to match realizations against the Wasserstein
+    # distance file's own (GCM, run) coords in _build_wasserstein_pixel_weight).
+    ds_gwl = ds_gwl.assign_coords(
+        GCM=("realization", ds_gwl.GCM.values),
+        run=("realization", ds_gwl.run.values),
+    )
 
     weight_count = pd.Series(ds_gwl.GCM.values).value_counts()
     weights = [1.0 / weight_count[g] / weight_count.size for g in ds_gwl.GCM.values]
@@ -1037,6 +1056,198 @@ def plot_supp_valuebyalpha_stacked(
 
 
 # =============================================================================
+# Inverse-Wasserstein-distance pixel weighting (supplementary figure)
+# =============================================================================
+
+def _build_wasserstein_pixel_weight(da_proj_freq, ds_wasserstein, base_weight,
+                                     var="w2_normalized", eps=1e-3):
+    """
+    Combine the usual per-realization 1/n_gcm weight with a per-pixel weight
+    equal to the inverse of that realization's normalized empirical
+    Wasserstein trend distance to ERA5 at that pixel (ds_wasserstein's
+    w2_normalized, from trend_sev_eval_wasserstein.wasserstein_empirical_grid()):
+    a realization whose bootstrap trend distribution is closer to ERA5's at a
+    given location counts for more there, on top of (not instead of) the
+    existing 1/n_gcm de-duplication across multi-run GCMs.
+
+    Matching is by (GCM, run) pair, since ds_wasserstein's realization axis
+    (built from GWL1 files only) does not generally line up positionally with
+    da_proj_freq's own realization axis (built per-GWL in from_ds_to_plot_decomp).
+    Realizations in da_proj_freq with no Wasserstein match get weight 0
+    (excluded) everywhere; eps floors w2_normalized so a near-zero distance
+    cannot make a single realization dominate the pixel mean.
+
+    Returns
+    -------
+    xr.DataArray with dims (realization, lat, lon), positionally aligned with
+    da_proj_freq's realization axis (no 'realization' coordinate, matching
+    base_weight's own convention), or None if no (GCM, run) pair matches.
+    """
+    n_real = da_proj_freq.sizes["realization"]
+    proj_pairs = [(str(g), str(r)) for g, r in
+                  zip(da_proj_freq.GCM.values, da_proj_freq.run.values)]
+    w2_pairs = [(str(g), str(r)) for g, r in
+                zip(ds_wasserstein.GCM.values, ds_wasserstein.run.values)]
+    w2_index = {p: i for i, p in enumerate(w2_pairs)}
+
+    matched_proj_idx, matched_w2_idx, missing = [], [], []
+    for i, p in enumerate(proj_pairs):
+        if p in w2_index:
+            matched_proj_idx.append(i)
+            matched_w2_idx.append(w2_index[p])
+        else:
+            missing.append(p)
+    if missing:
+        print(f"    [warn] no Wasserstein match for {len(missing)} realization(s), "
+              f"excluded from the reweighted map: {missing}")
+    if not matched_proj_idx:
+        return None
+
+    w2_sel = ds_wasserstein[var].isel(realization=matched_w2_idx)
+    w2_sel = w2_sel.interp(lat=da_proj_freq.lat, lon=da_proj_freq.lon, method="nearest")
+    inv_w2 = 1.0 / w2_sel.clip(min=eps)                       # (matched, lat, lon)
+
+    base_sel = base_weight.values[matched_proj_idx]           # (matched,)
+    weighted_matched = inv_w2.values * base_sel[:, None, None]
+
+    full = np.zeros((n_real,) + weighted_matched.shape[1:], dtype=float)
+    full[matched_proj_idx] = np.nan_to_num(weighted_matched, nan=0.0)
+
+    return xr.DataArray(
+        full, dims=("realization", "lat", "lon"),
+        coords={"lat": da_proj_freq.lat, "lon": da_proj_freq.lon},
+    )
+
+
+def plot_gwl_valuebyalpha_wasserstein(
+    rgba_map, extent, gwl_label,
+    rel_diff, diff_extent,
+    shapefile_path,
+    da_mask_ref, no_wind_mask,
+    hatchings=None,
+    agreement_threshold=config.AGREEMENT_THRESHOLD,
+    change_edges=None, sev_edges=None, n_bins_change=5, n_bins_sev=5,
+    color_levels=None, alpha_levels=None,
+    relchange_label="Relative change (%)",
+    sev_label="Average annual\nseverity (0.61 °C)",
+    diff_label="Difference in relative change,\ninverse-W2 minus multi-model mean (pp)",
+    diff_vmax=None,
+):
+    """
+    Two-panel supplementary figure for one GWL level:
+      a) value-by-alpha map, weighted per-pixel by 1/n_gcm times the inverse
+         of each realization's normalized Wasserstein trend distance to ERA5
+         at that pixel (see _build_wasserstein_pixel_weight), instead of the
+         flat multi-model-mean weighting used in the main figure. No region
+         boxes.
+      b) the difference this reweighting makes to the relative-change field:
+         (inverse-W2-weighted relative change) minus (multi-model-mean
+         relative change), in percentage points.
+    """
+    if change_edges is None:
+        change_edges = [-100, -25, -10, 10, 25, 100]
+    if color_levels is None:
+        color_levels = cm.get_cmap("coolwarm")(np.linspace(0, 1, n_bins_change))
+    if alpha_levels is None:
+        alpha_levels = np.linspace(0.4, 1.0, n_bins_sev)
+    if sev_edges is None:
+        sev_edges = np.linspace(0, 1.0, n_bins_sev + 1) ** 2
+
+    shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
+    lat_ok = (da_mask_ref.lat >= MAP_LAT_SOUTH) & (da_mask_ref.lat <= MAP_LAT_NORTH)
+    no_wind_mask_band = no_wind_mask.astype(float) * lat_ok.values[:, None]
+
+    fig_width_in  = FIG_WIDTH_IN
+    fig_height_in = fig_width_in * (12 / 14)   # two stacked map rows
+    fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
+    gs  = GridSpec(2, 1, hspace=0.15, figure=fig)
+
+    # --- Panel a: value-by-alpha map, inverse-W2 pixel weighting ---
+    ax_a = fig.add_subplot(gs[0, 0], projection=ccrs.EqualEarth())
+    ax_a.imshow(
+        rgba_map, extent=extent, origin="lower", transform=ccrs.PlateCarree(),
+        interpolation="nearest", rasterized=True,
+    )
+    ax_a.contourf(
+        da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
+        levels=[0.5, 1], colors=["#404040"], transform=ccrs.PlateCarree(), zorder=5,
+    )
+    shp_band.boundary.plot(ax=ax_a, color="black", linewidth=0.15,
+                           transform=ccrs.PlateCarree(), zorder=10)
+    if hatchings is not None:
+        hb = hatchings.sel(lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
+        ax_a.contourf(
+            hb.lon, hb.lat, (hb <= agreement_threshold).values.astype(float),
+            transform=ccrs.PlateCarree(), colors="none", levels=[0.5, 1.5],
+            hatches=[21 * "/", 21 * "/"], zorder=8,
+        )
+    ax_a.annotate(
+        "$\\mathbf{a}$", xy=(0.02, 1.02), xycoords="axes fraction",
+        ha="left", va="bottom", fontsize=7,
+        path_effects=[withStroke(linewidth=1.5, foreground="white")],
+    )
+    ax_a.set_title(f"Inverse-Wasserstein-weighted annual severity change under {gwl_label} warming",
+                   fontsize=7, pad=6)
+    ax_a.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
+    ax_a.set_global()
+    mask_poles(ax_a)
+    ax_a.spines["geo"].set_visible(False)
+
+    legend_rgba = np.zeros((n_bins_change, n_bins_sev, 4))
+    for ic in range(n_bins_change):
+        legend_rgba[ic, :, :3] = color_levels[ic, :3]
+        legend_rgba[ic, :,  3] = alpha_levels
+    legend_ax = inset_axes(ax_a, width="14%", height="45%", loc="center left", borderpad=0.5)
+    legend_ax.imshow(legend_rgba, origin="lower", aspect="equal")
+    legend_ax.set_xticks([0, n_bins_sev // 2, n_bins_sev - 1])
+    legend_ax.set_xticklabels(["low", "mid", "high"], fontsize=5, ha="center")
+    legend_ax.set_yticks([0.5, 1.5, 2.5, 3.5])
+    legend_ax.set_yticklabels(["-25%", "-10%", "10%", "25%"], fontsize=5, va="center")
+    legend_ax.set_xlabel(sev_label, fontsize=5, labelpad=4)
+    legend_ax.set_ylabel(relchange_label, fontsize=5, labelpad=4)
+    legend_ax.tick_params(axis="both", which="both", length=0)
+
+    # --- Panel b: difference vs. multi-model mean ---
+    ax_b = fig.add_subplot(gs[1, 0], projection=ccrs.EqualEarth())
+    finite = rel_diff[np.isfinite(rel_diff)]
+    if diff_vmax is None:
+        diff_vmax = float(np.nanpercentile(np.abs(finite), 98)) if finite.size else 1.0
+        diff_vmax = max(diff_vmax, 1e-6)
+    im = ax_b.imshow(
+        rel_diff, extent=diff_extent, origin="lower", transform=ccrs.PlateCarree(),
+        interpolation="nearest", cmap=cmo.cm.balance, vmin=-diff_vmax, vmax=diff_vmax,
+        rasterized=True,
+    )
+    ax_b.contourf(
+        da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
+        levels=[0.5, 1], colors=["#404040"], transform=ccrs.PlateCarree(), zorder=5,
+    )
+    shp_band.boundary.plot(ax=ax_b, color="black", linewidth=0.15,
+                           transform=ccrs.PlateCarree(), zorder=10)
+    ax_b.annotate(
+        "$\\mathbf{b}$", xy=(0.02, 1.02), xycoords="axes fraction",
+        ha="left", va="bottom", fontsize=7,
+        path_effects=[withStroke(linewidth=1.5, foreground="white")],
+    )
+    ax_b.set_title("Difference vs. multi-model mean", fontsize=7, pad=6)
+    ax_b.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
+    ax_b.set_global()
+    mask_poles(ax_b)
+    ax_b.spines["geo"].set_visible(False)
+
+    cax = inset_axes(
+        ax_b, width="30%", height="6%", loc="lower left",
+        bbox_to_anchor=(0.0, -0.1, 1, 1), bbox_transform=ax_b.transAxes, borderpad=0,
+    )
+    cb = fig.colorbar(im, cax=cax, orientation="horizontal")
+    cb.set_label(diff_label, fontsize=5, labelpad=2)
+    cb.ax.tick_params(labelsize=5, length=2)
+
+    return fig
+
+
+# =============================================================================
 # Global change statistics with spatial block-bootstrap CI
 # =============================================================================
 
@@ -1511,6 +1722,16 @@ def main():
     elif args.agreement_path is not None:
         print(f"  [warn] Agreement file not found: {args.agreement_path}. Hatching disabled.")
 
+    # Optional per-pixel Wasserstein distance file, for the inverse-W2-weighted
+    # suppfig_projected_change_valuebyalpha_GWLxx_wasserstein figures.
+    ds_wasserstein = None
+    if args.wasserstein_path is not None and os.path.exists(args.wasserstein_path):
+        print(f"Loading Wasserstein distance dataset from {args.wasserstein_path} ...")
+        ds_wasserstein = xr.open_dataset(args.wasserstein_path)
+    elif args.wasserstein_path is not None:
+        print(f"  [warn] Wasserstein file not found: {args.wasserstein_path}. "
+              f"Wasserstein-reweighted supplementary figures disabled.")
+
     # ------------------------------------------------------------------
     # STEP 4 - Loop over GWL levels and produce figures
     # ------------------------------------------------------------------
@@ -1636,6 +1857,46 @@ def main():
                 no_wind_mask_supp = _land & (_mf.values < 0.5)
         # ----------------------------------------------------------------
 
+        # ------ Inverse-Wasserstein-weighted supplementary figure ------
+        if ds_wasserstein is not None:
+            print(f"  Building Wasserstein-reweighted supplementary figure ...")
+            weight_pix = _build_wasserstein_pixel_weight(da_proj_freq, ds_wasserstein, weight)
+            if weight_pix is None:
+                print(f"    [warn] No (GCM, run) overlap with the Wasserstein dataset "
+                      f"for {gwl_label}, skipping.")
+            else:
+                _rgba_w, _extent_w, _cedges_w, _sedges_w, _clvl_w, _alvl_w = _compute_rgba_map(
+                    da_ref_freq, da_ref_int, da_ref_dur,
+                    da_proj_freq, da_proj_int, da_proj_dur,
+                    weight=weight_pix, mask=mask, lat_min=-60, lat_max=68,
+                )
+                rel_change_w = _compute_ensemble_rel_change(
+                    da_ref_freq, da_ref_int, da_ref_dur,
+                    da_proj_freq, da_proj_int, da_proj_dur,
+                    weight=weight_pix, mask=mask, lat_min=-60, lat_max=68,
+                )
+                rel_change_mmm = _compute_ensemble_rel_change(
+                    da_ref_freq, da_ref_int, da_ref_dur,
+                    da_proj_freq, da_proj_int, da_proj_dur,
+                    weight=weight, mask=mask, lat_min=-60, lat_max=68,
+                )
+                fig_w = plot_gwl_valuebyalpha_wasserstein(
+                    rgba_map=_rgba_w, extent=_extent_w, gwl_label=gwl_label,
+                    rel_diff=rel_change_w - rel_change_mmm, diff_extent=_extent_w,
+                    shapefile_path=args.shapefile,
+                    da_mask_ref=da_mask_ref_supp, no_wind_mask=no_wind_mask_supp,
+                    hatchings=hatchings, agreement_threshold=args.agreement_threshold,
+                    change_edges=_cedges_w, sev_edges=_sedges_w,
+                    color_levels=_clvl_w, alpha_levels=_alvl_w,
+                )
+                fname_w = f"suppfig_projected_change_valuebyalpha_{gwl_key}_wasserstein.png"
+                out_w = os.path.join(args.output_dir, "supp", fname_w)
+                os.makedirs(os.path.dirname(out_w), exist_ok=True)
+                fig_w.savefig(out_w, dpi=args.dpi, bbox_inches="tight")
+                plt.close(fig_w)
+                print(f"  Saved -> {out_w}")
+        # ----------------------------------------------------------------
+
         del da_ref_freq, da_ref_int, da_ref_dur
         del da_proj_freq, da_proj_int, da_proj_dur, weight, fig
         gc.collect()
@@ -1661,6 +1922,9 @@ def main():
         fig_supp.savefig(out_supp, dpi=args.dpi, bbox_inches="tight")
         plt.close(fig_supp)
         print(f"  Saved ? {out_supp}")
+
+    if ds_wasserstein is not None:
+        ds_wasserstein.close()
 
     print("\nDone.")
 

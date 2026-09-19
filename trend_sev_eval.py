@@ -21,6 +21,37 @@ from io_utils import match_files, glob_any, open_dataset_any
 
 
 # ---------------------------------------------------------------------------
+# Note: how "mean" and "confidence interval" are computed, and whether GCMs
+# are downscaled/upscaled
+#
+# Every trend mean/CI in this file (low_trend/up_trend/mean_trend,
+# slope_ci_low/up/mean) comes from a stationary bootstrap (Politis & Romano)
+# of the OLS slope of the annual severity series, not from an analytical
+# formula:
+#   1. The ~40-year annual series is resampled n_boot times (1000-2000
+#      reps) using randomly-sized blocks (mean length = block_size years,
+#      default 5) instead of single years, so year-to-year autocorrelation
+#      is preserved in the resampled series.
+#   2. An OLS slope is fit on each resampled replicate.
+#   3. mean_trend = plain mean of the n_boot bootstrap slopes; low/up_trend
+#      = the 2.5th/97.5th percentiles of that same distribution (a
+#      percentile-bootstrap 95% CI, not mean +/- k*std).
+# See _stationary_bootstrap_slopes / stationary_bootstrap_ci_grid.
+#
+# GCM data is NOT downscaled here -- there is no bias correction and no
+# statistical/dynamical downscaling anywhere in this file. Every
+# GCM/realization is regridded with plain nearest-neighbor interpolation
+# (xesmf, method='nearest_s2d') onto the reanalysis's own grid (ERA5
+# regridded to the W5E5 0.5 deg grid -- see config.REANALYSIS and
+# _target_grid()). Most CMIP6 GCMs are natively coarser than 0.5 deg, so in
+# practice this step mostly *upscales* (nearest-neighbor-interpolates onto
+# a finer grid) rather than downscales GCM fields -- it only relocates
+# values onto the shared grid so GCM and reanalysis cells line up for
+# comparison/averaging; it adds no genuine sub-grid information.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 

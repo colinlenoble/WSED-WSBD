@@ -85,6 +85,7 @@ PATHS = {
     "df_share_csv":       config.SHARE_RENEWABLE_CSV,
     "agreement_nc":       config.AGREEMENT_NC_PATH,
     "agreement_aggregated_nc": config.AGREEMENT_AGGREGATED_NC_PATH,
+    "wasserstein_aggregated_nc": config.WASSERSTEIN_AGGREGATED_NC_PATH,
     "out_dir":            config.PATH_PREPROCESSED + "agg_datasets/rl_out/",
     "ssp":                config.SSP,
     "reanalysis":         config.REANALYSIS,
@@ -553,6 +554,92 @@ def _mmm_absolute_days(df_gwl, share_re="current"):
     return _mmm(df_gwl, "Absolute_Days", share_re, vmax=None, compute_fn=fn)
 
 
+# =============================================================================
+# INVERSE-WASSERSTEIN-DISTANCE POLYGON WEIGHTING
+#
+# Aggregated-domain (poly_idx) twin of fig3.py's per-pixel inverse-W2
+# weighting (_build_wasserstein_pixel_weight): instead of the flat multi-model
+# mean used by _mmm() (equal weight per GCM, split evenly across its runs),
+# a realization whose bootstrap trend distribution is closer to ERA5's own at
+# a given polygon counts for more there. Source data is
+# trend_sev_eval_wasserstein.py's wasserstein_empirical_agg() output
+# (config.WASSERSTEIN_AGGREGATED_NC_PATH): dims (realization, poly_idx),
+# variables w2_distance/w2_normalized, per-realization GCM/run values.
+# =============================================================================
+
+def _load_wasserstein_agg(wasserstein_path=None):
+    """Open config.WASSERSTEIN_AGGREGATED_NC_PATH (or an override). Returns
+    None (with a warning) if the file is missing, so callers can skip the
+    inverse-W2-weighted companion figures gracefully rather than erroring."""
+    path = wasserstein_path or config.WASSERSTEIN_AGGREGATED_NC_PATH
+    if not os.path.exists(path):
+        print(f"  [WARN] Wasserstein aggregated file not found: {path} "
+              "-- inverse-W2-weighted companion figures skipped.")
+        return None
+    return xr.open_dataset(path)
+
+
+def _wasserstein_weight_table(ds_wasserstein, var="w2_normalized", eps=1e-3):
+    """
+    Long-format (GCM, run, poly_idx) -> weight table combining the usual
+    per-realization 1/n_gcm weight (de-duplicating multi-run GCMs, same
+    convention as fig3.py's add_severity_and_weights/
+    _build_wasserstein_pixel_weight) with the per-polygon inverse of that
+    realization's normalized empirical Wasserstein trend distance to ERA5
+    (ds_wasserstein's w2_normalized). eps floors w2_normalized so a
+    near-zero distance cannot make a single realization dominate a
+    polygon's weighted mean. Positional indexing (not a 'realization'
+    coordinate) matches fig3.py's own handling of this dataset.
+    """
+    gcms = np.asarray(ds_wasserstein["GCM"].values).astype(str)
+    runs = np.asarray(ds_wasserstein["run"].values).astype(str)
+    wcount = pd.Series(gcms).value_counts()
+    base_w = np.array([1.0 / wcount[g] / wcount.size for g in gcms])
+
+    w2     = ds_wasserstein[var].values                     # (realization, poly_idx)
+    inv_w2 = 1.0 / np.clip(w2, eps, None)
+    weight = inv_w2 * base_w[:, None]                        # (realization, poly_idx)
+
+    poly_idx     = ds_wasserstein["poly_idx"].values
+    n_real, n_poly = weight.shape
+    return pd.DataFrame({
+        "GCM":       np.repeat(gcms, n_poly),
+        "run":       np.repeat(runs, n_poly),
+        "poly_idx":  np.tile(poly_idx, n_real),
+        "w2_weight": weight.ravel(),
+    })
+
+
+def _mmm_wasserstein(df_gwl, effect_col, share_re, vmax, compute_fn, w2_table):
+    """Inverse-W2-weighted twin of _mmm(): per-polygon weighted average of
+    effect_col over (GCM, run) rows, using w2_table's weight instead of a
+    flat per-GCM mean. Rows with no matching (GCM, run, poly_idx) weight are
+    excluded, same as fig3.py's _build_wasserstein_pixel_weight."""
+    df = df_gwl[df_gwl["share_re"] == share_re].copy()
+    compute_fn(df)
+    df["GCM"] = df["GCM"].astype(str)
+    df["run"] = df["run"].astype(str)
+    merged = df.merge(w2_table, on=["GCM", "run", "poly_idx"], how="inner")
+    merged = merged[np.isfinite(merged[effect_col]) & (merged["w2_weight"] > 0)]
+    if merged.empty:
+        return pd.DataFrame(columns=["poly_idx", effect_col])
+    merged["_wsum"] = merged[effect_col] * merged["w2_weight"]
+    grp = merged.groupby("poly_idx").agg(_wsum=("_wsum", "sum"),
+                                          _wtot=("w2_weight", "sum"))
+    out = (grp["_wsum"] / grp["_wtot"]).rename(effect_col).reset_index()
+    if vmax is not None:
+        out.loc[out[effect_col] > vmax, effect_col] = vmax
+    return out
+
+
+def _mmm_absolute_days_wasserstein(df_gwl, w2_table, share_re="current"):
+    """Inverse-W2-weighted twin of _mmm_absolute_days()."""
+    def fn(df):
+        df["Absolute_Days"] = (df["cum_rl_gwl"] - df["cum_rl_ref"]) / df["demand_bas"]
+    return _mmm_wasserstein(df_gwl, "Absolute_Days", share_re, vmax=None,
+                            compute_fn=fn, w2_table=w2_table)
+
+
 def _save_fig(fig, path, dpi):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
@@ -601,7 +688,7 @@ def plot_main_gwl_maps(df_gwl15, df_gwl2, df_gwl3,
         title_gwl2="2°C",
         title_gwl15="1.5°C",
         title_gwl3="3°C",
-        cbar_label="WSBDs change compared to 0.61°C (%)", dpi=dpi,
+        cbar_label="SWBDs change compared to 0.61°C (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "main", "fig_main_gwl_maps.png"), dpi)
 
@@ -629,9 +716,44 @@ def plot_main_gwl_maps_absolute(df_gwl15, df_gwl2, df_gwl3,
         title_gwl2="2°C",
         title_gwl15="1.5°C",
         title_gwl3="3°C",
-        cbar_label="WSBDs change compared to 0.61°C (days of baseline demand)", dpi=dpi,
+        cbar_label="SWBDs change compared to 0.61°C (days of baseline demand)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "main", "fig_main_gwl_maps_absolute_days.png"), dpi)
+
+
+def plot_main_gwl_maps_absolute_wasserstein(df_gwl15, df_gwl2, df_gwl3,
+                                            shapefile_path, hatch_df, w2_table,
+                                            output_dir, dpi=300, share_re="current"):
+    """Companion to plot_main_gwl_maps_absolute: each polygon's value is the
+    inverse-Wasserstein-weighted average of the absolute change in cumulative
+    residual load (GWL - GWL0.61) instead of the flat multi-model mean --
+    see _mmm_absolute_days_wasserstein/_wasserstein_weight_table. A
+    realization whose bootstrap trend distribution is closer to ERA5's own at
+    a given polygon counts for more there."""
+    def value_fn(df_gwl, share_re_):
+        return _mmm_absolute_days_wasserstein(df_gwl, w2_table, share_re_)
+
+    abs_vals = []
+    for df_gwl in (df_gwl15, df_gwl2, df_gwl3):
+        eff = (value_fn(df_gwl, share_re)["Absolute_Days"]
+               .replace([np.inf, -np.inf], np.nan).dropna())
+        if len(eff):
+            abs_vals.append(np.abs(eff.values))
+    vmax_days = (max(1.0, np.ceil(np.nanpercentile(np.concatenate(abs_vals), 95)))
+                 if abs_vals else 1.0)
+    cmap = plt.get_cmap("RdYlGn_r")
+    norm = mcolors.TwoSlopeNorm(vmin=-vmax_days, vcenter=0, vmax=vmax_days)
+    fig = _three_panel_map(
+        df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
+        value_fn=value_fn, value_col="Absolute_Days",
+        title_gwl2="2°C",
+        title_gwl15="1.5°C",
+        title_gwl3="3°C",
+        cbar_label="SWBDs change vs 0.61°C, inverse-W2 weighted\n(days of baseline demand)",
+        dpi=dpi,
+    )
+    _save_fig(fig, os.path.join(output_dir, "main",
+                                "fig_main_gwl_maps_absolute_days_wasserstein.png"), dpi)
 
 
 def plot_main_dumbbell(df_gwl2, shapefile_path, dpi=300, share_re="current",
@@ -739,13 +861,13 @@ def plot_main_dumbbell(df_gwl2, shapefile_path, dpi=300, share_re="current",
     ax_db.annotate("", xy=(-130, 1.04), xycoords=("data", "axes fraction"),
                    xytext=(0, 1.04), textcoords=("data", "axes fraction"),
                    arrowprops=dict(arrowstyle="->", lw=0.8, color="#777777"))
-    ax_db.text(-75, 1.055, "Lower WSBDs",
+    ax_db.text(-75, 1.055, "Lower SWBDs",
                transform=ax_db.get_xaxis_transform(),
                ha="center", va="bottom", fontsize=6, color="black")
     ax_db.annotate("", xy=(700, 1.04), xycoords=("data", "axes fraction"),
                    xytext=(30, 1.04), textcoords=("data", "axes fraction"),
                    arrowprops=dict(arrowstyle="->", lw=0.8, color="#777777"))
-    ax_db.text(370, 1.055, "Higher WSBDs",
+    ax_db.text(370, 1.055, "Higher SWBDs",
                transform=ax_db.get_xaxis_transform(),
                ha="center", va="bottom", fontsize=6, color="black")
 
@@ -764,6 +886,236 @@ def plot_main_dumbbell(df_gwl2, shapefile_path, dpi=300, share_re="current",
     _save_fig(fig, os.path.join(output_dir, "main", "fig_main_dumbbell.png"), dpi)
 
 
+def plot_main_dumbbell_absolute(df_gwl2, shapefile_path, dpi=300, share_re="current",
+                                output_dir=None):
+    """Same layout as plot_main_dumbbell, but each effect is the absolute
+    change in cumulative residual load (GWL2 - GWL0.61) normalized by the
+    region's non-thermosensitive baseline demand, so it reads in units of
+    "days of baseline demand" instead of percent."""
+    shp      = gpd.read_file(shapefile_path)
+    name_col = "name" if "name" in shp.columns else shp.columns[1]
+    df_db    = df_gwl2[df_gwl2["share_re"] == share_re].copy()
+    df_db["name"] = df_db["poly_idx"].map(shp[name_col].to_dict())
+    for eff, num in [("Combined_Effect", "cum_rl_gwl"),
+                     ("Temp_Effect",     "cum_rl_tas"),
+                     ("RE_Effect",       "cum_rl_ds_cf")]:
+        df_db[eff] = (df_db[num] - df_db["cum_rl_ref"]) / df_db["demand_bas"]
+    df_db["label"] = df_db["name"].map(DICT_LABELS)
+    df_db = df_db[df_db["name"].isin(REGION_NAMES)].dropna(subset=["label"])
+    stats = (df_db[["label", "GCM", "Combined_Effect", "Temp_Effect", "RE_Effect"]]
+             .groupby(["label", "GCM"]).mean().groupby("label").mean())
+    order = stats["Combined_Effect"].sort_values(ascending=False).index.tolist()
+    stats = stats.loc[order] if order else stats
+    df_long = (df_db[["label", "Temp_Effect", "RE_Effect"]]
+               .melt(id_vars="label", var_name="Effect", value_name="Value")
+               .dropna())
+    df_long["Effect"] = df_long["Effect"].map(
+        {"Temp_Effect": "Demand driver", "RE_Effect": "Supply driver"})
+    pal = plt.get_cmap("PuOr")
+    demand_color, re_color = pal(0.8), pal(0.2)
+    plt.style.use("seaborn-v0_8-whitegrid")
+
+    fig_w = FIG_WIDTH_IN
+    fig_h = fig_w * (16 / 14)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+
+    if len(df_long) > 0 and len(order) > 0:
+        try:
+            sns.violinplot(
+                data=df_long, x="Value", y="label", hue="Effect",
+                order=order, split=True, inner=None, width=1.8,
+                palette={"Demand driver": demand_color, "Supply driver": re_color},
+                ax=ax,
+            )
+            sns.stripplot(
+                data=df_long, x="Value", y="label", hue="Effect",
+                order=order, dodge=True, size=2.5, alpha=0.55,
+                palette={"Demand driver": demand_color, "Supply driver": re_color},
+                ax=ax,
+            )
+            for coll in ax.collections:
+                if hasattr(coll, "get_alpha") and (coll.get_alpha() is None
+                                                    or coll.get_alpha() > 0.35):
+                    coll.set_alpha(0.35)
+            if ax.get_legend():
+                ax.get_legend().remove()
+            for i, sub in enumerate(order):
+                if sub not in stats.index:
+                    continue
+                r = stats.loc[sub]
+                ax.scatter(r["Temp_Effect"],     i, color=demand_color, s=30, zorder=5, alpha=0.9)
+                ax.scatter(r["RE_Effect"],       i, color=re_color,     s=30, zorder=5, alpha=0.9)
+                ax.scatter(r["Combined_Effect"], i, color="black",      s=30, zorder=6, alpha=0.9)
+        except Exception as exc:
+            print(f"  [WARN] Absolute dumbbell failed: {exc}")
+
+    ax.axvline(0, color="black", lw=1.2, alpha=0.6, linestyle="--")
+    finite_vals = df_long["Value"].replace([np.inf, -np.inf], np.nan).dropna()
+    vmax_abs = max(1.0, np.nanpercentile(np.abs(finite_vals.values), 98)) if len(finite_vals) else 1.0
+    ax.set_xlim(-vmax_abs * 1.15, vmax_abs * 1.15)
+
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels(order, fontsize=6)
+    ax.set_ylabel("")
+    ax.set_xlabel("Change (days of baseline demand)", fontsize=6, labelpad=2)
+    ax.tick_params(axis="x", labelsize=5)
+
+    xlim = ax.get_xlim()
+    ax.annotate("", xy=(xlim[0] * 0.85, 1.04), xycoords=("data", "axes fraction"),
+               xytext=(0, 1.04), textcoords=("data", "axes fraction"),
+               arrowprops=dict(arrowstyle="->", lw=0.8, color="#777777"))
+    ax.text(xlim[0] * 0.45, 1.055, "Lower SWBDs",
+           transform=ax.get_xaxis_transform(),
+           ha="center", va="bottom", fontsize=6, color="black")
+    ax.annotate("", xy=(xlim[1] * 0.85, 1.04), xycoords=("data", "axes fraction"),
+               xytext=(0, 1.04), textcoords=("data", "axes fraction"),
+               arrowprops=dict(arrowstyle="->", lw=0.8, color="#777777"))
+    ax.text(xlim[1] * 0.45, 1.055, "Higher SWBDs",
+           transform=ax.get_xaxis_transform(),
+           ha="center", va="bottom", fontsize=6, color="black")
+
+    ax.legend(handles=[
+        Line2D([0], [0], marker="o", linestyle="None",
+               color=demand_color, label="Demand driver", markersize=5),
+        Line2D([0], [0], marker="o", linestyle="None",
+               color=re_color, label="Supply driver", markersize=5),
+        Line2D([0], [0], marker="o", linestyle="None",
+               color="black", label="Combined effect", markersize=5),
+    ], title="Multi-model mean effect",
+       title_fontproperties={"weight": "bold", "size": 6},
+       loc="lower right", fontsize=5)
+
+    _save_fig(fig, os.path.join(output_dir, "main", "fig_main_dumbbell_absolute_days.png"), dpi)
+
+
+def plot_main_dumbbell_absolute_wasserstein(df_gwl2, shapefile_path, w2_table,
+                                            dpi=300, share_re="current",
+                                            output_dir=None):
+    """Companion to plot_main_dumbbell_absolute: each region's Combined_Effect
+    is shown as two dots instead of one -- the original flat multi-model-mean
+    value (black circle, as in plot_main_dumbbell_absolute), plus a second
+    value (teal diamond) obtained by averaging the same per-(GCM, run)
+    Combined_Effect with the inverse-Wasserstein-distance polygon weight from
+    _wasserstein_weight_table/_mmm_wasserstein instead of a flat per-GCM mean
+    (see trend_sev_eval_wasserstein.wasserstein_empirical_agg()) -- a
+    realization whose bootstrap trend distribution is closer to ERA5's own at
+    that region's polygon counts for more there. Demand/RE driver violins are
+    unchanged (still flat multi-model mean)."""
+    shp      = gpd.read_file(shapefile_path)
+    name_col = "name" if "name" in shp.columns else shp.columns[1]
+    df_db    = df_gwl2[df_gwl2["share_re"] == share_re].copy()
+    df_db["name"] = df_db["poly_idx"].map(shp[name_col].to_dict())
+    for eff, num in [("Combined_Effect", "cum_rl_gwl"),
+                     ("Temp_Effect",     "cum_rl_tas"),
+                     ("RE_Effect",       "cum_rl_ds_cf")]:
+        df_db[eff] = (df_db[num] - df_db["cum_rl_ref"]) / df_db["demand_bas"]
+    df_db["label"] = df_db["name"].map(DICT_LABELS)
+    df_db = df_db[df_db["name"].isin(REGION_NAMES)].dropna(subset=["label"])
+    stats = (df_db[["label", "GCM", "Combined_Effect", "Temp_Effect", "RE_Effect"]]
+             .groupby(["label", "GCM"]).mean().groupby("label").mean())
+    order = stats["Combined_Effect"].sort_values(ascending=False).index.tolist()
+    stats = stats.loc[order] if order else stats
+
+    def fn(df):
+        df["Combined_Effect"] = (df["cum_rl_gwl"] - df["cum_rl_ref"]) / df["demand_bas"]
+    poly_w2 = _mmm_wasserstein(df_gwl2, "Combined_Effect", share_re, vmax=None,
+                               compute_fn=fn, w2_table=w2_table)
+    poly_w2["name"]  = poly_w2["poly_idx"].map(shp[name_col].to_dict())
+    poly_w2["label"] = poly_w2["name"].map(DICT_LABELS)
+    w2_by_label = (poly_w2.dropna(subset=["label"])
+                          .set_index("label")["Combined_Effect"])
+
+    df_long = (df_db[["label", "Temp_Effect", "RE_Effect"]]
+               .melt(id_vars="label", var_name="Effect", value_name="Value")
+               .dropna())
+    df_long["Effect"] = df_long["Effect"].map(
+        {"Temp_Effect": "Demand driver", "RE_Effect": "Supply driver"})
+    pal = plt.get_cmap("PuOr")
+    demand_color, re_color = pal(0.8), pal(0.2)
+    w2_color = "#1b9e77"
+    plt.style.use("seaborn-v0_8-whitegrid")
+
+    fig_w = FIG_WIDTH_IN
+    fig_h = fig_w * (16 / 14)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+
+    if len(df_long) > 0 and len(order) > 0:
+        try:
+            sns.violinplot(
+                data=df_long, x="Value", y="label", hue="Effect",
+                order=order, split=True, inner=None, width=1.8,
+                palette={"Demand driver": demand_color, "Supply driver": re_color},
+                ax=ax,
+            )
+            sns.stripplot(
+                data=df_long, x="Value", y="label", hue="Effect",
+                order=order, dodge=True, size=2.5, alpha=0.55,
+                palette={"Demand driver": demand_color, "Supply driver": re_color},
+                ax=ax,
+            )
+            for coll in ax.collections:
+                if hasattr(coll, "get_alpha") and (coll.get_alpha() is None
+                                                    or coll.get_alpha() > 0.35):
+                    coll.set_alpha(0.35)
+            if ax.get_legend():
+                ax.get_legend().remove()
+            for i, sub in enumerate(order):
+                if sub not in stats.index:
+                    continue
+                r = stats.loc[sub]
+                ax.scatter(r["Temp_Effect"], i, color=demand_color, s=30, zorder=5, alpha=0.9)
+                ax.scatter(r["RE_Effect"],   i, color=re_color,     s=30, zorder=5, alpha=0.9)
+                ax.scatter(r["Combined_Effect"], i, color="black", s=34, zorder=6,
+                           alpha=0.9, marker="o")
+                if sub in w2_by_label.index and np.isfinite(w2_by_label.loc[sub]):
+                    ax.scatter(w2_by_label.loc[sub], i, color=w2_color, s=34, zorder=7,
+                              alpha=0.95, marker="D")
+        except Exception as exc:
+            print(f"  [WARN] Absolute wasserstein dumbbell failed: {exc}")
+
+    ax.axvline(0, color="black", lw=1.2, alpha=0.6, linestyle="--")
+    finite_vals = (pd.concat([df_long["Value"], stats["Combined_Effect"], w2_by_label])
+                   .replace([np.inf, -np.inf], np.nan).dropna())
+    vmax_abs = max(1.0, np.nanpercentile(np.abs(finite_vals.values), 98)) if len(finite_vals) else 1.0
+    ax.set_xlim(-vmax_abs * 1.15, vmax_abs * 1.15)
+
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels(order, fontsize=6)
+    ax.set_ylabel("")
+    ax.set_xlabel("Change (days of baseline demand)", fontsize=6, labelpad=2)
+    ax.tick_params(axis="x", labelsize=5)
+
+    xlim = ax.get_xlim()
+    ax.annotate("", xy=(xlim[0] * 0.85, 1.04), xycoords=("data", "axes fraction"),
+               xytext=(0, 1.04), textcoords=("data", "axes fraction"),
+               arrowprops=dict(arrowstyle="->", lw=0.8, color="#777777"))
+    ax.text(xlim[0] * 0.45, 1.055, "Lower SWBDs",
+           transform=ax.get_xaxis_transform(),
+           ha="center", va="bottom", fontsize=6, color="black")
+    ax.annotate("", xy=(xlim[1] * 0.85, 1.04), xycoords=("data", "axes fraction"),
+               xytext=(0, 1.04), textcoords=("data", "axes fraction"),
+               arrowprops=dict(arrowstyle="->", lw=0.8, color="#777777"))
+    ax.text(xlim[1] * 0.45, 1.055, "Higher SWBDs",
+           transform=ax.get_xaxis_transform(),
+           ha="center", va="bottom", fontsize=6, color="black")
+
+    ax.legend(handles=[
+        Line2D([0], [0], marker="o", linestyle="None",
+               color=demand_color, label="Demand driver", markersize=5),
+        Line2D([0], [0], marker="o", linestyle="None",
+               color=re_color, label="Supply driver", markersize=5),
+        Line2D([0], [0], marker="o", linestyle="None",
+               color="black", label="Combined effect (multi-model mean)", markersize=5),
+        Line2D([0], [0], marker="D", linestyle="None",
+               color=w2_color, label="Combined effect (inverse-W2 weighted)", markersize=5),
+    ], title="Combined effect, two weighting schemes",
+       title_fontproperties={"weight": "bold", "size": 6},
+       loc="lower right", fontsize=5)
+
+    _save_fig(fig, os.path.join(output_dir, "main",
+                                "fig_main_dumbbell_absolute_days_wasserstein.png"), dpi)
+
+
 # =============================================================================
 # FIGURE 2 -- Supp: three-panel GWL combined-effect maps
 # =============================================================================
@@ -775,10 +1127,10 @@ def plot_supp_gwl_maps(df_gwl15, df_gwl2, df_gwl3,
     fig = _three_panel_map(
         df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
         value_fn=_mmm_combined, value_col="Combined_Effect",
-        title_gwl2="WSBDs change - 2.0°C warming",
-        title_gwl15="WSBDs change - 1.5°C warming",
-        title_gwl3="WSBDs change - 3.0°C warming",
-        cbar_label="Combined effect on WSBDs (%)", dpi=dpi,
+        title_gwl2="SWBDs change - 2.0°C warming",
+        title_gwl15="SWBDs change - 1.5°C warming",
+        title_gwl3="SWBDs change - 3.0°C warming",
+        cbar_label="Combined effect on SWBDs (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "supp",
                                 f"suppfig_gwl_maps_{tag}.png"), dpi)
@@ -803,7 +1155,7 @@ def plot_supp_re_effect(df_gwl15, df_gwl2, df_gwl3,
         title_gwl2="RE supply effect - 2.0°C warming",
         title_gwl15="RE supply effect - 1.5°C warming",
         title_gwl3="RE supply effect - 3.0°C warming",
-        cbar_label="RE supply effect on WSBDs (%)", dpi=dpi,
+        cbar_label="RE supply effect on SWBDs (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "supp",
                                 f"suppfig_re_effect_{tag}.png"), dpi)
@@ -828,7 +1180,7 @@ def plot_supp_tas_effect(df_gwl15, df_gwl2, df_gwl3,
         title_gwl2="Demand effect - 2.0°C warming",
         title_gwl15="Demand effect - 1.5°C warming",
         title_gwl3="Demand effect - 3.0°C warming",
-        cbar_label="Demand effect on WSBDs (%)", dpi=dpi,
+        cbar_label="Demand effect on SWBDs (%)", dpi=dpi,
     )
     _save_fig(fig, os.path.join(output_dir, "supp",
                                 f"suppfig_tas_effect_{tag}.png"), dpi)
@@ -889,7 +1241,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
         ax.spines["geo"].set_visible(False)
     except KeyError:
         ax.outline_patch.set_visible(False)
-    ax.set_title("Driver decomposition: RE vs. demand share of WSBD change (GWL 2.0°C)",
+    ax.set_title("Driver decomposition: RE vs. demand share of SWBD change (GWL 2.0°C)",
                  fontsize=8, fontweight="bold", pad=6)
 
     sm = plt.cm.ScalarMappable(cmap=cmap_c, norm=norm_c)
@@ -1056,7 +1408,7 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
     sm_ref = plt.cm.ScalarMappable(cmap=cmap_ref, norm=norm_ref)
     sm_ref.set_array([])
     cb_ref = fig.colorbar(sm_ref, cax=cbar_ref_ax, orientation="horizontal", extend="max")
-    cb_ref.set_label("Combined effect on WSBDs (%), default - GWL 2.0C", fontsize=6)
+    cb_ref.set_label("Combined effect on SWBDs (%), default - GWL 2.0C", fontsize=6)
     cb_ref.ax.tick_params(labelsize=5)
 
     cbar_diff_ax = fig.add_axes([0.55, 0.025, 0.36, 0.020])
@@ -1233,7 +1585,7 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
     sm_ref = plt.cm.ScalarMappable(cmap=cmap_ref, norm=norm_ref)
     sm_ref.set_array([])
     cb_ref = fig.colorbar(sm_ref, cax=cbar_ref_ax, orientation="horizontal", extend="both")
-    cb_ref.set_label("Change in WSBDs (days of baseline demand), default", fontsize=6)
+    cb_ref.set_label("Change in SWBDs (days of baseline demand), default", fontsize=6)
     cb_ref.ax.tick_params(labelsize=5)
 
     cbar_diff_ax = fig.add_axes([0.55, 0.025, 0.36, 0.020])
@@ -1317,8 +1669,8 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
 
     ax1.scatter(x=df_mix["mix_effect"], y=df_mix["gwl_effect"],
                 c=color, marker="x", s=4, linewidths=0.4)
-    ax1.set_xlabel("Mix effect on WSBD (%)", fontsize=5)
-    ax1.set_ylabel("Global warming effect on WSBD (%)", fontsize=5)
+    ax1.set_xlabel("Mix effect on SWBD (%)", fontsize=5)
+    ax1.set_ylabel("Global warming effect on SWBD (%)", fontsize=5)
     ax1.tick_params(labelsize=5)
     ax1.axhline(0, color="gray", linestyle="--", linewidth=0.8)
     ax1.axvline(0, color="gray", linestyle="--", linewidth=0.8)
@@ -1381,10 +1733,10 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
 
     ax2.legend(
         handles=[
-            Patch(facecolor="#d73027", edgecolor="none", label="Both increase WSBDs"),
-            Patch(facecolor="#4575b4", edgecolor="none", label="Both decrease WSBDs"),
-            Patch(facecolor="#fee090", edgecolor="none", label="Warming increases WSBDs, Mix decreases WSBDs"),
-            Patch(facecolor="#91bfdb", edgecolor="none", label="Warming decreases WSBDs, Mix increases WSBDs"),
+            Patch(facecolor="#d73027", edgecolor="none", label="Both increase SWBDs"),
+            Patch(facecolor="#4575b4", edgecolor="none", label="Both decrease SWBDs"),
+            Patch(facecolor="#fee090", edgecolor="none", label="Warming increases SWBDs, Mix decreases SWBDs"),
+            Patch(facecolor="#91bfdb", edgecolor="none", label="Warming decreases SWBDs, Mix increases SWBDs"),
             Patch(facecolor="#8B4513", edgecolor="none", label="No change in mix"),
             Patch(facecolor="white",   edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
             Patch(facecolor="none",    edgecolor="black", hatch=7 * "///",
@@ -1528,12 +1880,12 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     except KeyError:
         ax.outline_patch.set_visible(False)
     ax.set_title(
-        "Inter-model spread in RE supply effect on WSBDs (std across GCMs, GWL 2.0°C)",
+        "Inter-model spread in RE supply effect on SWBDs (std across GCMs, GWL 2.0°C)",
         fontsize=8, fontweight="bold", pad=6)
     sm = plt.cm.ScalarMappable(cmap=cmap_c, norm=norm_c)
     sm.set_array([])
     cb = fig.colorbar(sm, ax=ax, orientation="horizontal", fraction=0.03, pad=0.04)
-    cb.set_label("Inter-model std of RE supply effect on WSBDs", fontsize=6)
+    cb.set_label("Inter-model std of RE supply effect on SWBDs", fontsize=6)
     cb.ax.tick_params(labelsize=5)
     ax.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No renewable capacities"),
@@ -1588,10 +1940,10 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend="max")
-    cbar.set_label("Combined effect on WSBDs (%)", fontsize=6)
+    cbar.set_label("Combined effect on SWBDs (%)", fontsize=6)
     cbar.ax.tick_params(labelsize=5)
 
-    fig.text(0.5, 0.980, "Effect of renewable penetration level on WSBDs",
+    fig.text(0.5, 0.980, "Effect of renewable penetration level on SWBDs",
              ha="center", va="top", fontsize=8, fontweight="bold")
     fig.text(0.5, 0.948, "Multi-model mean, current mix, threshold = 0.99",
              ha="center", va="top", fontsize=6, style="italic", color="#444444")
@@ -1640,7 +1992,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     sm_a.set_array([])
     cb_a = fig.colorbar(sm_a, ax=ax_a, orientation="horizontal",
                         fraction=0.046, pad=0.04, extend="both")
-    cb_a.set_label("RE supply effect on WSBDs (%)", fontsize=6)
+    cb_a.set_label("RE supply effect on SWBDs (%)", fontsize=6)
     cb_a.ax.tick_params(labelsize=5)
     cb_a.outline.set_linewidth(0.4)
 
@@ -1657,7 +2009,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     sm_b.set_array([])
     cb_b = fig.colorbar(sm_b, ax=ax_b, orientation="horizontal",
                         fraction=0.046, pad=0.04, extend="both")
-    cb_b.set_label("Demand effect on WSBDs (%)", fontsize=6)
+    cb_b.set_label("Demand effect on SWBDs (%)", fontsize=6)
     cb_b.set_ticks([-100, 0, 100, 200])
     cb_b.ax.tick_params(labelsize=5)
     cb_b.outline.set_linewidth(0.4)
@@ -1825,6 +2177,11 @@ def main():
         agreement_aggregated_nc=PATHS["agreement_aggregated_nc"],
     )
 
+    print("\n=== STEP 2b: Wasserstein aggregated weights ===")
+    ds_wasserstein_agg = _load_wasserstein_agg(PATHS["wasserstein_aggregated_nc"])
+    w2_table = (_wasserstein_weight_table(ds_wasserstein_agg)
+                if ds_wasserstein_agg is not None else None)
+
     print("\n=== STEP 3: Main figure ===")
     csv_current = os.path.join(PATHS["out_dir"],
         f"rl_agg_adaptation_Annual_{MAIN_THR}_ren_pen_{MAIN_TOT_RE}_{MAIN_MIX}_v2.csv")
@@ -1838,6 +2195,18 @@ def main():
                                     args.output_dir, dpi=args.dpi, share_re=MAIN_MIX)
         plot_main_dumbbell(df_gwl2, PATHS["shapefile"], dpi=args.dpi,
                            share_re=MAIN_MIX, output_dir=args.output_dir)
+        plot_main_dumbbell_absolute(df_gwl2, PATHS["shapefile"], dpi=args.dpi,
+                                    share_re=MAIN_MIX, output_dir=args.output_dir)
+        if w2_table is not None:
+            plot_main_gwl_maps_absolute_wasserstein(
+                df_gwl15, df_gwl2, df_gwl3, PATHS["shapefile"], hatch_df, w2_table,
+                args.output_dir, dpi=args.dpi, share_re=MAIN_MIX)
+            plot_main_dumbbell_absolute_wasserstein(
+                df_gwl2, PATHS["shapefile"], w2_table, dpi=args.dpi,
+                share_re=MAIN_MIX, output_dir=args.output_dir)
+
+    if ds_wasserstein_agg is not None:
+        ds_wasserstein_agg.close()
 
     print("\n=== STEP 4: Current vs Future mix comparison ===")
     csv_future = os.path.join(PATHS["out_dir"],

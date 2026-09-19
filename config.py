@@ -39,6 +39,20 @@ TEMP_FOLDER = "/gpfs/workdir/shared/juicce/RE_Colin/temp/"
 AGREEMENT_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/trend_agreement_mask_ERA5.nc"
 AGREEMENT_AGGREGATED_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/trend_agreement_mask_aggregated_ERA5_v1.nc"
 AGREEMENT_SUFFIX_SHP = "v1"  # shapefile-version suffix on wcf_agg_*/scf_agg_* files (see calculate_cf.py)
+
+# Per-(GCM, run), per-pixel empirical Wasserstein trend-distance file, built by
+# trend_sev_eval_wasserstein.py's wasserstein_empirical_grid(). dims (realization,
+# lat, lon); variables w2_distance (raw) and w2_normalized (w2_distance / ERA5's own
+# native-grid bootstrap trend std); coords GCM, run. Used by fig3.py to build the
+# suppfig_projected_change_valuebyalpha_GWLxx_wasserstein figures.
+WASSERSTEIN_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/agg_wasserstein_empirical_GCMs_all_year_ERA5.nc"
+# Aggregated-domain (per-polygon) twin of WASSERSTEIN_NC_PATH, built by
+# trend_sev_eval_wasserstein.py's wasserstein_empirical_agg() from wcf_agg_*/
+# scf_agg_* (one series per poly_idx, same AGREEMENT_SUFFIX_SHP shapefile as
+# AGREEMENT_AGGREGATED_NC_PATH/fig45.py's RL pipeline) instead of the full
+# (lat, lon) grid. dims (realization, poly_idx); same w2_distance/w2_normalized
+# variables and GCM/run coords as WASSERSTEIN_NC_PATH.
+WASSERSTEIN_AGGREGATED_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/agg_wasserstein_empirical_GCMs_aggregated_ERA5_v1.nc"
 SHARE_RENEWABLE_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/share_renewable.csv"
 POP_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ppp_2020_1km_Aggregated.tif"
 SUMMARY_FIGS_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures/"

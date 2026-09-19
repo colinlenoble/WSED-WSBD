@@ -740,13 +740,13 @@ def plot_mean_variables_6panel(
     datasets   = [freq_mean, dur_mean, int_mean, ann_sev_mean, wcf_mean, scf_mean, std_pdd]
     title_list = [
         "Frequency", "Duration",
-        "Intensity", "Annual WSED severity",
+        "Intensity", "Annual SWED severity",
         "Wind Capacity\nFactor",     "Solar Capacity\nFactor",
         "Interannual variability of\nannual severity",
     ]
     legend_list = [
         "Events/yr", "Days/event", "Intensity/day of event",
-        "Annual WSED severity", "Wind Capacity Factor", "Solar Capacity Factor", "Std of annual severity",
+        "Annual SWED severity", "Wind Capacity Factor", "Solar Capacity Factor", "Std of annual severity",
     ]
     cmap_list = [
         cmo.cm.solar.reversed(), cmo.cm.matter, cmo.cm.dense,
@@ -756,10 +756,11 @@ def plot_mean_variables_6panel(
     vmax_list = [36, 3,  0.05, 1, 0.5, 0.5, 0.25]
     panellabels = list(ascii_lowercase[:7])
 
-    # 3x3 layout, same width; height scales proportionally
+    # 2-column layout (4 rows), same width; height scales proportionally
+    # so each map panel is bigger than the previous 3-column layout
     fig_width_in  = FIG_WIDTH_IN
-    fig_height_in = fig_width_in * 0.6
-    fig, axes = plt.subplots(3, 3, figsize=(fig_width_in, fig_height_in), dpi=300,
+    fig_height_in = fig_width_in * 1.2
+    fig, axes = plt.subplots(4, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
                              subplot_kw={"projection": ccrs.EqualEarth()})
     axes_flat = axes.flatten()
 
@@ -868,9 +869,9 @@ def plot_valuebyalpha_sensitivity(
 
     panel_configs = [
         (axes[0], rgba_005, sev_005, ds_005, "a",
-         "Historical annual WSED severity change\nThreshold = 0.05"),
+         "Historical annual SWED severity change\nThreshold = 0.05"),
         (axes[1], rgba_02,  sev_02,  ds_02,  "b",
-         "Historical annual WSED severity change\nThreshold = 0.20"),
+         "Historical annual SWED severity change\nThreshold = 0.20"),
     ]
     for ax, rgba_map, sev_da, ds_src, letter, title in panel_configs:
         ax.imshow(
@@ -1205,8 +1206,8 @@ def main():
     fig1 = plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         ds_final=ds_final, mask=mask, shapefile_path=args.shapefile,
         map_title=" ",
-        relchange_label="Relative change in\nannual WSED severity(%)",
-        sev_label="Historical average\nannual WSED severity",
+        relchange_label="Relative change in\nannual SWED severity(%)",
+        sev_label="Historical average\nannual SWED severity",
         lat_min=-60, lat_max=75,
         period_hist=(1982, 2001), period_comp=(2002, 2021),
         n_boot=args.n_boot,
