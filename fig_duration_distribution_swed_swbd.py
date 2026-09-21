@@ -59,10 +59,10 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 from matplotlib.patches import ConnectionPatch
 
-# Reused rather than duplicated: WSED/SWED cache + shared constants/helpers
-# (zone edges, GWL colors, the locator map, the equal-GCM-weighted pooling
+# Reused rather than duplicated: SWED cache + shared constants/helpers (zone
+# edges, GWL colors, the locator map, the equal-GCM-weighted pooling
 # convention, ...) and fig45's residual-load formula + GCM/run discovery.
-import fig_duration_distribution_latitude as wsed_mod
+import fig_duration_distribution_latitude as swed_mod
 import fig45
 
 
@@ -87,7 +87,7 @@ def parse_args():
                               "(default: config.SHAPEFILE_PATH_LIGHT, same one xagg used "
                               "to build wcf_agg_*/scf_agg_*/tas_pop_agg_*).")
     parser.add_argument(
-        "--gwl_list", nargs="+", default=wsed_mod.GWL_KEYS,
+        "--gwl_list", nargs="+", default=swed_mod.GWL_KEYS,
         help="GWL keys to include (default: GWL0-61 GWL1-5 GWL2 GWL3).",
     )
     parser.add_argument("--threshold", type=float, default=0.1,
@@ -107,7 +107,7 @@ def parse_args():
                          help="Land shapefile for the SWED side (pixel land mask / "
                               "locator map), same as fig_duration_distribution_latitude.py.")
     parser.add_argument("--era5_grid_path", default=None)
-    parser.add_argument("--wsed_cache_csv", default=None,
+    parser.add_argument("--swed_cache_csv", default=None,
                          help="Path to fig_duration_distribution_latitude.py's own "
                               "event_duration_counts_cache.csv (default: "
                               "<output_dir>/event_duration_counts_cache.csv).")
@@ -118,7 +118,7 @@ def parse_args():
     parser.add_argument("--output_dir", default="../final_figs")
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--max_duration_days", type=float,
-                         default=wsed_mod.FULL_FIGURE_MAX_DURATION_DAYS)
+                         default=swed_mod.FULL_FIGURE_MAX_DURATION_DAYS)
     parser.add_argument("--min_events", type=int, default=5)
     return parser.parse_args()
 
@@ -154,7 +154,7 @@ def assign_regions_to_zones(shapefile_path):
     band_geoms_eq = {
         zlabel: gpd.GeoSeries([box(-180, lo, 180, hi)], crs="EPSG:4326")
                    .to_crs("EPSG:6933").iloc[0]
-        for zlabel, (lo, hi) in wsed_mod.ZONE_BOUNDS.items()
+        for zlabel, (lo, hi) in swed_mod.ZONE_BOUNDS.items()
     }
 
     zone_of_poly, area_of_poly = {}, {}
@@ -400,40 +400,40 @@ def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_i
 # Plotting
 # =============================================================================
 
-def plot_swed_swbd_distributions(wsed_counts_df, swbd_counts_df, land_area_pct,
+def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                                   zone_of_poly, area_of_poly, gwl_list, output_path,
                                   dpi=300, max_duration_days=20.0, min_events=5):
     """
     Same locator-map + connector-line + colored-spine + main/zoom-split
     layout as fig_duration_distribution_latitude.py's plot_distributions,
     but drawing both event definitions on the same axis per zone: SWED
-    (this script's wsed_counts_df, via wsed_mod._group_counts, same as the
+    (this script's swed_counts_df, via swed_mod._group_counts, same as the
     existing figures) as filled solid lines, and SWBD (swbd_counts_df, via
     zone_group_counts_swbd) as dotted lines -- both on the normalized share
     scale, so directly comparable despite the structurally different
     per-pixel-vs-per-region data behind them.
     """
     x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
-    zone_order = list(reversed(wsed_mod.LAT_ZONE_LABELS))
+    zone_order = list(reversed(swed_mod.LAT_ZONE_LABELS))
 
-    fig = plt.figure(figsize=(wsed_mod.FIG_WIDTH_IN, wsed_mod.FIG_WIDTH_IN))
+    fig = plt.figure(figsize=(swed_mod.FIG_WIDTH_IN, swed_mod.FIG_WIDTH_IN))
     gs = GridSpec(len(zone_order), 2, width_ratios=[1.2, 2.6],
                   left=0.14, right=0.97, top=0.96, bottom=0.13,
                   hspace=0.85, wspace=0.32, figure=fig)
 
-    ax_map, lat_mid = wsed_mod._add_locator_map(fig, gs[:, 0], zone_order)
+    ax_map, lat_mid = swed_mod._add_locator_map(fig, gs[:, 0], zone_order)
     ax_map.text(-0.02, 1.03, "a", transform=ax_map.transAxes,
-                fontsize=wsed_mod.LETTER_FONTSIZE, fontweight="bold")
+                fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
 
-    do_split = max_duration_days > wsed_mod.DURATION_SPLIT_DAY
-    split_idx = wsed_mod.DURATION_SPLIT_DAY
+    do_split = max_duration_days > swed_mod.DURATION_SPLIT_DAY
+    split_idx = swed_mod.DURATION_SPLIT_DAY
 
     dist_axes, dist_axes_zoom = [], []
     for i, zlabel in enumerate(zone_order):
         if do_split:
             inner_gs = GridSpecFromSubplotSpec(
                 1, 2, subplot_spec=gs[i, 1],
-                width_ratios=wsed_mod.DURATION_ZOOM_WIDTH_RATIOS, wspace=0.08)
+                width_ratios=swed_mod.DURATION_ZOOM_WIDTH_RATIOS, wspace=0.08)
             ax = fig.add_subplot(inner_gs[0], sharex=dist_axes[0] if dist_axes else None)
             ax_zoom = fig.add_subplot(
                 inner_gs[1], sharex=dist_axes_zoom[0] if dist_axes_zoom else None)
@@ -450,46 +450,46 @@ def plot_swed_swbd_distributions(wsed_counts_df, swbd_counts_df, land_area_pct,
             windows = [(ax, slice(None))]
 
         for gwl in gwl_list:
-            color = wsed_mod.GWL_COLORS.get(gwl, "gray")
+            color = swed_mod.GWL_COLORS.get(gwl, "gray")
 
             y_swed = None
-            group = wsed_mod._group_counts(wsed_counts_df, gwl, zlabel, x_int)
+            group = swed_mod._group_counts(swed_counts_df, gwl, zlabel, x_int)
             if group is not None:
                 arr_share, _, _, _, raw_total = group
                 if raw_total >= min_events:
-                    y_swed = wsed_mod._for_line(arr_share)
+                    y_swed = swed_mod._for_line(arr_share)
 
             y_swbd = zone_group_counts_swbd(
                 swbd_counts_df, gwl, zlabel, zone_of_poly, area_of_poly, x_int,
                 min_events=min_events)
             if y_swbd is not None:
-                y_swbd = wsed_mod._for_line(y_swbd)
+                y_swbd = swed_mod._for_line(y_swbd)
 
             for a, sl in windows:
                 if y_swed is not None:
                     a.plot(x_int[sl], y_swed[sl], color=color, marker="o", markersize=2.5,
                            linewidth=1.4, linestyle="-", zorder=3,
-                           label=f"{wsed_mod.GWL_LABELS.get(gwl, gwl)} -- SWED")
+                           label=f"{swed_mod.GWL_LABELS.get(gwl, gwl)} -- SWED")
                 if y_swbd is not None:
                     a.plot(x_int[sl], y_swbd[sl], color=color, marker="o", markersize=2.0,
                            linewidth=1.2, linestyle=":", zorder=3,
-                           label=f"{wsed_mod.GWL_LABELS.get(gwl, gwl)} -- SWBD")
+                           label=f"{swed_mod.GWL_LABELS.get(gwl, gwl)} -- SWBD")
 
         base_label = "Share of events"
         if i == 0:
-            ax.set_ylabel(base_label, fontsize=wsed_mod.AXIS_LABEL_FONTSIZE)
+            ax.set_ylabel(base_label, fontsize=swed_mod.AXIS_LABEL_FONTSIZE)
         pct = land_area_pct.get(zlabel)
-        lat_range_text = wsed_mod._fmt_lat_range(zlabel)
+        lat_range_text = swed_mod._fmt_lat_range(zlabel)
         zone_label_text = (f"{lat_range_text} ({pct:.1f}% of land area)" if pct is not None
                             else lat_range_text)
         ax.text(0.0, 1.03, chr(ord("b") + i), transform=ax.transAxes,
-                ha="left", va="bottom", fontsize=wsed_mod.LETTER_FONTSIZE, fontweight="bold")
+                ha="left", va="bottom", fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
         ax.text(0.14, 1.03, zone_label_text, transform=ax.transAxes,
-                ha="left", va="bottom", fontsize=wsed_mod.ZONE_TITLE_FONTSIZE, fontweight="bold",
-                color=wsed_mod.ZONE_MAP_COLORS[zlabel])
+                ha="left", va="bottom", fontsize=swed_mod.ZONE_TITLE_FONTSIZE, fontweight="bold",
+                color=swed_mod.ZONE_MAP_COLORS[zlabel])
         for a in row_axes:
             a.set_yscale("log")
-            a.tick_params(labelsize=wsed_mod.TICK_FONTSIZE)
+            a.tick_params(labelsize=swed_mod.TICK_FONTSIZE)
             locator = (matplotlib.ticker.MaxNLocator(integer=True) if a is ax
                        else matplotlib.ticker.MaxNLocator(integer=True, nbins=6))
             a.xaxis.set_major_locator(locator)
@@ -498,21 +498,21 @@ def plot_swed_swbd_distributions(wsed_counts_df, swbd_counts_df, land_area_pct,
                 spine.set_linewidth(0.4)
 
         if do_split:
-            ax.axvline(wsed_mod.DURATION_SPLIT_DAY, color=wsed_mod.DURATION_SPLIT_LINE_COLOR,
+            ax.axvline(swed_mod.DURATION_SPLIT_DAY, color=swed_mod.DURATION_SPLIT_LINE_COLOR,
                        linewidth=0.8, linestyle="-", zorder=1)
-            ax.set_xlim(0.5, wsed_mod.DURATION_SPLIT_DAY + 0.5)
-            ax_zoom.set_xlim(wsed_mod.DURATION_SPLIT_DAY - 0.5, max_duration_days + 0.5)
+            ax.set_xlim(0.5, swed_mod.DURATION_SPLIT_DAY + 0.5)
+            ax_zoom.set_xlim(swed_mod.DURATION_SPLIT_DAY - 0.5, max_duration_days + 0.5)
             ax_zoom.yaxis.tick_right()
             ax_zoom.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
         else:
             ax.set_xlim(0.5, max_duration_days + 0.5)
 
-        ax.spines["left"].set_color(wsed_mod.ZONE_MAP_COLORS[zlabel])
+        ax.spines["left"].set_color(swed_mod.ZONE_MAP_COLORS[zlabel])
         ax.spines["left"].set_linewidth(2.5)
         con = ConnectionPatch(
-            xyA=(wsed_mod.MAP_LON_EAST, lat_mid[zlabel]), coordsA=ax_map.transData,
+            xyA=(swed_mod.MAP_LON_EAST, lat_mid[zlabel]), coordsA=ax_map.transData,
             xyB=(0, 0.5), coordsB=ax.transAxes,
-            color=wsed_mod.ZONE_MAP_COLORS[zlabel], linewidth=0.9, linestyle="--",
+            color=swed_mod.ZONE_MAP_COLORS[zlabel], linewidth=0.9, linestyle="--",
             alpha=0.85, zorder=1,
         )
         fig.add_artist(con)
@@ -538,9 +538,9 @@ def plot_swed_swbd_distributions(wsed_counts_df, swbd_counts_df, land_area_pct,
             for y_zoom, y_frac_zoom in ((y_hi_zoom, 1), (y_lo_zoom, 0)):
                 y_anchor = min(max(y_zoom, y_lo_main), y_hi_main)
                 zoom_link = ConnectionPatch(
-                    xyA=(wsed_mod.DURATION_SPLIT_DAY, y_anchor), coordsA=ax.transData,
+                    xyA=(swed_mod.DURATION_SPLIT_DAY, y_anchor), coordsA=ax.transData,
                     xyB=(0, y_frac_zoom), coordsB=ax_zoom.transAxes,
-                    color=wsed_mod.DURATION_SPLIT_LINE_COLOR, linewidth=0.7,
+                    color=swed_mod.DURATION_SPLIT_LINE_COLOR, linewidth=0.7,
                     linestyle=":", zorder=1,
                 )
                 fig.add_artist(zoom_link)
@@ -551,10 +551,10 @@ def plot_swed_swbd_distributions(wsed_counts_df, swbd_counts_df, land_area_pct,
                 ax.plot((1 - d, 1 + d), (y0 - d, y0 + d), transform=ax.transAxes, **break_kwargs)
                 ax_zoom.plot((-d, d), (y0 - d, y0 + d), transform=ax_zoom.transAxes, **break_kwargs)
 
-    dist_axes[-1].set_xlabel("Event duration (days)", fontsize=wsed_mod.XLABEL_FONTSIZE)
+    dist_axes[-1].set_xlabel("Event duration (days)", fontsize=swed_mod.XLABEL_FONTSIZE)
     handles, labels = dist_axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=min(len(gwl_list), 2),
-               fontsize=wsed_mod.LEGEND_FONTSIZE - 1, bbox_to_anchor=(0.5, 0.0), frameon=False)
+               fontsize=swed_mod.LEGEND_FONTSIZE - 1, bbox_to_anchor=(0.5, 0.0), frameon=False)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return fig
@@ -578,25 +578,25 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 2 - SWED land area share per zone (ERA5 reference grid)")
     print("=" * 60)
-    era5_lat, era5_lon = wsed_mod.load_era5_reference_grid(
+    era5_lat, era5_lon = swed_mod.load_era5_reference_grid(
         args.preprocessed_path, era5_grid_path=args.era5_grid_path)
-    land_area_pct = wsed_mod.compute_land_area_share_per_zone(era5_lat, era5_lon, args.shapefile)
+    land_area_pct = swed_mod.compute_land_area_share_per_zone(era5_lat, era5_lon, args.shapefile)
     for z, pct in land_area_pct.items():
         print(f"  {z}: {pct:.1f}% of land area")
 
     print("\n" + "=" * 60)
     print("STEP 3 - SWED event-duration counts (cached)")
     print("=" * 60)
-    wsed_cache_path = args.wsed_cache_csv or os.path.join(
+    swed_cache_path = args.swed_cache_csv or os.path.join(
         args.output_dir, "event_duration_counts_cache.csv")
-    wsed_counts_df = wsed_mod.load_counts_cache(wsed_cache_path, args.threshold, args.ssp)
-    if wsed_counts_df is None:
-        wsed_counts_df = wsed_mod.build_counts_table(
+    swed_counts_df = swed_mod.load_counts_cache(swed_cache_path, args.threshold, args.ssp)
+    if swed_counts_df is None:
+        swed_counts_df = swed_mod.build_counts_table(
             args.preprocessed_path, args.gwl_list, args.ssp, args.threshold,
             args.shapefile, [], args.exclude_gcm_run,
         )
-        wsed_mod.save_counts_cache(wsed_counts_df, wsed_cache_path, args.threshold, args.ssp)
-    print(f"  {len(wsed_counts_df)} SWED cache rows")
+        swed_mod.save_counts_cache(swed_counts_df, swed_cache_path, args.threshold, args.ssp)
+    print(f"  {len(swed_counts_df)} SWED cache rows")
 
     print("\n" + "=" * 60)
     print("STEP 4 - SWBD event-duration counts (cached)")
@@ -624,7 +624,7 @@ def main():
     print("=" * 60)
     out_path = os.path.join(args.output_dir, "fig_duration_distribution_swed_swbd.png")
     plot_swed_swbd_distributions(
-        wsed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
+        swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
         args.gwl_list, out_path, dpi=args.dpi,
         max_duration_days=args.max_duration_days, min_events=args.min_events,
     )

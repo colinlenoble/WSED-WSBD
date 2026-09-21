@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Distribution of WSED (wind-solar energy drought) event duration by latitude
+Distribution of SWED (wind-solar energy drought) event duration by latitude
 zone, decomposed by global warming level (GWL) and pooled across every
 available GCM/run realization.
 
@@ -213,7 +213,7 @@ GWL_COLORS = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Distribution of WSED event duration by latitude zone, "
+            "Distribution of SWED event duration by latitude zone, "
             "decomposed by GWL and pooled over every available GCM/run."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -571,7 +571,7 @@ def build_daily_compound(preprocessed_path, gwl, gcm, run, ssp, threshold):
 
 def build_events_for_realization(preprocessed_path, gwl, gcm, run, ssp, threshold, shapefile_path):
     """
-    One row per WSED event (contiguous compound low-production spell) at one
+    One row per SWED event (contiguous compound low-production spell) at one
     land pixel, with its total duration (days), the year it started, and its
     latitude zone. Ocean pixels are zeroed out (not NaN) before event
     detection so they simply generate zero events, rather than needing
@@ -1337,7 +1337,7 @@ def plot_distributions(counts_df, land_area_pct, gwl_list, output_path, dpi=300,
                 ax.plot((1 - d, 1 + d), (y0 - d, y0 + d), transform=ax.transAxes, **break_kwargs)
                 ax_zoom.plot((-d, d), (y0 - d, y0 + d), transform=ax_zoom.transAxes, **break_kwargs)
 
-    dist_axes[-1].set_xlabel("WSED event duration (days)", fontsize=XLABEL_FONTSIZE)
+    dist_axes[-1].set_xlabel("SWED event duration (days)", fontsize=XLABEL_FONTSIZE)
     handles, labels = dist_axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=len(gwl_list), fontsize=LEGEND_FONTSIZE,
                bbox_to_anchor=(0.5, 0.0), frameon=False)
@@ -1450,7 +1450,7 @@ def plot_return_periods(counts_df, gcm_pixel_counts, era5_lat, era5_lon, era5_la
         for a in dist_axes:
             a.set_ylim(y_lo_shared, y_hi_shared)
 
-    dist_axes[-1].set_xlabel("WSED event duration (days)", fontsize=XLABEL_FONTSIZE)
+    dist_axes[-1].set_xlabel("SWED event duration (days)", fontsize=XLABEL_FONTSIZE)
     handles, labels = dist_axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=len(gwl_list), fontsize=LEGEND_FONTSIZE,
                bbox_to_anchor=(0.5, 0.0), frameon=False)
@@ -1555,7 +1555,7 @@ def plot_gwl_uncertainty_check(counts_df, gcm_pixel_counts, era5_lat, era5_lon, 
         for a in dist_axes:
             a.set_ylim(y_lo_shared, y_hi_shared)
 
-    dist_axes[-1].set_xlabel("WSED event duration (days)", fontsize=XLABEL_FONTSIZE)
+    dist_axes[-1].set_xlabel("SWED event duration (days)", fontsize=XLABEL_FONTSIZE)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return fig
