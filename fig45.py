@@ -100,12 +100,12 @@ GWL_DISPLAY = {"GWL0-61": "0.61 C", "GWL1-5": "1.5 C",
                "GWL2": "2.0 C", "GWL3": "3.0 C"}
 
 REGION_NAMES = [
-    "Ecuador", "Ivory Coast", "Germany", "Parana",
-    "Japan", "Sichuan", "Washington", "Queensland", "Egypt", "Florida",
+    "Ecuador", "Ivory Coast", "Poland", "Parana",
+    "Japan", "Andhra Pradesh", "Washington", "Queensland", "Egypt", "Florida",
 ]
 REGION_LABELS = [
-    "Ecuador", "Ivory Coast", "Germany", "Parana (BRA)", "Japan",
-    "Sichuan (CHN)", "Washington (USA)", "Queensland (AUS)", "Egypt", "Florida (USA)",
+    "Ecuador", "Ivory Coast", "Poland", "Parana (BRA)", "Japan",
+    "Andhra Pradesh (IND)", "Washington (USA)", "Queensland (AUS)", "Egypt", "Florida (USA)",
 ]
 DICT_LABELS = dict(zip(REGION_NAMES, REGION_LABELS))
 
@@ -763,6 +763,25 @@ def plot_main_gwl_maps_absolute_wasserstein(df_gwl15, df_gwl2, df_gwl3,
                                 "fig_main_gwl_maps_absolute_days_wasserstein.png"), dpi)
 
 
+def _print_effect_outliers(df_db, region_name, effect_col="RE_Effect", n_top=5):
+    """Diagnostic: print the GCM/run pairs with the most extreme effect_col
+    values for a single named region -- e.g. to identify which realizations
+    are driving an apparently multi-modal (two-group) spread of per-(GCM,run)
+    points far from 0 in the dumbbell's violin/strip plot."""
+    sub = df_db.loc[df_db["name"] == region_name, ["GCM", "run", effect_col]].dropna()
+    if sub.empty:
+        print(f"  [INFO] No rows for region '{region_name}' to check {effect_col} outliers.")
+        return
+    sub = sub.sort_values(effect_col)
+    print(f"\n  {effect_col} outliers for {region_name} ({len(sub)} GCM-run rows):")
+    print("    Most negative:")
+    for _, r in sub.head(n_top).iterrows():
+        print(f"      {r['GCM']:<25} {r['run']:<10} {r[effect_col]:8.1f}%")
+    print("    Most positive:")
+    for _, r in sub.tail(n_top).iterrows():
+        print(f"      {r['GCM']:<25} {r['run']:<10} {r[effect_col]:8.1f}%")
+
+
 def plot_main_dumbbell(df_gwl2, shapefile_path, dpi=300, share_re="current",
                        output_dir=None):
     shp      = gpd.read_file(shapefile_path)
@@ -773,6 +792,7 @@ def plot_main_dumbbell(df_gwl2, shapefile_path, dpi=300, share_re="current",
                      ("Temp_Effect",     "cum_rl_tas"),
                      ("RE_Effect",       "cum_rl_ds_cf")]:
         df_db[eff] = (df_db[num] - df_db["cum_rl_ref"]) / df_db["cum_rl_ref"] * 100
+    _print_effect_outliers(df_db, "Sichuan", "RE_Effect")
     df_db["label"] = df_db["name"].map(DICT_LABELS)
     df_db = df_db[df_db["name"].isin(REGION_NAMES)].dropna(subset=["label"])
     stats = (df_db[["label", "GCM", "Combined_Effect", "Temp_Effect", "RE_Effect"]]

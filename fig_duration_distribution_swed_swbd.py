@@ -58,12 +58,26 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 from matplotlib.patches import ConnectionPatch
+from matplotlib.lines import Line2D
 
 # Reused rather than duplicated: SWED cache + shared constants/helpers (zone
 # edges, GWL colors, the locator map, the equal-GCM-weighted pooling
-# convention, ...) and fig45's residual-load formula + GCM/run discovery.
+# convention, ...). fig45 (this project's residual-load formula + GCM/run
+# discovery) is imported lazily, inside the two functions that actually
+# compute SWBD from raw data (_daily_swbd_exceedance/build_swbd_counts_table)
+# -- it drags in xagg -> xesmf -> esmpy, which needs a real ESMFMKFILE and so
+# only works on the HPC. Everything else here (region/zone assignment,
+# pooling, and plotting off an already-built SWBD cache) doesn't need it and
+# should keep working in a plain xarray/geopandas/matplotlib environment.
 import fig_duration_distribution_latitude as swed_mod
-import fig45
+
+# fig45.py's headline SWBD configuration (MAIN_THR/MAIN_TOT_RE/MAIN_MIX),
+# duplicated here as plain literals rather than reached into at import time,
+# so building the CLI parser doesn't itself require fig45 (and therefore
+# xesmf) to import successfully.
+SWBD_MAIN_THR    = 0.99
+SWBD_MAIN_TOT_RE = 0.5
+SWBD_MAIN_MIX    = "current"
 
 
 # =============================================================================
@@ -93,15 +107,15 @@ def parse_args():
     parser.add_argument("--threshold", type=float, default=0.1,
                          help="SWED quantile threshold (default: 0.1, matching "
                               "fig_duration_distribution_latitude.py).")
-    parser.add_argument("--swbd_thr", type=float, default=fig45.MAIN_THR,
+    parser.add_argument("--swbd_thr", type=float, default=SWBD_MAIN_THR,
                          help=f"SWBD residual-load quantile threshold (default: "
-                              f"{fig45.MAIN_THR}, fig45.py's MAIN_THR).")
-    parser.add_argument("--swbd_tot_re", type=float, default=fig45.MAIN_TOT_RE,
+                              f"{SWBD_MAIN_THR}, matching fig45.py's MAIN_THR).")
+    parser.add_argument("--swbd_tot_re", type=float, default=SWBD_MAIN_TOT_RE,
                          help=f"SWBD renewable-penetration fraction (default: "
-                              f"{fig45.MAIN_TOT_RE}, fig45.py's MAIN_TOT_RE).")
-    parser.add_argument("--swbd_mix", default=fig45.MAIN_MIX,
-                         help=f"SWBD solar/wind mix key (default: {fig45.MAIN_MIX!r}, "
-                              f"fig45.py's MAIN_MIX).")
+                              f"{SWBD_MAIN_TOT_RE}, matching fig45.py's MAIN_TOT_RE).")
+    parser.add_argument("--swbd_mix", default=SWBD_MAIN_MIX,
+                         help=f"SWBD solar/wind mix key (default: {SWBD_MAIN_MIX!r}, "
+                              f"matching fig45.py's MAIN_MIX).")
     parser.add_argument("--exclude_gcm_run", nargs="+", default=config.EXCLUDE_GCM_RUN)
     parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH,
                          help="Land shapefile for the SWED side (pixel land mask / "
@@ -189,6 +203,7 @@ def _daily_swbd_exceedance(GCM, run, ssp, gwl, thr, tot_re, mix, path_preprocess
     branch structure: GWL0-61 supplies both its own field and the
     threshold/demand_bas every other GWL reuses.
     """
+    import fig45  # lazy: pulls in xagg -> xesmf -> esmpy, HPC-only (see module docstring)
     gwl_ref = "GWL0-61"
     dtas_ref, dds_cf_ref, dds_cf_ref_mean = fig45._load_data(
         GCM, run, ssp, gwl_ref, reanalysis, suffix_shp, path_preprocessed, df_share, mix)
@@ -255,6 +270,7 @@ def build_swbd_counts_table(path_preprocessed, gwl_list, ssp, reanalysis, suffix
     per-event row first (this is the expensive step: it opens every GCM/
     run's tas_pop_agg_*/wcf_agg_*/scf_agg_* files).
     """
+    import fig45  # lazy: see _daily_swbd_exceedance
     exclude_pairs = set(tuple(x.split(":")) for x in (exclude_gcm_run or []))
     rows = []
     for gwl in gwl_list:
@@ -416,9 +432,13 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
     zone_order = list(reversed(swed_mod.LAT_ZONE_LABELS))
 
-    fig = plt.figure(figsize=(swed_mod.FIG_WIDTH_IN, swed_mod.FIG_WIDTH_IN))
+    # Slightly taller than plot_distributions' own figure: bottom is bigger
+    # (0.155 vs 0.13) to leave a clean gap between the shared x-axis label
+    # and the legend below it (two short groups -- GWL color key, then the
+    # SWED/SWBD linestyle key -- see the fig.legend call below).
+    fig = plt.figure(figsize=(swed_mod.FIG_WIDTH_IN, swed_mod.FIG_WIDTH_IN * 1.03))
     gs = GridSpec(len(zone_order), 2, width_ratios=[1.2, 2.6],
-                  left=0.14, right=0.97, top=0.96, bottom=0.13,
+                  left=0.14, right=0.97, top=0.96, bottom=0.155,
                   hspace=0.85, wspace=0.32, figure=fig)
 
     ax_map, lat_mid = swed_mod._add_locator_map(fig, gs[:, 0], zone_order)
@@ -468,12 +488,10 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
             for a, sl in windows:
                 if y_swed is not None:
                     a.plot(x_int[sl], y_swed[sl], color=color, marker="o", markersize=2.5,
-                           linewidth=1.4, linestyle="-", zorder=3,
-                           label=f"{swed_mod.GWL_LABELS.get(gwl, gwl)} -- SWED")
+                           linewidth=1.4, linestyle="-", zorder=3)
                 if y_swbd is not None:
                     a.plot(x_int[sl], y_swbd[sl], color=color, marker="o", markersize=2.0,
-                           linewidth=1.2, linestyle=":", zorder=3,
-                           label=f"{swed_mod.GWL_LABELS.get(gwl, gwl)} -- SWBD")
+                           linewidth=1.2, linestyle=":", zorder=3)
 
         base_label = "Share of events"
         if i == 0:
@@ -552,9 +570,25 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                 ax_zoom.plot((-d, d), (y0 - d, y0 + d), transform=ax_zoom.transAxes, **break_kwargs)
 
     dist_axes[-1].set_xlabel("Event duration (days)", fontsize=swed_mod.XLABEL_FONTSIZE)
-    handles, labels = dist_axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=min(len(gwl_list), 2),
-               fontsize=swed_mod.LEGEND_FONTSIZE - 1, bbox_to_anchor=(0.5, 0.0), frameon=False)
+
+    # Two short legend groups instead of one 2*len(gwl_list)-entry legend
+    # (a GWL x {SWED, SWBD} label for every line would repeat "SWED"/"SWBD"
+    # once per GWL) -- color already encodes GWL and linestyle already
+    # encodes SWED-vs-SWBD on every line drawn above, so the legend only
+    # needs to explain each encoding once: GWL_LABELS is followed by the
+    # two-linestyle key together in one single-row legend.
+    gwl_handles = [
+        Line2D([0], [0], color=swed_mod.GWL_COLORS.get(gwl, "gray"), marker="o",
+               markersize=3, linewidth=1.6, label=swed_mod.GWL_LABELS.get(gwl, gwl))
+        for gwl in gwl_list
+    ]
+    style_handles = [
+        Line2D([0], [0], color="black", linewidth=1.4, linestyle="-", label="SWED"),
+        Line2D([0], [0], color="black", linewidth=1.2, linestyle=":", label="SWBD"),
+    ]
+    fig.legend(handles=gwl_handles + style_handles, loc="lower center",
+               ncol=len(gwl_handles) + len(style_handles), fontsize=swed_mod.LEGEND_FONTSIZE,
+               bbox_to_anchor=(0.5, 0.0), frameon=False, columnspacing=1.3, handlelength=1.8)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return fig
