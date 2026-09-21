@@ -272,7 +272,7 @@ def compute_rl_one_gcm(GCM, run, ssp, gwl, thr, tot_re, mix,
 # PIPELINE HELPERS  (unchanged)
 # =============================================================================
 
-EXCLUDED_RUNS = {("EC-Earth3-Veg-LR", "r3i1p1f1")}
+EXCLUDED_RUNS = {("EC-Earth3-Veg-LR", "r3i1p1f1"), ("NorESM2-MM", "r2i1p1f1")}
 
 def _iter_gcm_runs(path_preprocessed, ssp, reanalysis, suffix_shp):
     pattern = os.path.join(path_preprocessed, "*",
