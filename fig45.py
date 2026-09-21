@@ -459,7 +459,7 @@ def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
     gdf2 = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH].copy()
     if "var" not in gdf2.columns:
         gdf2 = gdf2.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
-    gdf2["do_hatch"] = gdf2["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+    gdf2["do_hatch"] = gdf2["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
     vals     = gdf2[value_col].to_numpy()
     nan_mask = ~np.isfinite(vals)
     fcs      = [(1.0, 1.0, 1.0, 1.0) if n else cmap(norm(v))
@@ -512,7 +512,7 @@ def _build_gdf(shapefile_path, df_data, hatch_df):
     gdf["poly_idx"] = gdf.index
     gdf = gdf.merge(df_data, on="poly_idx", how="left")
     gdf = gdf.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
-    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
     return gdf
 
 
@@ -1205,7 +1205,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
     gdf["poly_idx"] = gdf.index
     gdf = (gdf.merge(df[["poly_idx", "ratio"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
     gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
 
     cmap_c = plt.get_cmap("PiYG_r")
@@ -1771,7 +1771,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
     gdf["poly_idx"] = gdf.index
     gdf = (gdf.merge(df_unc[["poly_idx", "ratio"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
     gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     cmap_c = plt.get_cmap("PiYG_r")
     norm_c = mcolors.Normalize(vmin=0, vmax=1)
@@ -1843,7 +1843,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     gdf["poly_idx"] = gdf.index
     gdf = (gdf.merge(df_var[["poly_idx", "RE_Std"]], on="poly_idx", how="left")
                .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+    gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
     gdf = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     cmap_c = plt.get_cmap("Reds")
     vmax   = np.nanpercentile(df_var["RE_Std"].dropna().values, 95)
@@ -1921,7 +1921,7 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
             mmm    = _mmm_combined(df_gwl, share_re="current", vmax=800)
             gdf    = gdf_base.copy().merge(mmm, on="poly_idx", how="left")
             gdf    = gdf.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
-            gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+            gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
             _draw_map(ax, gdf, "Combined_Effect", cmap, norm, hatch_df,
                       title="", panel_letter="")
             ax.annotate(
@@ -2033,7 +2033,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     gdf_c = (gdf_base.copy()
              .merge(df_dec[["poly_idx", "ratio"]], on="poly_idx", how="left")
              .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf_c["do_hatch"] = gdf_c["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+    gdf_c["do_hatch"] = gdf_c["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
     gdf_c = gdf_c.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     vals_c   = gdf_c["ratio"].to_numpy()
     nan_c    = ~np.isfinite(vals_c)
@@ -2091,7 +2091,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     gdf_d = (gdf_base.copy()
              .merge(df_unc[["poly_idx", "ratio"]], on="poly_idx", how="left")
              .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
-    gdf_d["do_hatch"] = gdf_d["var"].le(config.AGREEMENT_THRESHOLD).fillna(False)
+    gdf_d["do_hatch"] = gdf_d["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
     gdf_d = gdf_d.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     vals_d   = gdf_d["ratio"].to_numpy()
     nan_d    = ~np.isfinite(vals_d)

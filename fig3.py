@@ -737,7 +737,11 @@ def plot_gwl_valuebyalpha_discrete(
     # --- 5. RGBA assembly ---
     nlat, nlon = dChange.shape
     valid_mask = np.isfinite(dChange.values) & np.isfinite(severity.values)
-    rgba_map   = np.zeros((nlat, nlon, 4), dtype=float)
+    # RGB defaults to white (not black) for invalid/masked (e.g. ocean) pixels --
+    # alpha stays 0 so they're still fully transparent, but this avoids a solid
+    # black sea in viewers that don't alpha-composite the PNG correctly.
+    rgba_map   = np.ones((nlat, nlon, 4), dtype=float)
+    rgba_map[..., 3] = 0.0
     cb = np.clip(change_bin, 0, n_bins_change - 1)
     sb = np.clip(sev_bin,    0, n_bins_sev    - 1)
     rgba_map[valid_mask, :3] = color_levels[cb[valid_mask], :3]
@@ -1302,7 +1306,10 @@ def _compute_rgba_map(
 
     nlat, nlon    = dChange.shape
     valid_px      = np.isfinite(dChange.values) & np.isfinite(severity.values)
-    rgba_map      = np.zeros((nlat, nlon, 4), dtype=float)
+    # RGB defaults to white (not black) for invalid/masked (e.g. ocean) pixels --
+    # see plot_gwl_valuebyalpha_discrete's rgba_map for the same fix/rationale.
+    rgba_map      = np.ones((nlat, nlon, 4), dtype=float)
+    rgba_map[..., 3] = 0.0
     cb = np.clip(change_bin, 0, n_bins_change - 1)
     sb = np.clip(sev_bin,    0, n_bins_sev    - 1)
     rgba_map[valid_px, :3] = color_levels[cb[valid_px], :3]
@@ -1716,7 +1723,9 @@ def main():
     # STEP 3 - Optional agreement hatching
     # ------------------------------------------------------------------
     hatchings = None
-    if args.agreement_path is not None and os.path.exists(args.agreement_path):
+    if not config.SHOW_AGREEMENT_HATCHING:
+        print("\nAgreement hatching disabled (config.SHOW_AGREEMENT_HATCHING=False).")
+    elif args.agreement_path is not None and os.path.exists(args.agreement_path):
         print(f"\nLoading agreement mask from {args.agreement_path} ...")
         hatchings = xr.open_dataarray(args.agreement_path)
     elif args.agreement_path is not None:
@@ -1879,6 +1888,20 @@ def main():
                     da_ref_freq, da_ref_int, da_ref_dur,
                     da_proj_freq, da_proj_int, da_proj_dur,
                     weight=weight, mask=mask, lat_min=-60, lat_max=68,
+                )
+                print(f"  Computing global change statistics (inverse-W2 weighted) ...")
+                (global_chg_w, ci_lo_w, ci_hi_w,
+                 gcm_ci_lo_w, gcm_ci_hi_w) = compute_global_change_stats_gwl(
+                    da_ref_freq, da_ref_int, da_ref_dur,
+                    da_proj_freq, da_proj_int, da_proj_dur,
+                    weight=weight_pix, mask=mask,
+                    lat_min=-60, lat_max=68,
+                )
+                print(
+                    f"  Global mean change under {gwl_label} (inverse-W2 weighted): "
+                    f"{global_chg_w:+.2f}% "
+                    f"[spatial CI: {ci_lo_w:+.2f}%, {ci_hi_w:+.2f}%] "
+                    f"[GCM CI: {gcm_ci_lo_w:+.2f}%, {gcm_ci_hi_w:+.2f}%]"
                 )
                 fig_w = plot_gwl_valuebyalpha_wasserstein(
                     rgba_map=_rgba_w, extent=_extent_w, gwl_label=gwl_label,
