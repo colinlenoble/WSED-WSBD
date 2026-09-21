@@ -490,7 +490,7 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                     a.plot(x_int[sl], y_swed[sl], color=color, marker="o", markersize=2.5,
                            linewidth=1.4, linestyle="-", zorder=3)
                 if y_swbd is not None:
-                    a.plot(x_int[sl], y_swbd[sl], color=color, marker="o", markersize=2.0,
+                    a.plot(x_int[sl], y_swbd[sl], color=color, marker="s", markersize=2.0,
                            linewidth=1.2, linestyle=":", zorder=3)
 
         base_label = "Share of events"
@@ -583,8 +583,10 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
         for gwl in gwl_list
     ]
     style_handles = [
-        Line2D([0], [0], color="black", linewidth=1.4, linestyle="-", label="SWED"),
-        Line2D([0], [0], color="black", linewidth=1.2, linestyle=":", label="SWBD"),
+        Line2D([0], [0], color="black", marker="o", markersize=3, linewidth=1.4,
+               linestyle="-", label="SWED"),
+        Line2D([0], [0], color="black", marker="s", markersize=3, linewidth=1.2,
+               linestyle=":", label="SWBD"),
     ]
     fig.legend(handles=gwl_handles + style_handles, loc="lower center",
                ncol=len(gwl_handles) + len(style_handles), fontsize=swed_mod.LEGEND_FONTSIZE,

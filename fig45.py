@@ -561,6 +561,41 @@ def _mmm_absolute_days(df_gwl, share_re="current"):
     return _mmm(df_gwl, "Absolute_Days", share_re, vmax=None, compute_fn=fn)
 
 
+def _mmm_supply_days(df_gwl, share_re="current"):
+    # Isolated RE-supply driver (cum_rl_ds_cf - cum_rl_ref), same
+    # days-of-baseline-demand normalization as _mmm_absolute_days.
+    def fn(df):
+        df["Supply_Days"] = (df["cum_rl_ds_cf"] - df["cum_rl_ref"]) / df["demand_bas"]
+    return _mmm(df_gwl, "Supply_Days", share_re, vmax=None, compute_fn=fn)
+
+
+def _mmm_demand_days(df_gwl, share_re="current"):
+    # Isolated TAS-demand driver (cum_rl_tas - cum_rl_ref), same
+    # days-of-baseline-demand normalization as _mmm_absolute_days.
+    def fn(df):
+        df["Demand_Days"] = (df["cum_rl_tas"] - df["cum_rl_ref"]) / df["demand_bas"]
+    return _mmm(df_gwl, "Demand_Days", share_re, vmax=None, compute_fn=fn)
+
+
+def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
+    """Diagnostic across all polygons at a given GWL: how many regions have a
+    positive vs. negative isolated RE-supply driver, and how the average
+    magnitude of the supply driver compares to the average magnitude of the
+    demand driver, both in days of baseline demand."""
+    supply = (_mmm_supply_days(df_gwl, share_re)["Supply_Days"]
+              .replace([np.inf, -np.inf], np.nan).dropna())
+    demand = (_mmm_demand_days(df_gwl, share_re)["Demand_Days"]
+              .replace([np.inf, -np.inf], np.nan).dropna())
+    n_pos = int((supply > 0).sum())
+    n_neg = int((supply < 0).sum())
+    print(f"  [INFO] {gwl_label}: supply effect > 0 in {n_pos} regions, "
+          f"< 0 in {n_neg} regions (out of {len(supply)})")
+    if len(demand) and demand.abs().mean() > 0:
+        ratio = supply.abs().mean() / demand.abs().mean()
+        print(f"  [INFO] {gwl_label}: avg |supply effect| / avg |demand effect| "
+              f"(days of baseline demand) = {ratio:.3f}")
+
+
 # =============================================================================
 # INVERSE-WASSERSTEIN-DISTANCE POLYGON WEIGHTING
 #
@@ -708,11 +743,12 @@ def plot_main_gwl_maps_absolute(df_gwl15, df_gwl2, df_gwl3,
     by the region's non-thermosensitive baseline demand, so the anomaly
     reads in units of "days of baseline demand" instead of percent."""
     abs_vals = []
-    for df_gwl in (df_gwl15, df_gwl2, df_gwl3):
+    for df_gwl, gwl_label in ((df_gwl15, "1.5°C"), (df_gwl2, "2°C"), (df_gwl3, "3°C")):
         eff = (_mmm_absolute_days(df_gwl, share_re)["Absolute_Days"]
                .replace([np.inf, -np.inf], np.nan).dropna())
         if len(eff):
             abs_vals.append(np.abs(eff.values))
+        _print_supply_demand_stats(df_gwl, gwl_label, share_re)
     vmax_days = (max(1.0, np.ceil(np.nanpercentile(np.concatenate(abs_vals), 95)))
                  if abs_vals else 1.0)
     cmap = plt.get_cmap("RdYlGn_r")
