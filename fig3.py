@@ -181,16 +181,6 @@ def parse_args():
         help="Directory where output figures are saved.",
     )
     parser.add_argument("--dpi", type=int, default=300, help="DPI for saved figures (default: 300).")
-    parser.add_argument(
-        "--path_hist",
-        default=config.PATH_PREPROCESSED + 'agg_datasets/ds_final_non_zero_0.1_ERA5.nc',
-        help=(
-            "Path to the historical ds_final .nc file (ERA5 reanalysis). "
-            "Used to draw the dark grey layer for pixels with no wind potential "
-            "(where historical duration is null). If not provided, falls back to "
-            "the GCM baseline null pattern."
-        ),
-    )
 
     return parser.parse_args()
 
@@ -503,6 +493,27 @@ def build_land_mask(ref_2d, shapefile_path):
     return mask
 
 
+def build_era5_wind_mask(preprocessed_path, target_lat, target_lon):
+    """
+    True where ERA5 has a usable wind resource at a pixel: the 10th-percentile
+    wcf over the full ERA5 record is strictly positive. Built directly from
+    the raw ERA5 wcf record (not any GCM output), then interpolated (nearest)
+    onto (target_lat, target_lon). Used to grey out land pixels with no wind
+    potential; sea pixels are left alone by the caller (intersected with the
+    land shapefile), so they stay white rather than grey.
+    """
+    rea_files, _ = match_files(os.path.join(preprocessed_path, "ERA5", "wcf_day*"))
+    if not rea_files:
+        raise FileNotFoundError(
+            f"No ERA5 wcf file found under {preprocessed_path}/ERA5/ "
+            "to build the wind-availability mask."
+        )
+    wcf_era5 = open_dataset_any(rea_files[0])
+    wcf_q10  = wcf_era5.wcf.quantile(0.1, dim="time").load()
+    wcf_era5.close()
+    return (wcf_q10 > 0).interp(lat=target_lat, lon=target_lon, method="nearest")
+
+
 def _reduce_to_2d(da):
     """Average out 'year' and 'realization' dims to obtain a (lat, lon) DataArray."""
     if "year" in da.dims:
@@ -691,7 +702,7 @@ def plot_gwl_valuebyalpha_discrete(
     regions=None,
     n_bins_change=5,
     n_bins_sev=5,
-    hist_null_da=None,
+    era5_wind_mask=None,
 ):
     if regions is None:
         regions = [
@@ -778,34 +789,31 @@ def plot_gwl_valuebyalpha_discrete(
     )
     land_shp   = rasterize_shapefile(shp_band, da_mask.shape, t_mask)
     land_shp   = land_shp[::-1, :]
-    # Dark grey layer: land pixels with no wind potential
-    # Prefer the ERA5 historical null mask (hist_null_da); fall back to GCM baseline mask.
-    if hist_null_da is not None:
-        _null_float = hist_null_da.astype(float).interp(
-            lat=da_mask.lat, lon=da_mask.lon, method="nearest"
-        )
-        no_wind_mask = land_shp & (_null_float.values > 0.5)
-    else:
-        _mask_float = mask.astype(float).interp(
-            lat=da_mask.lat, lon=da_mask.lon, method="nearest"
-        )
-        no_wind_mask = land_shp & (_mask_float.values < 0.5)
+    # Grey layer: land pixels with no ERA5 wind resource (10th-percentile
+    # wcf <= 0). Intersected with land_shp so the sea stays white, not grey.
+    _wind_float = era5_wind_mask.astype(float).interp(
+        lat=da_mask.lat, lon=da_mask.lon, method="nearest"
+    )
+    no_wind_mask = land_shp & (_wind_float.values < 0.5)
     ax_map.contourf(
         da_mask.lon, da_mask.lat, no_wind_mask.astype(float),
-        levels=[0.5, 1], colors=["#404040"],
+        levels=[0.5, 1], colors=["grey"],
         transform=ccrs.PlateCarree(), zorder=5,
     )
     shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
 
     if hatchings is not None:
-        hatchings_band = hatchings.sel(lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
+        # Black layer: land pixels that failed the trend-agreement evaluation
+        # (agreement_pct <= agreement_threshold).
+        _agree_float = hatchings.interp(
+            lat=da_mask.lat, lon=da_mask.lon, method="nearest"
+        )
+        failed_eval_mask = land_shp & (_agree_float.values <= agreement_threshold)
         ax_map.contourf(
-            hatchings_band.lon, hatchings_band.lat,
-            (hatchings_band <= agreement_threshold).values.astype(float),
-            transform=ccrs.PlateCarree(),
-            colors="none", levels=[0.5, 1.5],
-            hatches=[21 * "/", 21 * "/"], zorder=8,
+            da_mask.lon, da_mask.lat, failed_eval_mask.astype(float),
+            levels=[0.5, 1], colors=["black"],
+            transform=ccrs.PlateCarree(), zorder=6,
         )
 
     if map_title is None:
@@ -985,6 +993,14 @@ def plot_supp_valuebyalpha_stacked(
     shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     lat_ok = (da_mask_ref.lat >= MAP_LAT_SOUTH) & (da_mask_ref.lat <= MAP_LAT_NORTH)
     no_wind_mask_band = no_wind_mask.astype(float) * lat_ok.values[:, None]
+
+    _transform_ref = rasterio.transform.from_bounds(
+        da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
+        da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
+        len(da_mask_ref.lon), len(da_mask_ref.lat),
+    )
+    land_shp_band = rasterize_shapefile(shp, da_mask_ref.shape, _transform_ref)[::-1, :]
+    land_shp_band = land_shp_band & lat_ok.values[:, None]
     n   = len(gwl_items)
 
     # LaTeX-compatible width; height scales with number of rows
@@ -1015,20 +1031,23 @@ def plot_supp_valuebyalpha_stacked(
         )
         ax.contourf(
             da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
-            levels=[0.5, 1], colors=["#404040"],
+            levels=[0.5, 1], colors=["grey"],
             transform=ccrs.PlateCarree(), zorder=5,
         )
         shp_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                transform=ccrs.PlateCarree(), zorder=10)
 
         if hatchings is not None:
-            hatchings_band = hatchings.sel(lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
+            # Black layer: land pixels that failed the trend-agreement
+            # evaluation (agreement_pct <= agreement_threshold).
+            _agree_float = hatchings.interp(
+                lat=da_mask_ref.lat, lon=da_mask_ref.lon, method="nearest"
+            )
+            failed_eval_band = land_shp_band & (_agree_float.values <= agreement_threshold)
             ax.contourf(
-                hatchings_band.lon, hatchings_band.lat,
-                (hatchings_band <= agreement_threshold).values.astype(float),
-                transform=ccrs.PlateCarree(),
-                colors="none", levels=[0.5, 1.5],
-                hatches=[21 * "/", 21 * "/"], zorder=8,
+                da_mask_ref.lon, da_mask_ref.lat, failed_eval_band.astype(float),
+                levels=[0.5, 1], colors=["black"],
+                transform=ccrs.PlateCarree(), zorder=6,
             )
 
         panel_letter = ascii_lowercase[i]
@@ -1162,6 +1181,14 @@ def plot_gwl_valuebyalpha_wasserstein(
     lat_ok = (da_mask_ref.lat >= MAP_LAT_SOUTH) & (da_mask_ref.lat <= MAP_LAT_NORTH)
     no_wind_mask_band = no_wind_mask.astype(float) * lat_ok.values[:, None]
 
+    _transform_ref = rasterio.transform.from_bounds(
+        da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
+        da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
+        len(da_mask_ref.lon), len(da_mask_ref.lat),
+    )
+    land_shp_band = rasterize_shapefile(shp, da_mask_ref.shape, _transform_ref)[::-1, :]
+    land_shp_band = land_shp_band & lat_ok.values[:, None]
+
     fig_width_in  = FIG_WIDTH_IN
     fig_height_in = fig_width_in * (12 / 14)   # two stacked map rows
     fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
@@ -1175,16 +1202,20 @@ def plot_gwl_valuebyalpha_wasserstein(
     )
     ax_a.contourf(
         da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
-        levels=[0.5, 1], colors=["#404040"], transform=ccrs.PlateCarree(), zorder=5,
+        levels=[0.5, 1], colors=["grey"], transform=ccrs.PlateCarree(), zorder=5,
     )
     shp_band.boundary.plot(ax=ax_a, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     if hatchings is not None:
-        hb = hatchings.sel(lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
+        # Black layer: land pixels that failed the trend-agreement evaluation.
+        _agree_float_a = hatchings.interp(
+            lat=da_mask_ref.lat, lon=da_mask_ref.lon, method="nearest"
+        )
+        failed_eval_band_a = land_shp_band & (_agree_float_a.values <= agreement_threshold)
         ax_a.contourf(
-            hb.lon, hb.lat, (hb <= agreement_threshold).values.astype(float),
-            transform=ccrs.PlateCarree(), colors="none", levels=[0.5, 1.5],
-            hatches=[21 * "/", 21 * "/"], zorder=8,
+            da_mask_ref.lon, da_mask_ref.lat, failed_eval_band_a.astype(float),
+            levels=[0.5, 1], colors=["black"],
+            transform=ccrs.PlateCarree(), zorder=6,
         )
     ax_a.annotate(
         "$\\mathbf{a}$", xy=(0.02, 0.99), xycoords="axes fraction",
@@ -1225,7 +1256,7 @@ def plot_gwl_valuebyalpha_wasserstein(
     )
     ax_b.contourf(
         da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
-        levels=[0.5, 1], colors=["#404040"], transform=ccrs.PlateCarree(), zorder=5,
+        levels=[0.5, 1], colors=["grey"], transform=ccrs.PlateCarree(), zorder=5,
     )
     shp_band.boundary.plot(ax=ax_b, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
@@ -1683,19 +1714,13 @@ def main():
     ref_2d = _reduce_to_2d(ds_baseline.duration)
     mask   = build_land_mask(ref_2d, args.shapefile)
 
-    # Historical ERA5 null mask (True = no wind potential) for the dark grey layer
-    hist_null_da = None
-    if args.path_hist is not None:
-        if os.path.exists(args.path_hist):
-            print(f"  Loading historical null mask from {args.path_hist} ...")
-            _ds_hist = xr.open_dataset(args.path_hist)
-            _dur_hist = _ds_hist.duration
-            if "year" in _dur_hist.dims:
-                _dur_hist = _dur_hist.isel(year=0)
-            hist_null_da = _dur_hist.isnull().load()
-            _ds_hist.close()
-        else:
-            print(f"  [warn] --path_hist not found: {args.path_hist}. Dark grey layer uses GCM baseline.")
+    # Wind-availability mask (True = usable wind resource), built directly
+    # from the raw ERA5 wcf record (10th-percentile wcf > 0). Land pixels
+    # where this is False are greyed out on the maps.
+    print(f"  Building ERA5 wind-availability mask (10th-percentile wcf > 0) ...")
+    era5_wind_mask = build_era5_wind_mask(
+        args.preprocessed_path, target_lat=ref_2d.lat, target_lon=ref_2d.lon
+    )
 
     # ------------------------------------------------------------------
     # STEP 2 - Regional DataFrame
@@ -1823,7 +1848,7 @@ def main():
             relchange_label="Relative change (%)",
             sev_label="Average annual\nseverity (0.61 °C)",
             lat_min=-60, lat_max=68,
-            hist_null_da=hist_null_da,
+            era5_wind_mask=era5_wind_mask,
         )
         out_path = os.path.join(args.output_dir, "main", fname)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -1854,16 +1879,10 @@ def main():
                 len(da_mask_ref_supp.lon), len(da_mask_ref_supp.lat),
             )
             _land = rasterize_shapefile(_shp_tmp, da_mask_ref_supp.shape, _t)[::-1, :]
-            if hist_null_da is not None:
-                _null = hist_null_da.astype(float).interp(
-                    lat=da_mask_ref_supp.lat, lon=da_mask_ref_supp.lon, method="nearest"
-                )
-                no_wind_mask_supp = _land & (_null.values > 0.5)
-            else:
-                _mf = mask.astype(float).interp(
-                    lat=da_mask_ref_supp.lat, lon=da_mask_ref_supp.lon, method="nearest"
-                )
-                no_wind_mask_supp = _land & (_mf.values < 0.5)
+            _wf = era5_wind_mask.astype(float).interp(
+                lat=da_mask_ref_supp.lat, lon=da_mask_ref_supp.lon, method="nearest"
+            )
+            no_wind_mask_supp = _land & (_wf.values < 0.5)
         # ----------------------------------------------------------------
 
         # ------ Inverse-Wasserstein-weighted supplementary figure ------
