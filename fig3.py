@@ -1187,7 +1187,7 @@ def plot_gwl_valuebyalpha_wasserstein(
             hatches=[21 * "/", 21 * "/"], zorder=8,
         )
     ax_a.annotate(
-        "$\\mathbf{a}$", xy=(0.02, 1.02), xycoords="axes fraction",
+        "$\\mathbf{a}$", xy=(0.02, 0.99), xycoords="axes fraction",
         ha="left", va="bottom", fontsize=7,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
@@ -1230,7 +1230,7 @@ def plot_gwl_valuebyalpha_wasserstein(
     shp_band.boundary.plot(ax=ax_b, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     ax_b.annotate(
-        "$\\mathbf{b}$", xy=(0.02, 1.02), xycoords="axes fraction",
+        "$\\mathbf{b}$", xy=(0.02, 0.99), xycoords="axes fraction",
         ha="left", va="bottom", fontsize=7,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
