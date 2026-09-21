@@ -172,7 +172,7 @@ def parse_args():
 
 def _calculate_rl(tas, ds_cf, ds_cf_mean, thr, period, tot_re,
                   threshold=None, demand_bas=None,
-                  demand_cfg: DemandConfig = None):
+                  demand_cfg: DemandConfig = None, return_daily=False):
     if demand_cfg is None:
         demand_cfg = DEFAULT_DEMAND
     demand_temp = xr.where(
@@ -191,7 +191,14 @@ def _calculate_rl(tas, ds_cf, ds_cf_mean, thr, period, tot_re,
         time=(demand - tot_re * ds_cf)["time.month"].isin(months))
     if threshold is None:
         threshold = rl.quantile(thr, dim="time")
-    cum_rl = xr.where(rl > threshold, rl - threshold, 0.0).sum(dim="time")
+    exceeds = rl > threshold
+    cum_rl = xr.where(exceeds, rl - threshold, 0.0).sum(dim="time")
+    if return_daily:
+        # Day-level SWBD exceedance field, kept only for callers that need
+        # individual-event duration (e.g. fig_duration_distribution_swed_swbd.py)
+        # -- cum_rl above already discards this by summing over time, which
+        # is all every other caller in this module has ever needed.
+        return cum_rl, threshold, demand_bas, exceeds.astype(int)
     return cum_rl, threshold, demand_bas
 
 
