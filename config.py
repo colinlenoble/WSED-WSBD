@@ -89,4 +89,4 @@ REANALYSIS = 'ERA5'
 SHEAR_REF_PERIOD = ('1982-01-01', '2001-12-31')  # local wind shear exponent fit period
 EXCLUDE_GCM_RUN = ['EC-Earth3-Veg-LR:r3i1p1f1', 'NorESM2-MM:r2i1p1f1']  # GCM:run pairs excluded from ensemble figures
 AGREEMENT_THRESHOLD = 50.0  # % of models whose trend CI overlaps the ERA5 reference CI, below which cells/polygons are hatched on figures
-SHOW_AGREEMENT_HATCHING = True  # whether fig3.py/fig45.py draw the low-agreement hatch overlay on maps at all
+SHOW_AGREEMENT_HATCHING = False  # whether fig3.py/fig45.py draw the low-agreement hatch overlay on maps at all

@@ -67,6 +67,14 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from io_utils import match_files, glob_any, open_dataset_any
 
+# Below this ERA5 bootstrap-trend std, a pixel is treated as having ~zero
+# reference variability and dropped (NaN) from w2_normalized rather than
+# divided into: real sigma_ref values across the grid sit in ~[1e-3, 2e-2],
+# with a separate population pinned at ~0 (e.g. pixels where severity is
+# always zero) -- dividing those by a tiny epsilon floor instead of masking
+# them produced w2_normalized outliers up to ~1e10.
+SIGMA_REF_MIN = 1e-6
+
 
 # ---------------------------------------------------------------------------
 # Duplicated low-level helpers (see trend_sev_eval.py for the originals --
@@ -571,7 +579,7 @@ def _wasserstein_realization(args):
 
     w2 = empirical_w2(slopes_gcm, slopes_ref)
     sigma_ref = slopes_ref.std(dim="boot", ddof=1)
-    w2_norm = (w2 / sigma_ref.clip(min=1e-12)).rename("w2_normalized")
+    w2_norm = (w2 / sigma_ref.where(sigma_ref > SIGMA_REF_MIN)).rename("w2_normalized")
 
     ds_native = w2.to_dataset(name="w2_distance")
     ds_native["w2_normalized"] = w2_norm
@@ -599,7 +607,9 @@ def wasserstein_empirical_grid(preprocessed_path, out_dir, reanalysis=None, excl
     dims (realization, lat, lon), variables:
       w2_distance   -- raw empirical W2 (severity-trend units), downscaled to the ERA5 grid.
       w2_normalized -- w2_distance / std(ERA5's own native-grid bootstrap trend samples),
-                       also downscaled to the ERA5 grid.
+                       also downscaled to the ERA5 grid. NaN where that std is below
+                       SIGMA_REF_MIN (near-zero ERA5 reference variability, e.g. always-zero
+                       severity) rather than a huge ratio from dividing by ~0.
 
     n_boot defaults lower than trend_sev_eval.py's uncertainty_range()
     (500 vs. 1000) since every replicate has to be kept in memory across the
@@ -678,7 +688,7 @@ def _wasserstein_realization_agg(args):
 
     w2 = empirical_w2(slopes_gcm, slopes_ref)
     sigma_ref = slopes_ref.std(dim="boot", ddof=1)
-    w2_norm = (w2 / sigma_ref.clip(min=1e-12)).rename("w2_normalized")
+    w2_norm = (w2 / sigma_ref.where(sigma_ref > SIGMA_REF_MIN)).rename("w2_normalized")
 
     ds = w2.to_dataset(name="w2_distance")
     ds["w2_normalized"] = w2_norm

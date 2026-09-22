@@ -49,11 +49,12 @@ max_duration_days on x), log-scale and harmonized across all 10 panels so
 every factor-of-4 tick (1/16, 1/4, 1, 4, 16, ...) sits the same distance
 apart everywhere and a dashed line marks ratio = 1 -- rare outlier ratios
 are clipped off the shared range rather than stretching it for every other
-panel (see _shared_ratio_ylim). A (zone, GWL) line is only drawn if it is
-defined at every duration in that window; one with even a single missing
-point (too few events at some duration for either side of the ratio) is
-dropped entirely rather than shown with a gap, since a broken ratio line
-reads as a real dip/spike at a glance.
+panel (see _shared_ratio_ylim). A duration with too few events on either
+side of the ratio is left as a gap rather than dropping its whole (zone,
+GWL) line -- every connected run of points still draws its own segment --
+but a point left isolated by that gap (no valid neighbor on either side)
+is removed too, rather than drawn as a disconnected floating marker (see
+_drop_isolated_points).
 """
 import os
 import config
@@ -98,7 +99,7 @@ SWBD_MAIN_MIX    = "current"
 # GWL every ratio panel divides by -- this project's reference/baseline
 # period (see fig_duration_distribution_latitude.py's own GWL0-61 handling).
 BASELINE_GWL  = "GWL0-61"
-RATIO_YLABEL  = "Ratio events under GWL /\nGWL 0.61°C"
+RATIO_YLABEL  = "Ratio nb of events\nat each GWL divided\nby reference 0.61°C"
 
 
 # =============================================================================
@@ -522,6 +523,30 @@ def _ratio_tick_label(v, _pos=None):
     return f"1/{round(1.0 / v):g}"
 
 
+def _drop_isolated_points(arr):
+    """
+    NaN out any point in `arr` with no valid neighbor on either side.
+    A duration with too few events at either the GWL or the baseline (see
+    plot_swed_swbd_distributions) is left as NaN in the ratio array; plotted
+    as-is, a NaN with valid points on both sides just breaks the line
+    there, which is fine -- but a single valid point surrounded by NaN on
+    both sides would still draw as a lone, disconnected marker (no line
+    into or out of it), which reads as a real data point rather than the
+    single-duration gap it actually is. Runs of 2+ consecutive valid points
+    are left untouched and still draw as connected line segments, even if
+    the overall curve is broken elsewhere (e.g. a southern-band SWBD line
+    with a few short-duration gaps still shows every segment it has data
+    for, rather than being dropped outright).
+    """
+    valid = np.isfinite(arr)
+    left_valid = np.concatenate(([False], valid[:-1]))
+    right_valid = np.concatenate((valid[1:], [False]))
+    isolated = valid & ~left_valid & ~right_valid
+    out = arr.copy()
+    out[isolated] = np.nan
+    return out
+
+
 def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                                   zone_of_poly, area_of_poly, regions_shapefile,
                                   gwl_list, output_path, dpi=300,
@@ -546,8 +571,12 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     by the GWL0-61 baseline's own curve at that duration -- so > 1 means
     that duration is over-represented at that GWL relative to baseline, < 1
     under-represented, independent of the two metrics' very different
-    absolute share scales. A (zone, GWL) line is drawn only if it is
-    defined at every plotted duration -- see the Pass-1 loop below.
+    absolute share scales. Durations with too little data (either side
+    short of min_events) are left as gaps; an isolated single point
+    surrounded by gaps on both sides is dropped too rather than drawn as a
+    disconnected floating marker -- see _drop_isolated_points -- but a
+    (zone, GWL) curve with several such gaps still draws every connected
+    segment it has, instead of being dropped outright.
     """
     x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
     zone_order = list(reversed(swed_mod.LAT_ZONE_LABELS))
@@ -568,10 +597,12 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     share_fns = {"SWED": _swed_share, "SWBD": _swbd_share}
 
     # Pass 1: gather every panel's ratio curves up front, so the one shared
-    # ratio y-axis can be fixed before anything is drawn. A curve with any
-    # NaN duration (baseline or GWL itself short of min_events/zero events
-    # at that duration) is dropped whole -- a broken line reads as a real
-    # dip/spike, not as missing data, so it's not drawn at all.
+    # ratio y-axis can be fixed before anything is drawn. A duration with
+    # too little data on either side of the ratio (baseline or GWL itself
+    # short of min_events/zero events at that duration) is left as a NaN
+    # gap, not dropped for the whole curve -- only points left isolated by
+    # that gap (no valid neighbor on either side, so they'd draw as a
+    # disconnected floating marker) are removed; see _drop_isolated_points.
     panel_data = {col: [] for col in share_fns}
     for zlabel in zone_order:
         for col, share_fn in share_fns.items():
@@ -584,7 +615,8 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                     continue
                 base_safe = np.where(base > 0, base, np.nan)
                 ratio = np.where(arr > 0, arr / base_safe, np.nan)
-                ratios[gwl] = ratio if not np.any(np.isnan(ratio)) else None
+                ratio = _drop_isolated_points(ratio)
+                ratios[gwl] = ratio if np.any(np.isfinite(ratio)) else None
             panel_data[col].append({"ratios": ratios})
 
     all_ratio_arrays = [arr for col in panel_data.values() for row in col
