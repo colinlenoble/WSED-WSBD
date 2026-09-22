@@ -98,7 +98,7 @@ SWBD_MAIN_MIX    = "current"
 # GWL every ratio panel divides by -- this project's reference/baseline
 # period (see fig_duration_distribution_latitude.py's own GWL0-61 handling).
 BASELINE_GWL  = "GWL0-61"
-RATIO_YLABEL  = "Events at GWL /\nEvents at GWL0.61°C"
+RATIO_YLABEL  = "Ratio events under GWL /\nGWL 0.61°C"
 
 
 # =============================================================================
@@ -515,6 +515,13 @@ def _ratio_yticks(ylim):
     return [t for t in (4.0 ** k for k in range(-6, 7)) if lo * 0.98 <= t <= hi * 1.02]
 
 
+def _ratio_tick_label(v, _pos=None):
+    """'1/4'/'1/16' below 1, plain integers at/above 1 -- reads as a fold-change, not a decimal."""
+    if v >= 1:
+        return f"{v:g}"
+    return f"1/{round(1.0 / v):g}"
+
+
 def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                                   zone_of_poly, area_of_poly, regions_shapefile,
                                   gwl_list, output_path, dpi=300,
@@ -624,7 +631,7 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
             ax_left.set_yscale("log")
             ax_left.set_ylim(*ratio_ylim)
             ax_left.set_yticks(ratio_yticks)
-            ax_left.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+            ax_left.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_ratio_tick_label))
             ax_left.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
             ax_left.set_xlim(0.5, max_duration_days + 0.5)
             ax_left.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
