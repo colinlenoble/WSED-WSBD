@@ -30,6 +30,7 @@ from matplotlib.patches import Patch
 from matplotlib.patheffects import withStroke
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import cmocean as cmo
 
 
 # =============================================================================
@@ -682,6 +683,16 @@ def _mmm_absolute_days_wasserstein(df_gwl, w2_table, share_re="current"):
                             compute_fn=fn, w2_table=w2_table)
 
 
+def _mmm_combined_wasserstein(df_gwl, w2_table, share_re="current", vmax=None):
+    """Inverse-W2-weighted twin of _mmm_combined() -- same relative-change (%)
+    metric plotted by plot_main_gwl_maps, but averaged per polygon with
+    _wasserstein_weight_table's weights instead of a flat multi-model mean."""
+    def fn(df):
+        df["Combined_Effect"] = (df["cum_rl_gwl"] - df["cum_rl_ref"]) / df["cum_rl_ref"] * 100
+    return _mmm_wasserstein(df_gwl, "Combined_Effect", share_re, vmax,
+                            compute_fn=fn, w2_table=w2_table)
+
+
 def _save_fig(fig, path, dpi):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
@@ -797,6 +808,69 @@ def plot_main_gwl_maps_absolute_wasserstein(df_gwl15, df_gwl2, df_gwl3,
     )
     _save_fig(fig, os.path.join(output_dir, "main",
                                 "fig_main_gwl_maps_absolute_days_wasserstein.png"), dpi)
+
+
+def plot_gwl2_wasserstein_vs_mmm(df_gwl2, shapefile_path, hatch_df, w2_table,
+                                 output_dir, dpi=300, share_re="current"):
+    """
+    Two-panel supplementary companion to plot_main_gwl_maps, at GWL2 (2 deg C)
+    only. Aggregated (poly_idx) twin of fig3.py's
+    plot_gwl_valuebyalpha_wasserstein, using the same SWBDs relative-change (%)
+    metric as plot_main_gwl_maps (Combined_Effect) instead of fig3's pixel-level
+    value-by-alpha map:
+      a) average SWBDs change vs 0.61 deg C, weighted per polygon by each
+         realization's inverse normalized Wasserstein trend distance to ERA5 at
+         that polygon (_mmm_combined_wasserstein/_wasserstein_weight_table),
+         instead of the flat multi-model mean plot_main_gwl_maps uses. Same
+         colour scale as plot_main_gwl_maps so the two are directly comparable.
+      b) the difference this reweighting makes: (inverse-W2-weighted change)
+         minus (multi-model-mean change), in percentage points -- diverging
+         blue/orange (cmo.cm.balance), matching fig3's diff panel. Agreement
+         hatching is shown in (a) but, as in fig3's reference figure, omitted
+         in (b) since it describes trend agreement, not this reweighting.
+    """
+    cmap, norm = _make_cmap(vmin=-100, vmax=800)
+
+    df_flat = _mmm_combined(df_gwl2, share_re=share_re, vmax=None)
+    df_w2   = _mmm_combined_wasserstein(df_gwl2, w2_table, share_re=share_re, vmax=None)
+
+    diff = df_flat.merge(df_w2, on="poly_idx", suffixes=("_flat", "_w2"))
+    diff["Diff_Effect"] = diff["Combined_Effect_w2"] - diff["Combined_Effect_flat"]
+    diff = diff[["poly_idx", "Diff_Effect"]]
+
+    finite = diff["Diff_Effect"].replace([np.inf, -np.inf], np.nan).dropna()
+    diff_vmax = max(1.0, float(np.nanpercentile(np.abs(finite), 98))) if len(finite) else 1.0
+    diff_cmap = cmo.cm.balance
+    diff_norm = mcolors.TwoSlopeNorm(vmin=-diff_vmax, vcenter=0, vmax=diff_vmax)
+
+    hatch_df_none = hatch_df.copy()
+    hatch_df_none["var"] = np.nan
+
+    proj  = ccrs.EqualEarth()
+    fig_w = FIG_WIDTH_IN
+    fig_h = fig_w * (15 / 14)
+    fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+    gs    = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.55,
+                             bottom=0.10, top=0.95)
+
+    ax_a  = fig.add_subplot(gs[0, 0], projection=proj)
+    gdf_a = _build_gdf(shapefile_path, df_w2, hatch_df)
+    _draw_map(ax_a, gdf_a, "Combined_Effect", cmap, norm, hatch_df,
+              "Inverse-Wasserstein-weighted SWBDs change under 2.0°C warming",
+              "a", title_fontsize=7)
+    _add_colorbar(fig, cmap, norm, "SWBDs change compared to 0.61°C (%)",
+                  pos=(0.25, 0.545, 0.5, 0.016))
+
+    ax_b  = fig.add_subplot(gs[1, 0], projection=proj)
+    gdf_b = _build_gdf(shapefile_path, diff, hatch_df_none)
+    _draw_map(ax_b, gdf_b, "Diff_Effect", diff_cmap, diff_norm, hatch_df_none,
+              "Difference vs. multi-model mean", "b", title_fontsize=7)
+    _add_colorbar(fig, diff_cmap, diff_norm,
+                  "Difference in SWBDs change,\ninverse-W2 minus multi-model mean (pp)",
+                  pos=(0.25, 0.035, 0.5, 0.016))
+
+    _save_fig(fig, os.path.join(output_dir, "supp",
+                                "suppfig_main_gwl_maps_GWL2_wasserstein.png"), dpi)
 
 
 def _print_effect_outliers(df_db, region_name, effect_col="RE_Effect", n_top=5):
@@ -2267,6 +2341,9 @@ def main():
             plot_main_dumbbell_absolute_wasserstein(
                 df_gwl2, PATHS["shapefile"], w2_table, dpi=args.dpi,
                 share_re=MAIN_MIX, output_dir=args.output_dir)
+            plot_gwl2_wasserstein_vs_mmm(
+                df_gwl2, PATHS["shapefile"], hatch_df, w2_table,
+                args.output_dir, dpi=args.dpi, share_re=MAIN_MIX)
 
     if ds_wasserstein_agg is not None:
         ds_wasserstein_agg.close()

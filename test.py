@@ -39,7 +39,7 @@ LAT_EDGES = [-90, -70, -50, -30, -10, 10, 30, 50, 70, 90]
 LAT_LABELS = [f"{LAT_EDGES[i]}..{LAT_EDGES[i + 1]}" for i in range(len(LAT_EDGES) - 1)]
 
 
-def load_era5_cf(path_preprocessed, reanalysis, chunks):
+def load_era5_cf(path_preprocessed, reanalysis):
     base = os.path.join(path_preprocessed, reanalysis)
     wcf_files, _ = match_files(
         os.path.join(base, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231"))
@@ -50,8 +50,15 @@ def load_era5_cf(path_preprocessed, reanalysis, chunks):
             f"No wcf_day/scf_day files found under {base}. "
             "Run calculate_ds_cf_reanalysis (calculate_cf.py) first."
         )
-    wcf = open_dataset_any(wcf_files[0], chunks=chunks).sel(time=slice(*REF_PERIOD))
-    scf = open_dataset_any(scf_files[0], chunks=chunks).sel(time=slice(*REF_PERIOD))
+    # Open lazily (cheap: just metadata) so .sel(ref_period) only reads the
+    # ~7300 needed days off disk, then .load() that slice into plain numpy
+    # arrays. _compound_indices -> duration_xr does eager boolean-mask
+    # indexing (`.where(..., drop=True)`) that dask doesn't support
+    # ("Indexing with a boolean dask array is not allowed") -- production
+    # (make_grid_files.py's process_single_gcm) never hits this because it
+    # opens wcf/scf with no chunks= at all, i.e. already eager.
+    wcf = open_dataset_any(wcf_files[0], chunks={'time': -1}).sel(time=slice(*REF_PERIOD)).load()
+    scf = open_dataset_any(scf_files[0], chunks={'time': -1}).sel(time=slice(*REF_PERIOD)).load()
     return wcf.sortby('lat').sortby('lon'), scf.sortby('lat').sortby('lon')
 
 
@@ -61,10 +68,18 @@ def quantile_threshold(da, q, exclude_zero):
 
 
 def zero_day_stats(da):
-    """Per-pixel count/fraction of exactly-zero time steps -- what
-    exclude_zero=True removes from the quantile sample."""
-    n_zero = (da == 0).sum('time')
-    frac_zero = n_zero / da.sizes['time']
+    """
+    Per-pixel count/fraction of exactly-zero time steps -- what
+    exclude_zero=True removes from the quantile sample. Pixels with no
+    valid (non-NaN) time steps at all (e.g. outside the reanalysis's masked
+    domain) are returned as NaN rather than 0: `da == 0` is False on NaN, so
+    a naive sum would silently count "no data here" as "never zero here"
+    and pull the average down wherever the grid is masked out.
+    """
+    n_valid = da.notnull().sum('time')
+    n_zero = ((da == 0) & da.notnull()).sum('time')
+    n_zero = n_zero.where(n_valid > 0)
+    frac_zero = n_zero / n_valid.where(n_valid > 0)
     return n_zero, frac_zero
 
 
@@ -96,9 +111,8 @@ if __name__ == '__main__':
     out_dir = getattr(config, 'TEMP_FOLDER', os.getcwd())
     os.makedirs(out_dir, exist_ok=True)
 
-    chunks = {'time': -1, 'lat': 60, 'lon': 60}
     print(f"Loading native-grid {reanalysis} wcf/scf, ref_period={REF_PERIOD}")
-    wcf, scf = load_era5_cf(path_preprocessed, reanalysis, chunks)
+    wcf, scf = load_era5_cf(path_preprocessed, reanalysis)
     n_time = wcf.sizes['time']
     print(f"{n_time} daily time steps in ref_period\n")
 
