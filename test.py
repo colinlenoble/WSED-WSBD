@@ -1,220 +1,194 @@
 # -*- coding: cp1252 -*-
 """
-Standalone diagnostic for the ZeroDivisionError seen in unbias_GCM's MBCn
-training (xclim's _escore dividing by zero).
+Standalone diagnostic: does excluding zero-capacity-factor days from the
+threshold quantile change the annual compound-event indices much?
 
-Reconstructs dref/dhist through exactly the same masking/regridding/unit
-steps as unbias_GCM (calculate_cf.py, up to just before the jitter /
-additive-space transform), then prints, per variable and per location, how
-many time steps are NaN. This is meant to answer one question concretely:
-is the NaN problem "a little bit of NaN spread across every location"
-(harmless) or "a subset of locations that are entirely NaN in one
-variable" (fatal for the multivariate MBCn training)?
+Production code (calculate_cf.py's _score_branch, make_grid_files.py's
+process_single_gcm) always computes the low-wind/low-solar threshold as
+    wcf.where(wcf > 0).quantile(q, dim='time')
+i.e. the q-th percentile of *non-zero* days only. This script checks how
+much that choice actually matters by recomputing everything a second way,
+    wcf.quantile(q, dim='time')
+(zeros included), and comparing the resulting freq/dur/int/sev annual
+compound-event indices -- both globally and by 20-degree latitude band
+(edges at -90..90, one band centered on the equator: -10..10) -- along with
+how many zero days per pixel get filtered out of the quantile in the first
+place (for both wcf and scf).
 
-Run this on the server, in the same environment as calculate_cf.py.
+Uses ERA5 on its native grid (via calculate_ds_cf_reanalysis's wcf_day_ERA5*/
+scf_day_ERA5* output) over the standard 1982-2001 reference period, so the
+comparison is grid/GCM-independent. Run this on the server, in the same
+environment as calculate_cf.py.
 """
-import numpy as np
-import xarray as xr
-import xesmf as xe
-import geopandas as gpd
-import rasterio
-
-import config
-from calculate_cf import (
-    load_ds, filter_domain, set_variable_units, rasterize_shapefile,
-    _standardize_reanalysis_names,
-)
-from io_utils import match_files as _match_files, open_mfdataset_any
-
-GCM, run, ssp = 'CanESM5', 'r10i1p1f1', config.SSP
-path_folder = config.PATH_FOLDER
-shapefile_path = config.SHAPEFILE_PATH
-reanalysis = config.REANALYSIS
-
-print(f"Reconstructing dref/dhist for GCM={GCM}, run={run}, ssp={ssp}, reanalysis={reanalysis}")
-
-# ------------------------------------------------------------------
-# Same steps as unbias_GCM up to the point ref/hist locations are fixed
-# (calculate_cf.py, unbias_GCM, roughly lines 312-398)
-# ------------------------------------------------------------------
-dhist = load_ds(GCM, ssp, run, path_folder, 'GWL0-61').dropna('time', how='all')
-
-files_ref, _ = _match_files(__import__('os').path.join(path_folder, reanalysis, f"*{reanalysis}*"))
-if not files_ref:
-    raise FileNotFoundError(f"No reanalysis files found in {path_folder}{reanalysis}")
-dref = open_mfdataset_any(files_ref)
-dref = _standardize_reanalysis_names(dref)
-
-if 'sfcWind' not in dref:
-    print("Computing sfcWind from u10/v10")
-    dref['sfcWind'] = np.hypot(dref['u10'], dref['v10'])
-
-dref = dref.sortby('lat').sortby('lon').sortby('time')
-dhist = dhist.sortby('lat').sortby('lon').sortby('time')
-dref = dref.chunk({'time': -1, 'lat': 50, 'lon': 50})
-
-lat_range = (dref.lat.values[0], dref.lat.values[-1])
-lon_range = (dref.lon.values[0], dref.lon.values[-1])
-dhist = filter_domain(dhist, lat_range, lon_range)
-dhist = dhist.chunk({'time': -1, 'lat': 20, 'lon': 20})
-
-mask_template = dref.tas.isel(time=0).load()
-shapefile = gpd.read_file(shapefile_path)
-lons, lats = np.meshgrid(mask_template.lon, mask_template.lat)
-coords = np.array([lons.flatten(), lats.flatten()]).T
-transform = rasterio.transform.from_bounds(
-    mask_template.lon.min().item(), mask_template.lat.min().item(),
-    mask_template.lon.max().item(), mask_template.lat.max().item(),
-    len(mask_template.lon), len(mask_template.lat)
-)
-mask = rasterize_shapefile(shapefile, coords, mask_template.shape, transform)
-mask = mask[::-1, :]
-
-dref = dref.where(mask == 1, np.nan)
-
-regridder = xe.Regridder(dref, dhist, method='conservative_normed')
-dref = regridder(dref, output_chunks={'lat': 50, 'lon': 50})
-dref = dref.convert_calendar('noleap').convert_calendar('standard')
-dhist = dhist.convert_calendar('noleap').convert_calendar('standard')
-
-ref_grid = dref.tas.isel(time=0)
-
-
-def create_mask_from_shapefile(grid, shapefile):
-    transform = rasterio.transform.from_bounds(
-        grid.lon.min().item(), grid.lat.min().item(),
-        grid.lon.max().item(), grid.lat.max().item(),
-        len(grid.lon), len(grid.lat)
-    )
-    from rasterio.features import geometry_mask
-    shape = (len(grid.lat), len(grid.lon))
-    mask = geometry_mask(
-        geometries=shapefile.geometry, all_touched=True,
-        out_shape=shape, transform=transform, invert=True
-    )
-    return xr.DataArray(
-        mask[::-1, :], dims=("lat", "lon"),
-        coords={"lat": grid.lat, "lon": grid.lon}
-    )
-
-
-mask_array = create_mask_from_shapefile(ref_grid, shapefile)
-
-var_units = {'sfcWind': 'm s-1', 'tas': 'K', 'rsds': 'W m-2'}
-dref = dref.where(mask_array)
-dhist = dhist.where(mask_array)
-dref = set_variable_units(dref, var_units)
-dhist = set_variable_units(dhist, var_units)
-
-dref = dref.sel(time=slice('1982-01-01', '2001-12-31'))
-dref = dref[['sfcWind', 'tas', 'rsds']]
-
-dref = dref.stack(location=("lat", "lon"))
-dhist = dhist.stack(location=("lat", "lon"))
-
-# ------------------------------------------------------------------
-# Diagnostics: is NaN spread thin, or concentrated in dead locations?
-# ------------------------------------------------------------------
-n_time_ref = dref.sizes['time']
-n_time_hist = dhist.sizes['time']
-print(f"\ndref time steps={n_time_ref}, dhist time steps={n_time_hist}\n")
-
-for name, ds in [('dref', dref), ('dhist', dhist)]:
-    print(f"--- {name} ---")
-    for v in ['tas', 'rsds', 'sfcWind']:
-        nan_per_loc = ds[v].isnull().sum('time').compute()
-        n_loc = nan_per_loc.sizes['location']
-        n_time = n_time_ref if name == 'dref' else n_time_hist
-
-        n_zero = int((nan_per_loc == 0).sum())
-        n_full = int((nan_per_loc == n_time).sum())
-        n_partial = n_loc - n_zero - n_full
-
-        print(f"  {v}: {n_loc} locations total")
-        print(f"    - fully valid (0 NaN steps):      {n_zero}")
-        print(f"    - fully NaN (all {n_time} steps):  {n_full}"
-              f"  <-- these poison the multivariate MBCn sample entirely")
-        print(f"    - partially NaN (some but not all): {n_partial}")
-        if n_partial > 0:
-            partial_counts = nan_per_loc.values[
-                (nan_per_loc.values > 0) & (nan_per_loc.values < n_time)
-            ]
-            print(f"      partial-NaN counts: min={partial_counts.min()}, "
-                  f"median={int(np.median(partial_counts))}, "
-                  f"max={partial_counts.max()} (out of {n_time})")
-
-        # zero-variance among the fully-valid locations (what
-        # remove_constant_locations's std==0 check actually catches)
-        std = ds[v].std(dim='time').compute()
-        n_const = int(((std == 0) & (nan_per_loc == 0)).sum())
-        print(f"    - constant but not NaN (std==0):    {n_const}")
-    print()
-
-print(
-    "Interpretation:\n"
-    "  'fully NaN' locations are invisible to a std==0 check (NaN std != 0)\n"
-    "  and survive dropna(how='all') if only ONE variable is dead there\n"
-    "  while the others are fine. Those are the ones that blow up xclim's\n"
-    "  _escore (n=0 samples -> division by zero). 'partially NaN' locations\n"
-    "  with only a handful of NaN steps (e.g. from the ref/hist calendar-\n"
-    "  label mismatch) are harmless by comparison."
-)
-
-# ------------------------------------------------------------------
-# Map the fully-NaN locations (headless server -> save PNG, no display)
-# ------------------------------------------------------------------
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import os
 
-out_dir = getattr(config, 'TEMP_FOLDER', os.getcwd())
-os.makedirs(out_dir, exist_ok=True)
+import numpy as np
+import pandas as pd
+import xarray as xr
 
-datasets = [('dref', dref, n_time_ref), ('dhist', dhist, n_time_hist)]
-variables = ['tas', 'rsds', 'sfcWind']
+import config
+from io_utils import match_files, open_dataset_any
+from calculate_cf import _compound_indices
 
-fig, axes = plt.subplots(len(datasets), len(variables),
-                          figsize=(5 * len(variables), 5 * len(datasets)),
-                          squeeze=False)
+REF_PERIOD = ('1982-01-01', '2001-12-31')
+Q = 0.1
 
-for row, (name, ds, n_time) in enumerate(datasets):
-    lat_vals = ds.location.lat.values
-    lon_vals = ds.location.lon.values
-    for col, v in enumerate(variables):
-        ax = axes[row][col]
-        nan_per_loc = ds[v].isnull().sum('time').compute().values
-        is_full_nan = nan_per_loc == n_time
-        is_valid = nan_per_loc == 0
+# 20-degree latitude bands, edges chosen so one band is centered on the
+# equator (-10..10) rather than straddling it at an odd offset.
+LAT_EDGES = [-90, -70, -50, -30, -10, 10, 30, 50, 70, 90]
+LAT_LABELS = [f"{LAT_EDGES[i]}..{LAT_EDGES[i + 1]}" for i in range(len(LAT_EDGES) - 1)]
 
-        shapefile.boundary.plot(ax=ax, color='black', linewidth=0.5)
-        ax.scatter(lon_vals[is_valid], lat_vals[is_valid],
-                   s=6, c='lightgray', label=f'valid (n={int(is_valid.sum())})')
-        ax.scatter(lon_vals[~is_valid & ~is_full_nan], lat_vals[~is_valid & ~is_full_nan],
-                   s=6, c='orange', label=f'partial NaN (n={int((~is_valid & ~is_full_nan).sum())})')
-        ax.scatter(lon_vals[is_full_nan], lat_vals[is_full_nan],
-                   s=10, c='red', label=f'fully NaN (n={int(is_full_nan.sum())})')
 
-        ax.set_title(f"{name}.{v}")
-        ax.set_xlabel('lon')
-        ax.set_ylabel('lat')
-        ax.legend(fontsize=7, loc='upper right', markerscale=2)
+def load_era5_cf(path_preprocessed, reanalysis, chunks):
+    base = os.path.join(path_preprocessed, reanalysis)
+    wcf_files, _ = match_files(
+        os.path.join(base, f"wcf_day_{reanalysis}_historical_reanalysis_19790101-20191231"))
+    scf_files, _ = match_files(
+        os.path.join(base, f"scf_day_{reanalysis}_historical_reanalysis_19790101-20191231"))
+    if not wcf_files or not scf_files:
+        raise FileNotFoundError(
+            f"No wcf_day/scf_day files found under {base}. "
+            "Run calculate_ds_cf_reanalysis (calculate_cf.py) first."
+        )
+    wcf = open_dataset_any(wcf_files[0], chunks=chunks).sel(time=slice(*REF_PERIOD))
+    scf = open_dataset_any(scf_files[0], chunks=chunks).sel(time=slice(*REF_PERIOD))
+    return wcf.sortby('lat').sortby('lon'), scf.sortby('lat').sortby('lon')
 
-fig.tight_layout()
-out_path = os.path.join(out_dir, 'nan_locations_diagnostic.png')
-fig.savefig(out_path, dpi=150)
-print(f"\nSaved NaN-location map to: {out_path}")
 
-# Also dump the fully-NaN dref locations (the ones that matter) to CSV
-for v in variables:
-    nan_per_loc = dref[v].isnull().sum('time').compute().values
-    is_full_nan = nan_per_loc == n_time_ref
-    if is_full_nan.any():
-        import pandas as pd
-        df_out = pd.DataFrame({
-            'lat': dref.location.lat.values[is_full_nan],
-            'lon': dref.location.lon.values[is_full_nan],
+def quantile_threshold(da, q, exclude_zero):
+    src = da.where(da > 0) if exclude_zero else da
+    return src.quantile(q, dim='time')
+
+
+def zero_day_stats(da):
+    """Per-pixel count/fraction of exactly-zero time steps -- what
+    exclude_zero=True removes from the quantile sample."""
+    n_zero = (da == 0).sum('time')
+    frac_zero = n_zero / da.sizes['time']
+    return n_zero, frac_zero
+
+
+def mean_by_band(da):
+    """
+    Unweighted mean of da (any combination of year/lat/lon dims) collapsed
+    over every dim except lat, grouped into 20-degree latitude bands
+    (LAT_EDGES/LAT_LABELS), plus the overall global mean over all dims.
+    Grid cells are weighted equally (no cos(lat) area weighting) -- fine for
+    comparing two threshold definitions on the same grid, not for an
+    absolute climatology.
+    """
+    da = da.compute()
+    global_mean = float(da.mean(skipna=True))
+    df = da.rename('value').to_dataframe().reset_index()
+    df = df.dropna(subset=['value'])
+    df['band'] = pd.cut(df['lat'], bins=LAT_EDGES, labels=LAT_LABELS, include_lowest=True)
+    band_means = df.groupby('band', observed=True)['value'].mean().reindex(LAT_LABELS)
+    return global_mean, band_means
+
+
+def safe_pct(diff_series, base_series):
+    return (diff_series / base_series.replace(0, np.nan)) * 100
+
+
+if __name__ == '__main__':
+    path_preprocessed = config.PATH_PREPROCESSED
+    reanalysis = config.REANALYSIS
+    out_dir = getattr(config, 'TEMP_FOLDER', os.getcwd())
+    os.makedirs(out_dir, exist_ok=True)
+
+    chunks = {'time': -1, 'lat': 60, 'lon': 60}
+    print(f"Loading native-grid {reanalysis} wcf/scf, ref_period={REF_PERIOD}")
+    wcf, scf = load_era5_cf(path_preprocessed, reanalysis, chunks)
+    n_time = wcf.sizes['time']
+    print(f"{n_time} daily time steps in ref_period\n")
+
+    # ------------------------------------------------------------------
+    # 1. How many zero days per pixel does exclude_zero actually filter
+    #    out of the quantile, for wind and solar, globally and by band?
+    # ------------------------------------------------------------------
+    print("=== Zero-value days excluded from the quantile sample (per pixel, mean) ===")
+    zero_rows = []
+    for label, var, da in [('wind (wcf)', 'wcf', wcf['wcf']), ('solar (scf)', 'scf', scf['scf'])]:
+        n_zero, frac_zero = zero_day_stats(da)
+        g_n, band_n = mean_by_band(n_zero)
+        g_f, band_f = mean_by_band(frac_zero * 100)
+
+        print(f"\n{label}: global mean = {g_n:.1f} zero days / {n_time} ({g_f:.1f}%)")
+        tbl = pd.DataFrame({'mean_zero_days': band_n, 'pct_zero_days': band_f})
+        print(tbl.to_string(float_format=lambda x: f"{x:.1f}"))
+
+        zero_rows.append({'var': var, 'scope': 'global', 'mean_zero_days': g_n, 'pct_zero_days': g_f})
+        for band in LAT_LABELS:
+            zero_rows.append({
+                'var': var, 'scope': band,
+                'mean_zero_days': band_n.get(band, np.nan),
+                'pct_zero_days': band_f.get(band, np.nan),
+            })
+
+    zero_csv = os.path.join(out_dir, 'zero_quantile_excluded_days.csv')
+    pd.DataFrame(zero_rows).to_csv(zero_csv, index=False)
+    print(f"\nSaved zero-day stats to: {zero_csv}")
+
+    # ------------------------------------------------------------------
+    # 2. Threshold itself: how much does including zero shift wcf_thr/
+    #    scf_thr (before even getting to freq/dur/int/sev)?
+    # ------------------------------------------------------------------
+    wcf_thr = {excl: quantile_threshold(wcf['wcf'], Q, excl) for excl in (True, False)}
+    scf_thr = {excl: quantile_threshold(scf['scf'], Q, excl) for excl in (True, False)}
+
+    print("\n=== Threshold shift from including zero (incl_zero - excl_zero) ===")
+    for label, thr in [('wcf_thr', wcf_thr), ('scf_thr', scf_thr)]:
+        diff = thr[False] - thr[True]
+        rel = xr.where(thr[True] != 0, diff / thr[True], np.nan) * 100
+        g_abs, band_abs = mean_by_band(diff)
+        g_rel, band_rel = mean_by_band(rel)
+        print(f"\n{label}: global mean diff = {g_abs:+.4f} ({g_rel:+.1f}%)")
+        tbl = pd.DataFrame({'abs_diff': band_abs, 'pct_diff': band_rel})
+        print(tbl.to_string(float_format=lambda x: f"{x:+.4f}"))
+
+    # ------------------------------------------------------------------
+    # 3. freq/dur/int/sev under both threshold definitions
+    #    (mirrors calculate_cf.py's _compound_indices exactly).
+    # ------------------------------------------------------------------
+    results = {}
+    for exclude_zero in (True, False):
+        freq, dur, intensity, sev = _compound_indices(
+            wcf, scf, wcf_thr[exclude_zero], scf_thr[exclude_zero])
+        results[exclude_zero] = dict(freq=freq, dur=dur, int=intensity, sev=sev)
+
+    print("\n=== freq/dur/int/sev: excl_zero (production) vs incl_zero ===")
+    summary_rows = []
+    for metric in ['freq', 'dur', 'int', 'sev']:
+        g_excl, band_excl = mean_by_band(results[True][metric])
+        g_incl, band_incl = mean_by_band(results[False][metric])
+        g_diff = g_incl - g_excl
+        g_pct = (g_diff / g_excl * 100) if g_excl else np.nan
+        band_diff = band_incl - band_excl
+        band_pct = safe_pct(band_diff, band_excl)
+
+        print(f"\n--- {metric} ---")
+        print(f"Global: excl_zero={g_excl:.4f}, incl_zero={g_incl:.4f}, "
+              f"diff={g_diff:+.4f} ({g_pct:+.1f}%)")
+        tbl = pd.DataFrame({
+            'excl_zero': band_excl, 'incl_zero': band_incl,
+            'abs_diff': band_diff, 'pct_diff': band_pct,
         })
-        csv_path = os.path.join(out_dir, f'fully_nan_locations_dref_{v}.csv')
-        df_out.to_csv(csv_path, index=False)
-        print(f"Saved {len(df_out)} fully-NaN dref.{v} locations to: {csv_path}")
+        print(tbl.to_string(float_format=lambda x: f"{x:.4f}"))
+
+        summary_rows.append({
+            'metric': metric, 'scope': 'global',
+            'excl_zero': g_excl, 'incl_zero': g_incl,
+            'abs_diff': g_diff, 'pct_diff': g_pct,
+        })
+        for band in LAT_LABELS:
+            summary_rows.append({
+                'metric': metric, 'scope': band,
+                'excl_zero': band_excl.get(band, np.nan),
+                'incl_zero': band_incl.get(band, np.nan),
+                'abs_diff': band_diff.get(band, np.nan),
+                'pct_diff': band_pct.get(band, np.nan),
+            })
+
+    summary_csv = os.path.join(out_dir, 'zero_quantile_sensitivity_indices.csv')
+    pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
+    print(f"\nSaved freq/dur/int/sev sensitivity summary to: {summary_csv}")

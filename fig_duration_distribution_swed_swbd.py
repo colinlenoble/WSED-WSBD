@@ -43,15 +43,17 @@ SWED's is the flat per-zone latitude-band map (a pixel's zone is just its
 own latitude); SWBD's instead choropleths every admin region by the zone
 assign_regions_to_zones actually assigned it (the same max-overlap-area
 rule above), since a region can straddle a zone edge. Rows 1-5, one per
-latitude zone, each carry two y-axes sharing one x-axis (day 1 ..
-max_duration_days): the left axis plots each non-baseline GWL's
-duration-share curve as a ratio to the GWL0-61 baseline's own curve at
-that duration (log-scale, harmonized across all 10 panels so 0.5x/2x sit
-equidistant from a dashed ratio=1 line, with rare outlier ratios clipped
-off the shared range rather than stretching it -- see
-_shared_ratio_ylim); the right axis (same label on every panel) draws the
-baseline's own share-of-events curve as a light background bar chart, for
-context on what the ratio is actually built from at each duration.
+latitude zone, plot each non-baseline GWL's duration-share curve as a
+ratio to the GWL0-61 baseline's own curve at that duration (day 1 ..
+max_duration_days on x), log-scale and harmonized across all 10 panels so
+every factor-of-4 tick (1/16, 1/4, 1, 4, 16, ...) sits the same distance
+apart everywhere and a dashed line marks ratio = 1 -- rare outlier ratios
+are clipped off the shared range rather than stretching it for every other
+panel (see _shared_ratio_ylim). A (zone, GWL) line is only drawn if it is
+defined at every duration in that window; one with even a single missing
+point (too few events at some duration for either side of the ratio) is
+dropped entirely rather than shown with a gap, since a broken ratio line
+reads as a real dip/spike at a glance.
 """
 import os
 import config
@@ -73,7 +75,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 
 # Reused rather than duplicated: SWED cache + shared constants/helpers (zone
 # edges, GWL colors, the locator map, the equal-GCM-weighted pooling
@@ -97,9 +98,7 @@ SWBD_MAIN_MIX    = "current"
 # GWL every ratio panel divides by -- this project's reference/baseline
 # period (see fig_duration_distribution_latitude.py's own GWL0-61 handling).
 BASELINE_GWL  = "GWL0-61"
-RATIO_YLABEL  = "Duration-share ratio\nto baseline"
-# Same exact string on every panel's right axis -- see plot_swed_swbd_distributions.
-SHARE_YLABEL  = "Share of events\n(baseline)"
+RATIO_YLABEL  = "Events at GWL /\nEvents at GWL0.61°C"
 
 
 # =============================================================================
@@ -484,8 +483,9 @@ def _shared_ratio_ylim(ratio_arrays, outlier_pct=2.0, pad=1.08):
     """
     Symmetric-in-log ylim for every ratio panel -- shared across both
     columns and all 5 zones, so a given vertical distance means the same
-    fold-change everywhere and 0.5x/2x sit equidistant from the dashed
-    ratio=1 line (log(0.5) == -log(2)) -- see plot_swed_swbd_distributions.
+    fold-change everywhere and e.g. 1/4x and 4x sit equidistant from the
+    dashed ratio=1 line (log(1/4) == -log(4)) -- see
+    plot_swed_swbd_distributions.
 
     Bounded by the `outlier_pct`-th-from-the-edge percentile of every
     finite, positive ratio actually drawn (folded around 1 via abs(log10)),
@@ -494,9 +494,10 @@ def _shared_ratio_ylim(ratio_arrays, outlier_pct=2.0, pad=1.08):
     would otherwise blow the one shared axis out for every other panel.
     Those points are left off the visible range -- clipped, not rescaled
     for -- rather than dropped from the underlying data. Never narrower
-    than a 2x/0.5x span, so the axis always resolves at least a doubling.
+    than a 4x/0.25x span, so the axis always resolves at least the first
+    factor-of-4 tick beyond 1 in both directions (see _ratio_yticks).
     """
-    min_half_decades = np.log10(2.0)
+    min_half_decades = np.log10(4.0)
     finite_chunks = [a[np.isfinite(a) & (a > 0)] for a in ratio_arrays if a is not None]
     finite_chunks = [c for c in finite_chunks if c.size > 0]
     if finite_chunks:
@@ -509,9 +510,9 @@ def _shared_ratio_ylim(ratio_arrays, outlier_pct=2.0, pad=1.08):
 
 
 def _ratio_yticks(ylim):
-    """Powers of 2 within `ylim`, so ticks read as plain fold-changes (0.5, 1, 2, 4, ...)."""
+    """Powers of 4 within `ylim` (..., 1/16, 1/4, 1, 4, 16, ...), one tick per factor of 4."""
     lo, hi = ylim
-    return [t for t in (2.0 ** k for k in range(-6, 7)) if lo * 0.98 <= t <= hi * 1.02]
+    return [t for t in (4.0 ** k for k in range(-6, 7)) if lo * 0.98 <= t <= hi * 1.02]
 
 
 def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
@@ -530,21 +531,16 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
 
     Rows 1-5 are the five latitude zones (day 1 .. max_duration_days, no
     main/zoom split -- max_duration_days is kept short precisely so one
-    panel is enough). Each panel carries two y-axes on one shared x-axis:
-      - Left (log-scale, harmonized across every one of the 10 panels via
-        _shared_ratio_ylim, dashed line at 1): each non-baseline GWL's
-        duration-share curve (swed_mod._group_counts / zone_group_counts_swbd,
-        same equal-GCM/area-weighted pooling as every other figure here)
-        divided elementwise by the GWL0-61 baseline's own curve at that
-        duration -- so > 1 means that duration is over-represented at that
-        GWL relative to baseline, < 1 under-represented, independent of the
-        two metrics' very different absolute share scales.
-      - Right (log-scale, identical "Share of events (baseline)" label on
-        every panel): the GWL0-61 curve itself, drawn as a light background
-        bar chart (zorder below the ratio lines, ax_left's own patch made
-        transparent so it shows through) -- context for which durations the
-        ratio actually has data behind it, not a quantity meant to be read
-        precisely off this axis.
+    panel is enough), each with a single log-scale y-axis (harmonized
+    across all 10 panels via _shared_ratio_ylim, factor-of-4 ticks, dashed
+    line at 1): each non-baseline GWL's duration-share curve
+    (swed_mod._group_counts / zone_group_counts_swbd, same equal-GCM/
+    area-weighted pooling as every other figure here) divided elementwise
+    by the GWL0-61 baseline's own curve at that duration -- so > 1 means
+    that duration is over-represented at that GWL relative to baseline, < 1
+    under-represented, independent of the two metrics' very different
+    absolute share scales. A (zone, GWL) line is drawn only if it is
+    defined at every plotted duration -- see the Pass-1 loop below.
     """
     x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
     zone_order = list(reversed(swed_mod.LAT_ZONE_LABELS))
@@ -564,9 +560,11 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
 
     share_fns = {"SWED": _swed_share, "SWBD": _swbd_share}
 
-    # Pass 1: gather every panel's data up front (baseline share + each
-    # GWL's ratio to it), so the one shared ratio y-axis can be fixed
-    # before anything is drawn.
+    # Pass 1: gather every panel's ratio curves up front, so the one shared
+    # ratio y-axis can be fixed before anything is drawn. A curve with any
+    # NaN duration (baseline or GWL itself short of min_events/zero events
+    # at that duration) is dropped whole -- a broken line reads as a real
+    # dip/spike, not as missing data, so it's not drawn at all.
     panel_data = {col: [] for col in share_fns}
     for zlabel in zone_order:
         for col, share_fn in share_fns.items():
@@ -579,8 +577,8 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                     continue
                 base_safe = np.where(base > 0, base, np.nan)
                 ratio = np.where(arr > 0, arr / base_safe, np.nan)
-                ratios[gwl] = ratio
-            panel_data[col].append({"base": base, "ratios": ratios})
+                ratios[gwl] = ratio if not np.any(np.isnan(ratio)) else None
+            panel_data[col].append({"ratios": ratios})
 
     all_ratio_arrays = [arr for col in panel_data.values() for row in col
                          for arr in row["ratios"].values()]
@@ -588,10 +586,10 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     ratio_yticks = _ratio_yticks(ratio_ylim)
 
     n_rows = len(zone_order)
-    fig = plt.figure(figsize=(swed_mod.FIG_WIDTH_IN * 1.65, swed_mod.FIG_WIDTH_IN * 1.75))
+    fig = plt.figure(figsize=(swed_mod.FIG_WIDTH_IN * 1.55, swed_mod.FIG_WIDTH_IN * 1.75))
     gs = GridSpec(n_rows + 1, 2, height_ratios=[0.8] + [1.0] * n_rows,
-                  left=0.09, right=0.90, top=0.93, bottom=0.09,
-                  hspace=0.65, wspace=0.42, figure=fig)
+                  left=0.11, right=0.97, top=0.93, bottom=0.09,
+                  hspace=0.65, wspace=0.30, figure=fig)
 
     ax_map_swed, _ = swed_mod._add_locator_map(fig, gs[0, 0], zone_order)
     ax_map_swbd = _add_region_zone_map(fig, gs[0, 1], regions_shapefile, zone_of_poly)
@@ -604,7 +602,6 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
               fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
 
     letters = [chr(ord("b") + i) for i in range(n_rows)]
-    col_axes_right = {col: [] for col in share_fns}
 
     for i, zlabel in enumerate(zone_order):
         pct = land_area_pct.get(zlabel)
@@ -615,22 +612,6 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
         for j, col in enumerate(share_fns):
             row = panel_data[col][i]
             ax_left = fig.add_subplot(gs[i + 1, j])
-            ax_right = ax_left.twinx()
-            # twinx() stacks the new axis above the original by default --
-            # flipped here (and ax_left's own patch hidden) so the share
-            # bars drawn on ax_right sit visually *behind* the ratio lines
-            # on ax_left, per "in background".
-            ax_left.set_zorder(ax_right.get_zorder() + 1)
-            ax_left.patch.set_visible(False)
-            col_axes_right[col].append(ax_right)
-
-            base = row["base"]
-            ax_right.set_yscale("log")
-            if base is not None:
-                ax_right.bar(x_int, np.where(base > 0, base, np.nan), width=0.85,
-                             color="#9a9a9a", alpha=0.35, zorder=0, edgecolor="none")
-            ax_right.set_ylabel(SHARE_YLABEL, fontsize=swed_mod.AXIS_LABEL_FONTSIZE - 0.5)
-            ax_right.tick_params(labelsize=swed_mod.TICK_FONTSIZE - 0.5)
 
             ax_left.axhline(1.0, color="black", linewidth=0.8, linestyle="--", zorder=1)
             for gwl in ratio_gwls:
@@ -665,19 +646,6 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
             if i == n_rows - 1:
                 ax_left.set_xlabel("Event duration (days)", fontsize=swed_mod.XLABEL_FONTSIZE)
 
-    # Harmonize each column's own right (share) axis range across its 5
-    # zone rows -- same "shared main_ylims" convention as
-    # fig_duration_distribution_latitude.py, scoped per column since SWED
-    # and SWBD sit on structurally different absolute share scales.
-    for axes in col_axes_right.values():
-        ylims = [a.get_ylim() for a in axes if a.patches]
-        if not ylims:
-            continue
-        y_lo = min(y[0] for y in ylims)
-        y_hi = max(y[1] for y in ylims)
-        for a in axes:
-            a.set_ylim(y_lo, y_hi)
-
     gwl_handles = [
         Line2D([0], [0], color=swed_mod.GWL_COLORS.get(gwl, "gray"), marker="o",
                markersize=3, linewidth=1.6, label=swed_mod.GWL_LABELS.get(gwl, gwl))
@@ -687,8 +655,6 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     extra_handles = [
         Line2D([0], [0], color="black", linewidth=0.8, linestyle="--",
                label=f"Ratio = 1 ({baseline_label})"),
-        Patch(facecolor="#9a9a9a", alpha=0.35,
-              label=f"Share of events, {baseline_label} (right axis)"),
     ]
     fig.legend(handles=gwl_handles + extra_handles, loc="lower center",
                ncol=len(gwl_handles) + len(extra_handles), fontsize=swed_mod.LEGEND_FONTSIZE,
@@ -760,7 +726,7 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 5 - Plotting")
     print("=" * 60)
-    out_path = os.path.join(args.output_dir, "fig_duration_distribution_swed_swbd.png")
+    out_path = os.path.join(args.output_dir, "fig_duration_distribution_swed_swbd_ratio.png")
     plot_swed_swbd_distributions(
         swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
         args.regions_shapefile, args.gwl_list, out_path, dpi=args.dpi,
