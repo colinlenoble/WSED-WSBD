@@ -630,17 +630,22 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                   left=0.11, right=0.97, top=0.93, bottom=0.09,
                   hspace=0.65, wspace=0.30, figure=fig)
 
+    # One letter per panel, reading order (row-major, left-to-right, top to
+    # bottom): a/b for the two row-0 maps, then c/d, e/f, ... for each
+    # latitude zone's SWED/SWBD pair below -- not one letter per row, since
+    # SWED and SWBD are now full, independently-readable panels.
+    all_letters = [chr(ord("a") + k) for k in range(2 * (n_rows + 1))]
+
     ax_map_swed, _ = swed_mod._add_locator_map(fig, gs[0, 0], zone_order)
     ax_map_swbd = _add_region_zone_map(fig, gs[0, 1], regions_shapefile, zone_of_poly)
     for ax_map, label in ((ax_map_swed, "SWED"), (ax_map_swbd, "SWBD (region attribution)")):
         bbox = ax_map.get_position()
         fig.text((bbox.x0 + bbox.x1) / 2, bbox.y1 + 0.012, label, ha="center", va="bottom",
                   fontsize=swed_mod.ZONE_TITLE_FONTSIZE, fontweight="bold")
-    bbox0 = ax_map_swed.get_position()
-    fig.text(bbox0.x0 - 0.02, bbox0.y1 + 0.012, "a", ha="left", va="bottom",
-              fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
-
-    letters = [chr(ord("b") + i) for i in range(n_rows)]
+    for ax_map, letter in ((ax_map_swed, all_letters[0]), (ax_map_swbd, all_letters[1])):
+        bbox = ax_map.get_position()
+        fig.text(bbox.x0 - 0.02, bbox.y1 + 0.012, letter, ha="left", va="bottom",
+                  fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
 
     for i, zlabel in enumerate(zone_order):
         pct = land_area_pct.get(zlabel)
@@ -674,11 +679,12 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
             ax_left.spines["left"].set_color(swed_mod.ZONE_MAP_COLORS[zlabel])
             ax_left.spines["left"].set_linewidth(2.2)
 
+            panel_letter = all_letters[2 + i * 2 + j]
+            ax_left.text(0.0, 1.05, panel_letter, transform=ax_left.transAxes,
+                         ha="left", va="bottom", fontsize=swed_mod.LETTER_FONTSIZE,
+                         fontweight="bold")
             if j == 0:
                 ax_left.set_ylabel(RATIO_YLABEL, fontsize=swed_mod.AXIS_LABEL_FONTSIZE)
-                ax_left.text(0.0, 1.05, letters[i], transform=ax_left.transAxes,
-                             ha="left", va="bottom", fontsize=swed_mod.LETTER_FONTSIZE,
-                             fontweight="bold")
                 ax_left.text(0.13, 1.05, zone_label_text, transform=ax_left.transAxes,
                              ha="left", va="bottom", fontsize=swed_mod.ZONE_TITLE_FONTSIZE,
                              fontweight="bold", color=swed_mod.ZONE_MAP_COLORS[zlabel])
