@@ -1,4 +1,4 @@
-# -*- coding: cp1252 -*-
+# -*- coding: utf-8 -*-
 import os
 import config
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
@@ -97,9 +97,19 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--data_path", default=None)
-    parser.add_argument("--data_path_005", default=None)
-    parser.add_argument("--data_path_02", default=None)
-    parser.add_argument("--rl_path", default=None)
+    parser.add_argument("--data_path_005", default=None,
+                        help="Pre-computed ds_final at threshold 0.05; "
+                             "computed from the reanalysis if omitted.")
+    parser.add_argument("--data_path_02", default=None,
+                        help="Pre-computed ds_final at threshold 0.20; "
+                             "computed from the reanalysis if omitted.")
+    parser.add_argument("--rl_path", default=config.PATH_PREPROCESSED + "agg_datasets/rl_out/",
+                        help="Folder holding fig45.py's RL CSVs (same default as fig45's "
+                             "PATHS['out_dir']). If the RL-threshold CSVs are missing, "
+                             "only the value-by-alpha sensitivity figure is produced.")
+    parser.add_argument("--skip_sensitivity", action="store_true", default=False,
+                        help="Skip the threshold-sensitivity suppfig (avoids recomputing "
+                             "ds_final at thresholds 0.05 and 0.20).")
     parser.add_argument("--path_preprocessed", default=config.PATH_PREPROCESSED)
     parser.add_argument("--reanalysis", default=config.REANALYSIS)
     parser.add_argument("--threshold", type=float, default=0.1)
@@ -458,6 +468,25 @@ def get_or_build_wcf_zero_mask(path_preprocessed, reanalysis, ref_start, ref_end
     if cache_path:
         save_wcf_zero_mask(mask_da, cache_path)
     return mask_da
+
+
+def fit_to_width(fig, width_in=FIG_WIDTH_IN, n_iter=4, tol=0.002):
+    """
+    Rescale the figure canvas (both dimensions, fonts untouched) so that
+    savefig(..., bbox_inches="tight") yields an image exactly width_in wide.
+    Without this, the tight crop leaves each figure at a different width, so
+    once LaTeX scales them all to the column width their fonts (panel
+    letters, titles, legends) end up at different effective point sizes.
+    Accounts for savefig's own pad_inches on each side.
+    """
+    target = width_in - 2 * plt.rcParams["savefig.pad_inches"]
+    for _ in range(n_iter):
+        fig.canvas.draw()
+        scale = target / fig.get_tightbbox(fig.canvas.get_renderer()).width
+        if abs(scale - 1) < tol:
+            break
+        fig.set_size_inches(fig.get_figwidth() * scale, fig.get_figheight() * scale)
+    return fig
 
 
 def draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp, target_lat, target_lon, zorder=7):
@@ -1022,26 +1051,26 @@ def plot_valuebyalpha_sensitivity(
 # Supplementary combined threshold sensitivity
 # =============================================================================
 
-def _load_wsbd_gwl2(csv_path, share_re="current", vmax=800):
-    df = pd.read_csv(csv_path, index_col=0)
-    keys      = ["poly_idx", "GCM", "run", "share_re"]
-    gwl_label = "GWL2"
-    base      = (df["gwl_tas"] == "GWL0-61") & (df["gwl_ds_cf"] == "GWL0-61")
-    df_ref    = df[base][keys + ["rl_cum"]].reset_index(drop=True).rename(
-        columns={"rl_cum": "cum_rl_ref"})
-    mask_b    = (df["gwl_tas"] == gwl_label) & (df["gwl_ds_cf"] == gwl_label)
-    df_gwl    = df[mask_b][keys + ["rl_cum"]].reset_index(drop=True).rename(
-        columns={"rl_cum": "cum_rl_gwl"})
-    df_m      = df_ref.merge(df_gwl, on=keys, how="left")
-    df_m      = df_m[df_m["share_re"] == share_re].copy()
-    df_m["Combined_Effect"] = (
-        (df_m["cum_rl_gwl"] - df_m["cum_rl_ref"]) / df_m["cum_rl_ref"] * 100)
-    mmm = (df_m[["poly_idx", "GCM", "Combined_Effect"]]
-           .groupby(["GCM", "poly_idx"])["Combined_Effect"].mean()
-           .reset_index()
-           .groupby("poly_idx")["Combined_Effect"].mean()
-           .reset_index())
-    mmm.loc[mmm["Combined_Effect"] > vmax, "Combined_Effect"] = vmax
+def rl_threshold_csv(rl_path, rl_thr):
+    """fig45.py's RL CSV for a given RL threshold at its main renewable
+    penetration / mix (fig45._compute_and_save naming, demand_tag=None)."""
+    from fig45 import MAIN_TOT_RE, MAIN_MIX
+    return os.path.join(
+        rl_path, f"rl_agg_adaptation_Annual_{rl_thr}_ren_pen_{MAIN_TOT_RE}_{MAIN_MIX}_v2.csv")
+
+
+def _load_wsbd_gwl2(csv_path):
+    """
+    GWL2 multi-model-mean SWBD change vs GWL0.61, in days of baseline demand
+    -- delegates to fig45.py's own loader (load_gwl_dfs, which also drops
+    EXCLUDED_RUNS) and metric (_mmm_absolute_days) so these panels match
+    fig45's fig_main_gwl_maps_absolute_days exactly. Returns poly_idx /
+    Absolute_Days, with +/-inf (zero baseline demand) set to NaN.
+    """
+    from fig45 import load_gwl_dfs, _mmm_absolute_days, MAIN_MIX
+    _, df_gwl2, _ = load_gwl_dfs(csv_path)
+    mmm = _mmm_absolute_days(df_gwl2, share_re=MAIN_MIX)
+    mmm["Absolute_Days"] = mmm["Absolute_Days"].replace([np.inf, -np.inf], np.nan)
     return mmm
 
 
@@ -1069,13 +1098,15 @@ def plot_combined_threshold_sensitivity(
     mmm_99  = _load_wsbd_gwl2(csv_thr99)
     mmm_995 = _load_wsbd_gwl2(csv_thr995)
 
-    n_neg    = 50
-    n_pos    = int(n_neg * 800 / 100)
-    base_wsbd = plt.get_cmap("RdYlGn_r")
-    cols_wsbd = ([base_wsbd(v) for v in np.linspace(0.0, 0.45, n_neg)] +
-                [base_wsbd(v) for v in np.linspace(0.55, 1.0, n_pos)])
-    cmap_wsbd = LinearSegmentedColormap.from_list("wsbd_cmap", cols_wsbd, N=300)
-    norm_wsbd = mcolors.Normalize(vmin=-100, vmax=800)
+    # Same colour scale construction as fig45.plot_main_gwl_maps_absolute:
+    # symmetric around 0, capped at the 95th percentile of |change| pooled
+    # over the panels shown (here the three RL thresholds).
+    abs_vals = np.concatenate([np.abs(m["Absolute_Days"].dropna().values)
+                               for m in (mmm_95, mmm_99, mmm_995)])
+    vmax_days = (max(1.0, np.ceil(np.nanpercentile(abs_vals, 95)))
+                 if abs_vals.size else 1.0)
+    cmap_wsbd = plt.get_cmap("RdYlGn_r")
+    norm_wsbd = mcolors.TwoSlopeNorm(vmin=-vmax_days, vcenter=0, vmax=vmax_days)
     gdf_re   = gpd.read_file(shapefile_path)
     gdf_re["poly_idx"] = gdf_re.index
     gdf_re_band = gdf_re.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
@@ -1147,7 +1178,7 @@ def plot_combined_threshold_sensitivity(
     for ic in range(n_bins_change):
         legend_rgba[ic, :, :3] = color_levels[ic, :3]
         legend_rgba[ic, :,  3] = alpha_levels
-    leg_ax = fig.add_axes([0.03, 0.06, 0.08, 0.10])
+    leg_ax = fig.add_axes([0.07, 0.06, 0.08, 0.10])   # labels stay inside the figure
     leg_ax.imshow(legend_rgba, origin="lower", aspect="equal")
     leg_ax.set_xticks([0, n_bins_sev // 2, n_bins_sev - 1])
     leg_ax.set_xticklabels(["low", "mid", "high"], fontsize=5, ha="center")
@@ -1170,7 +1201,7 @@ def plot_combined_threshold_sensitivity(
     ]
     for ax, mmm, letter, thr_label, is_ref in right_cfgs:
         gdf  = gdf_re_band.copy().merge(mmm, on="poly_idx", how="left")
-        vals = gdf["Combined_Effect"].to_numpy()
+        vals = gdf["Absolute_Days"].to_numpy()
         fcs  = [cmap_wsbd(norm_wsbd(v)) if np.isfinite(v) else (0.8, 0.8, 0.8, 1.0)
                 for v in vals]
         for geom, fc in zip(gdf.geometry, fcs):
@@ -1204,9 +1235,9 @@ def plot_combined_threshold_sensitivity(
     cbar_ax = fig.add_axes([0.54, 0.025, 0.44, 0.012])
     sm = plt.cm.ScalarMappable(cmap=cmap_wsbd, norm=norm_wsbd)
     sm.set_array([])
-    cb = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend="max")
+    cb = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend="both")
     cb.set_label(
-        "WSBDs change under 2°C warming compared to 0.61°C (%)",
+        "SWBDs change under 2°C compared to 0.61°C\n(days of baseline demand)",
         fontsize=5,
     )
     cb.ax.tick_params(labelsize=5)
@@ -1264,31 +1295,37 @@ def compute_global_change_stats(ds_final, mask, n_bootstrap=1000, block_size=10)
 # Main
 # =============================================================================
 
+def load_or_build_ds_final(args, data_path, thr):
+    """Open ds_final from `data_path` if given, else compute it from the
+    reanalysis at quantile threshold `thr` (and save it with --save_nc)."""
+    if data_path is not None:
+        print(f"Loading pre-computed dataset (thr={thr}) from {data_path}")
+        return xr.open_dataset(data_path)
+    print(f"No pre-computed dataset for thr={thr}: computing ds_final on-the-fly")
+    ds = build_ds_final(
+        path_preprocessed=args.path_preprocessed,
+        reanalysis=args.reanalysis,
+        thr=thr,
+        ref_start=args.ref_start,
+        ref_end=args.ref_end,
+        shapefile_path=args.shapefile,
+    )
+    if args.save_nc:
+        thr_str = str(thr).replace(".", "")
+        out_nc  = os.path.join(args.path_preprocessed, "agg_datasets",
+                               f"ds_final_high_non_zero_{thr_str}_{args.reanalysis}.nc")
+        os.makedirs(os.path.dirname(out_nc), exist_ok=True)
+        print(f"  Saving dataset to {out_nc}  ")
+        ds.to_netcdf(out_nc)
+        print(f"  Saved : {out_nc}")
+    return ds
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.data_path is not None:
-        print(f"Loading pre-computed dataset from {args.data_path}")
-        ds_final = xr.open_dataset(args.data_path)
-    else:
-        print("No --data_path provided computing ds_final on-the-fly ")
-        ds_final = build_ds_final(
-            path_preprocessed=args.path_preprocessed,
-            reanalysis=args.reanalysis,
-            thr=args.threshold,
-            ref_start=args.ref_start,
-            ref_end=args.ref_end,
-            shapefile_path=args.shapefile,
-        )
-        if args.save_nc:
-            thr_str = str(args.threshold).replace(".", "")
-            out_nc  = os.path.join(args.path_preprocessed, "agg_datasets",
-                                   f"ds_final_high_non_zero_{thr_str}_{args.reanalysis}.nc")
-            os.makedirs(os.path.dirname(out_nc), exist_ok=True)
-            print(f"  Saving dataset to {out_nc}  ")
-            ds_final.to_netcdf(out_nc)
-            print(f"  Saved : {out_nc}")
+    ds_final = load_or_build_ds_final(args, args.data_path, args.threshold)
 
     print("Building land mask")
     mask = build_land_mask(ds_final, args.shapefile)
@@ -1314,6 +1351,7 @@ def main():
     out1 = os.path.join(args.output_dir, "main",
                         f"fig1_valuebyalpha_slides_{str(args.threshold).replace('.', '')}.png")
     os.makedirs(os.path.dirname(out1), exist_ok=True)
+    fit_to_width(fig1)
     fig1.savefig(out1, dpi=args.dpi, bbox_inches="tight")
     plt.close(fig1)
     print(f"Saved {out1}")
@@ -1323,6 +1361,7 @@ def main():
                                 wcf_zero_mask=wcf_zero_mask)
     out2 = os.path.join(args.output_dir, "supp", "suppfig2_pdd_std_map.png")
     os.makedirs(os.path.dirname(out2), exist_ok=True)
+    fit_to_width(fig2)
     fig2.savefig(out2, dpi=args.dpi, bbox_inches="tight")
     plt.close(fig2)
     print(f"Saved {out2}")
@@ -1337,25 +1376,28 @@ def main():
     )
     out3 = os.path.join(args.output_dir, "supp", "suppfig3_mean_variables_6panel.png")
     os.makedirs(os.path.dirname(out3), exist_ok=True)
+    fit_to_width(fig3)
     fig3.savefig(out3, dpi=args.dpi, bbox_inches="tight")
     plt.close(fig3)
     print(f"Saved {out3}")
 
-    _have_vba = (args.data_path_005 is not None and args.data_path_02 is not None)
-    _have_rl  = args.rl_path is not None
-
-    if _have_vba and _have_rl:
-        csv_thr95  = os.path.join(args.rl_path,
-                                  "rl_agg_adaptation_Annual_0.95_ren_pen_0.5_current_v2.csv")
-        csv_thr99  = os.path.join(args.rl_path,
-                                  "rl_agg_adaptation_Annual_0.99_ren_pen_0.5_current_v2.csv")
-        csv_thr995 = os.path.join(args.rl_path,
-                                  "rl_agg_adaptation_Annual_0.995_ren_pen_0.5_current_v2.csv")
-        print("Plotting combined threshold-sensitivity figure  ")
-        ds_005   = xr.open_dataset(args.data_path_005)
-        ds_02    = xr.open_dataset(args.data_path_02)
+    if args.skip_sensitivity:
+        print("Skipping sensitivity suppfig (--skip_sensitivity).")
+    else:
+        ds_005   = load_or_build_ds_final(args, args.data_path_005, 0.05)
+        ds_02    = load_or_build_ds_final(args, args.data_path_02,  0.2)
         mask_005 = build_land_mask(ds_005, args.shapefile)
         mask_02  = build_land_mask(ds_02,  args.shapefile)
+
+        csv_thr95, csv_thr99, csv_thr995 = (
+            rl_threshold_csv(args.rl_path, t) for t in (0.95, 0.99, 0.995))
+        missing = [p for p in (csv_thr95, csv_thr99, csv_thr995) if not os.path.exists(p)]
+        if missing:
+            print("RL-threshold CSVs not found (run fig45.py first):\n  "
+                  + "\n  ".join(missing))
+
+    if not args.skip_sensitivity and not missing:
+        print("Plotting combined threshold-sensitivity figure  ")
         fig_comb = plot_combined_threshold_sensitivity(
             ds_005, mask_005, ds_final, mask, ds_02, mask_02,
             shapefile_path=args.shapefile,
@@ -1366,26 +1408,22 @@ def main():
         out_comb = os.path.join(args.output_dir, "supp",
                                 "suppfig_combined_threshold_sensitivity.png")
         os.makedirs(os.path.dirname(out_comb), exist_ok=True)
+        fit_to_width(fig_comb)
         fig_comb.savefig(out_comb, dpi=args.dpi, bbox_inches="tight")
         plt.close(fig_comb)
         print(f"Saved : {out_comb}")
-    elif _have_vba:
+    elif not args.skip_sensitivity:
         print("Plotting value-by-alpha sensitivity figure  ")
-        ds_005   = xr.open_dataset(args.data_path_005)
-        ds_02    = xr.open_dataset(args.data_path_02)
-        mask_005 = build_land_mask(ds_005, args.shapefile)
-        mask_02  = build_land_mask(ds_02,  args.shapefile)
         fig_sens = plot_valuebyalpha_sensitivity(
             ds_005, mask_005, ds_02, mask_02, shapefile_path=args.shapefile,
             wcf_zero_mask=wcf_zero_mask)
         out_sens = os.path.join(args.output_dir, "supp",
                                 "suppfig_valuebyalpha_sensitivity.png")
         os.makedirs(os.path.dirname(out_sens), exist_ok=True)
+        fit_to_width(fig_sens)
         fig_sens.savefig(out_sens, dpi=args.dpi, bbox_inches="tight")
         plt.close(fig_sens)
         print(f"Saved : {out_sens}")
-    else:
-        print("Skipping sensitivity suppfig.")
 
     print("Computing global change statistics  ")
     global_rel_change, ci_lower_rel, ci_upper_rel = compute_global_change_stats(

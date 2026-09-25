@@ -56,6 +56,7 @@ FIG_WIDTH_IN = 5.15   # column width - fontsizes in pt will match LaTeX
 # within +/-180 deg longitude.
 MAP_LAT_SOUTH = -58
 MAP_LAT_NORTH = 68
+EQUAL_EARTH_ASPECT = 2.05   # width / height of a set_global() EqualEarth axes
 
 
 def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
@@ -518,6 +519,25 @@ def load_wcf_zero_mask(path):
     GCM-trend-agreement hatching -- see draw_wcf_zero_overlay.
     """
     return xr.open_dataarray(path).astype(bool)
+
+
+def fit_to_width(fig, width_in=FIG_WIDTH_IN, n_iter=4, tol=0.002):
+    """
+    Rescale the figure canvas (both dimensions, fonts untouched) so that
+    savefig(..., bbox_inches="tight") yields an image exactly width_in wide.
+    Without this, the tight crop leaves each figure at a different width, so
+    once LaTeX scales them all to the column width their fonts (panel
+    letters, titles, legends) end up at different effective point sizes.
+    Accounts for savefig's own pad_inches on each side.
+    """
+    target = width_in - 2 * plt.rcParams["savefig.pad_inches"]
+    for _ in range(n_iter):
+        fig.canvas.draw()
+        scale = target / fig.get_tightbbox(fig.canvas.get_renderer()).width
+        if abs(scale - 1) < tol:
+            break
+        fig.set_size_inches(fig.get_figwidth() * scale, fig.get_figheight() * scale)
+    return fig
 
 
 def draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp, target_lat, target_lon, zorder=7):
@@ -1019,12 +1039,18 @@ def plot_supp_valuebyalpha_stacked(
     land_shp_band = land_shp_band & lat_ok.values[:, None]
     n   = len(gwl_items)
 
-    # LaTeX-compatible width; height scales with number of rows
+    # Maps span the full column width; the height is derived from the
+    # EqualEarth aspect so rows are not height-limited (a height-limited map
+    # shrinks the tight crop and LaTeX then upscales every font).
     fig_width_in  = FIG_WIDTH_IN
-    fig_height_in = fig_width_in * (6 / 14) * n   # keep per-row aspect ratio
+    map_h_in      = fig_width_in * 0.98 / EQUAL_EARTH_ASPECT
+    title_in, gap_in, bottom_in = 0.22, 0.30, 0.05
+    fig_height_in = n * map_h_in + (n - 1) * gap_in + title_in + bottom_in
 
     fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
-    gs  = GridSpec(n, 1, hspace=0.06, figure=fig)
+    gs  = GridSpec(n, 1, figure=fig, left=0.01, right=0.99,
+                   top=1 - title_in / fig_height_in, bottom=bottom_in / fig_height_in,
+                   hspace=gap_in / map_h_in)
 
     legend_rgba = np.zeros((n_bins_change, n_bins_sev, 4))
     for ic in range(n_bins_change):
@@ -1078,7 +1104,9 @@ def plot_supp_valuebyalpha_stacked(
         ax.spines["geo"].set_visible(False)
 
         # Inset legend
-        legend_ax = inset_axes(ax, width="14%", height="50%", loc="center left", borderpad=0.5)
+        # Shifted right so its tick/axis labels stay inside the map frame
+        legend_ax = inset_axes(ax, width="14%", height="50%", loc="center left", borderpad=0.5,
+                               bbox_to_anchor=(0.07, 0, 1, 1), bbox_transform=ax.transAxes)
         legend_ax.imshow(legend_rgba, origin="lower", aspect="equal")
         legend_ax.set_xticks([0, n_bins_sev // 2, n_bins_sev - 1])
         legend_ax.set_xticklabels(["low", "mid", "high"], fontsize=5, ha="center")
@@ -1202,10 +1230,16 @@ def plot_gwl_valuebyalpha_wasserstein(
     land_shp_band = rasterize_shapefile(shp, da_mask_ref.shape, _transform_ref)[::-1, :]
     land_shp_band = land_shp_band & lat_ok.values[:, None]
 
+    # Two full-width map rows (see plot_supp_valuebyalpha_stacked); extra
+    # bottom room for panel b's colorbar, which hangs below the map.
     fig_width_in  = FIG_WIDTH_IN
-    fig_height_in = fig_width_in * (12 / 14)   # two stacked map rows
+    map_h_in      = fig_width_in * 0.98 / EQUAL_EARTH_ASPECT
+    title_in, gap_in, bottom_in = 0.22, 0.30, 0.50
+    fig_height_in = 2 * map_h_in + gap_in + title_in + bottom_in
     fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
-    gs  = GridSpec(2, 1, hspace=0.15, figure=fig)
+    gs  = GridSpec(2, 1, figure=fig, left=0.01, right=0.99,
+                   top=1 - title_in / fig_height_in, bottom=bottom_in / fig_height_in,
+                   hspace=gap_in / map_h_in)
 
     # --- Panel a: value-by-alpha map, inverse-W2 pixel weighting ---
     ax_a = fig.add_subplot(gs[0, 0], projection=ccrs.EqualEarth())
@@ -1228,7 +1262,7 @@ def plot_gwl_valuebyalpha_wasserstein(
         )
     draw_wcf_zero_overlay(ax_a, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
     ax_a.annotate(
-        "$\\mathbf{a}$", xy=(0.02, 0.99), xycoords="axes fraction",
+        "$\\mathbf{a}$", xy=(0.02, 1.02), xycoords="axes fraction",
         ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
@@ -1243,7 +1277,9 @@ def plot_gwl_valuebyalpha_wasserstein(
     for ic in range(n_bins_change):
         legend_rgba[ic, :, :3] = color_levels[ic, :3]
         legend_rgba[ic, :,  3] = alpha_levels
-    legend_ax = inset_axes(ax_a, width="14%", height="45%", loc="center left", borderpad=0.5)
+    # Shifted right so its tick/axis labels stay inside the map frame
+    legend_ax = inset_axes(ax_a, width="14%", height="45%", loc="center left", borderpad=0.5,
+                           bbox_to_anchor=(0.07, 0, 1, 1), bbox_transform=ax_a.transAxes)
     legend_ax.imshow(legend_rgba, origin="lower", aspect="equal")
     legend_ax.set_xticks([0, n_bins_sev // 2, n_bins_sev - 1])
     legend_ax.set_xticklabels(["low", "mid", "high"], fontsize=5, ha="center")
@@ -1268,7 +1304,7 @@ def plot_gwl_valuebyalpha_wasserstein(
     shp_band.boundary.plot(ax=ax_b, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     ax_b.annotate(
-        "$\\mathbf{b}$", xy=(0.02, 0.99), xycoords="axes fraction",
+        "$\\mathbf{b}$", xy=(0.02, 1.02), xycoords="axes fraction",
         ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
@@ -1862,6 +1898,7 @@ def main():
         )
         out_path = os.path.join(args.output_dir, "main", fname)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        fit_to_width(fig)
         fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved ? {out_path}")
@@ -1935,6 +1972,7 @@ def main():
                 fname_w = f"suppfig_projected_change_valuebyalpha_{gwl_key}_wasserstein.png"
                 out_w = os.path.join(args.output_dir, "supp", fname_w)
                 os.makedirs(os.path.dirname(out_w), exist_ok=True)
+                fit_to_width(fig_w)
                 fig_w.savefig(out_w, dpi=args.dpi, bbox_inches="tight")
                 plt.close(fig_w)
                 print(f"  Saved -> {out_w}")
@@ -1962,6 +2000,7 @@ def main():
         )
         out_supp = os.path.join(args.output_dir, "supp", "fig_supp_valuebyalpha_all_gwl.png")
         os.makedirs(os.path.dirname(out_supp), exist_ok=True)
+        fit_to_width(fig_supp)
         fig_supp.savefig(out_supp, dpi=args.dpi, bbox_inches="tight")
         plt.close(fig_supp)
         print(f"  Saved ? {out_supp}")
