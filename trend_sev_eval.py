@@ -66,6 +66,22 @@ def rasterize_shapefile(shapefile, shape, transform):
     )
 
 
+def _land_mask(grid_coords, shapefile_path):
+    """(lat, lon) boolean land mask on `grid_coords` (True = land), rasterized from
+    the country/admin shapefile -- same rasterization preprocess_ref_boot() uses."""
+    shapefile = gpd.read_file(shapefile_path)
+    transform = rasterio.transform.from_bounds(
+        grid_coords.lon.min().item(), grid_coords.lat.min().item(),
+        grid_coords.lon.max().item(), grid_coords.lat.max().item(),
+        len(grid_coords.lon), len(grid_coords.lat),
+    )
+    mask = rasterize_shapefile(shapefile, (len(grid_coords.lat), len(grid_coords.lon)), transform)
+    # rasterio row 0 = northernmost; flip to match an ascending lat coordinate
+    if grid_coords.lat.values[0] < grid_coords.lat.values[-1]:
+        mask = mask[::-1, :]
+    return mask
+
+
 def _parse_exclude_gcm_run(exclude_gcm_run):
     """
     'GCM:run' strings -> a {(GCM, run), ...} set, same convention as
@@ -777,13 +793,7 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
         {"name": "Kenya",         "lat": [-5,   5],  "lon": [33,   42]},
     ]
 
-    shapefile = gpd.read_file(shapefile_path)
-    transform = rasterio.transform.from_bounds(
-        grid_coords.lon.min().item(), grid_coords.lat.min().item(),
-        grid_coords.lon.max().item(), grid_coords.lat.max().item(),
-        len(grid_coords.lon), len(grid_coords.lat),
-    )
-    mask = rasterize_shapefile(shapefile, (len(grid_coords.lat), len(grid_coords.lon)), transform)[::-1, :]
+    mask = _land_mask(grid_coords, shapefile_path)
 
     tasks = [
         (preprocessed_path, GCM, run, reanalysis, grid_coords, mask, regions)
@@ -1015,13 +1025,19 @@ def uncertainty_range_aggregated(preprocessed_path, out_dir, reanalysis=None, ex
 # agg_ic_ann_sev_GCMs_aggregated_*.nc) alike.
 # ---------------------------------------------------------------------------
 
-def build_agreement_mask(ref_path, gcm_path, out_path, exclude_gcm_run=None):
+def build_agreement_mask(ref_path, gcm_path, out_path, exclude_gcm_run=None, shapefile_path=None):
     """
     Save agreement_pct = 100 * (fraction of GCM realizations at `gcm_path`
     whose trend CI overlaps the ERA5 reference CI at `ref_path`), as a single
     DataArray at `out_path` -- a cell/polygon "fails" validation (is hatched)
     where fig3.py/fig45.py find agreement_pct < config.AGREEMENT_THRESHOLD
     (50%, i.e. fewer than half the ensemble agrees with ERA5).
+
+    `shapefile_path` (per-pixel (lat, lon) files only): cells outside the
+    shapefile's land polygons are set to NaN. GCM and ERA5 severity fields are
+    both defined over the ocean, so without this the per-pixel mask also
+    covers the seas. The aggregated (poly_idx) mask needs no such step: it is
+    land-only by construction.
     """
     exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
     ds_ref = xr.open_dataset(ref_path)
@@ -1037,6 +1053,13 @@ def build_agreement_mask(ref_path, gcm_path, out_path, exclude_gcm_run=None):
     overlap = (ds_ref.low_trend < ds_gcm.up_trend) & (ds_ref.up_trend > ds_gcm.low_trend)
     within = overlap.sum(dim='realization')
     agreement_pct = (within / ds_gcm.sizes['realization'] * 100)
+    # overlap is False (not NaN) wherever the reference CI is NaN, so restore NaN there
+    agreement_pct = agreement_pct.where(ds_ref.low_trend.notnull() & ds_ref.up_trend.notnull())
+    if shapefile_path is not None:
+        land = _land_mask(xr.Dataset(coords={'lat': ds_ref.lat.values, 'lon': ds_ref.lon.values}),
+                          shapefile_path)
+        agreement_pct = agreement_pct.where(
+            xr.DataArray(land, dims=['lat', 'lon'], coords={'lat': ds_ref.lat, 'lon': ds_ref.lon}))
     agreement_pct.name = 'agreement_pct'
     agreement_pct.attrs['description'] = (
         "% of GCM realizations whose bootstrap trend CI overlaps the ERA5 reference "
@@ -1084,6 +1107,12 @@ if __name__ == '__main__':
         '--skip-mask', action='store_true',
         help="Skip build_agreement_mask() (only compute the CI grids, not the derived mask).",
     )
+    parser.add_argument(
+        '--mask-only', action='store_true',
+        help="Only rebuild the agreement mask(s) from the existing grid_ic_ref.nc / "
+             "agg_ic_ann_sev_GCMs_*.nc files in trend_evaluation/ (no CI recomputation). "
+             "Combine with --aggregated to also rebuild the per-polygon mask.",
+    )
     args = parser.parse_args()
 
     preprocessed_path = config.PATH_PREPROCESSED
@@ -1091,31 +1120,36 @@ if __name__ == '__main__':
     out_dir            = os.path.join(config.PATH_PREPROCESSED, 'trend_evaluation')
     os.makedirs(out_dir, exist_ok=True)
 
-    make_grid_ref_trend_ci(preprocessed_path, out_dir, max_workers=args.max_workers)
-    preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, max_workers=args.max_workers)
+    if not args.mask_only:
+        make_grid_ref_trend_ci(preprocessed_path, out_dir, max_workers=args.max_workers)
+        preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, max_workers=args.max_workers)
 
     if not args.era5_ref_only:
-        uncertainty_range(preprocessed_path, out_dir, exclude_gcm_run=args.exclude_gcm_run)
-        slopes_samples(preprocessed_path, out_dir, shapefile_path, exclude_gcm_run=args.exclude_gcm_run)
+        if not args.mask_only:
+            uncertainty_range(preprocessed_path, out_dir, exclude_gcm_run=args.exclude_gcm_run)
+            slopes_samples(preprocessed_path, out_dir, shapefile_path, exclude_gcm_run=args.exclude_gcm_run)
 
         if not args.skip_mask:
-            print("\n=== Building per-pixel agreement mask (< 50% CI overlap with ERA5) ===")
+            print("\n=== Building per-pixel agreement mask (< 50% CI overlap with ERA5, land only) ===")
             build_agreement_mask(
                 ref_path=os.path.join(out_dir, 'grid_ic_ref.nc'),
                 gcm_path=os.path.join(out_dir, f'agg_ic_ann_sev_GCMs_all_year_{config.REANALYSIS}.nc'),
                 out_path=config.AGREEMENT_NC_PATH,
                 exclude_gcm_run=args.exclude_gcm_run,
+                shapefile_path=shapefile_path,
             )
 
     if args.aggregated:
         print("\n=== Aggregated-domain pipeline (wcf_agg_*/scf_agg_*, per poly_idx) ===")
-        make_ref_trend_ci_aggregated(preprocessed_path, out_dir,
-                                     reanalysis=config.REANALYSIS, suffix_shp=args.suffix_shp)
+        if not args.mask_only:
+            make_ref_trend_ci_aggregated(preprocessed_path, out_dir,
+                                         reanalysis=config.REANALYSIS, suffix_shp=args.suffix_shp)
         if not args.era5_ref_only:
-            uncertainty_range_aggregated(preprocessed_path, out_dir,
-                                         reanalysis=config.REANALYSIS,
-                                         exclude_gcm_run=args.exclude_gcm_run,
-                                         suffix_shp=args.suffix_shp)
+            if not args.mask_only:
+                uncertainty_range_aggregated(preprocessed_path, out_dir,
+                                             reanalysis=config.REANALYSIS,
+                                             exclude_gcm_run=args.exclude_gcm_run,
+                                             suffix_shp=args.suffix_shp)
             if not args.skip_mask:
                 print("\n=== Building aggregated (per-polygon) agreement mask (< 50% CI overlap) ===")
                 build_agreement_mask(
