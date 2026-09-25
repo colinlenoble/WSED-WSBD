@@ -55,6 +55,13 @@ GWL) line -- every connected run of points still draws its own segment --
 but a point left isolated by that gap (no valid neighbor on either side)
 is removed too, rather than drawn as a disconnected floating marker (see
 _drop_isolated_points).
+
+main() writes two figures off the same data and layout, both with a broken
+x-axis at DURATION_SPLIT_DAY: the ratio figure above
+(plot_swed_swbd_distributions_split) and the discrete duration-share
+distributions themselves, every GWL including the baseline, on a log y-axis
+(plot_swed_swbd_share_split -- the SWED+SWBD analogue of
+fig_duration_distribution_latitude.py's "_full" share figure).
 """
 import os
 import config
@@ -196,6 +203,13 @@ def parse_args():
                               "20-day 'full' figure, since past ~12 days this figure's "
                               "per-duration GWL/baseline ratio is built from too few "
                               "events per zone to be meaningful).")
+    parser.add_argument("--share_max_duration_days", type=float,
+                         default=swed_mod.FULL_FIGURE_MAX_DURATION_DAYS,
+                         help="X-axis cap in days for the share-distribution figure "
+                              "(plot_swed_swbd_share_split; default: "
+                              f"{swed_mod.FULL_FIGURE_MAX_DURATION_DAYS:g}, matching "
+                              "fig_duration_distribution_latitude.py's 'full' figure -- "
+                              "unlike the ratio, a share stays meaningful far into the tail).")
     parser.add_argument("--min_events", type=int, default=5)
     parser.add_argument("--duration_split_day", type=float, default=DURATION_SPLIT_DAY_DEFAULT,
                          help="Day at which plot_swed_swbd_distributions_split's broken-axis "
@@ -1144,6 +1158,176 @@ def plot_swed_swbd_distributions_split(swed_counts_df, swbd_counts_df, land_area
     return fig
 
 
+def _shared_log_ylim(arrays, pad_decades=0.12):
+    """(lo, hi) spanning every finite, positive value in `arrays`, padded by
+    `pad_decades` on a log scale; None if there is nothing to span."""
+    vals = [a[np.isfinite(a) & (a > 0)] for a in arrays]
+    vals = np.concatenate([v for v in vals if v.size] or [np.array([])])
+    if vals.size == 0:
+        return None
+    return (10.0 ** (np.log10(vals.min()) - pad_decades),
+            10.0 ** (np.log10(vals.max()) + pad_decades))
+
+
+def plot_swed_swbd_share_split(swed_counts_df, swbd_counts_df, land_area_pct,
+                                zone_of_poly, area_of_poly, regions_shapefile,
+                                gwl_list, output_path, dpi=300,
+                                max_duration_days=swed_mod.FULL_FIGURE_MAX_DURATION_DAYS,
+                                min_events=5, duration_split_day=DURATION_SPLIT_DAY_DEFAULT):
+    """
+    Share-of-events twin of plot_swed_swbd_distributions_split -- same
+    2-column (SWED | SWBD) x 6-row layout, locator maps and broken x-axis,
+    but each panel plots the discrete duration distribution itself (every
+    GWL including the GWL0-61 baseline, each duration's share of that
+    (zone, GWL) group's total events -- see _share_fns) on a log y-axis,
+    as in fig_duration_distribution_latitude.py's plot_distributions,
+    rather than its ratio to the baseline.
+
+    Each sub-panel type (short-term / persistent) shares one y-range across
+    all 10 panels, so SWED and SWBD shares are read on the same scale.
+    Vertical markers per GWL: dashed = mean event duration, dotted =
+    q-HIGH_DURATION_PCTILE duration, both computed over the full duration
+    record (not cropped to max_duration_days), so they mark the true tail
+    even when it lies beyond the plotted window.
+    """
+    x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
+    zone_order = list(reversed(swed_mod.LAT_ZONE_LABELS))
+    split_idx = int(duration_split_day)  # x_int[:split_idx] == days 1..duration_split_day
+    do_split = max_duration_days > duration_split_day
+    share_fns = _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
+                            min_events=min_events)
+    counts_by_col = {"SWED": swed_counts_df, "SWBD": swbd_counts_df}
+
+    # Pass 1: every panel's curves (evaluated on the full duration record,
+    # so the mean/tail markers aren't biased by the plotted window), before
+    # anything is drawn, so the shared y-ranges can be fixed up front.
+    panel_data = {col: [] for col in share_fns}
+    for col, share_fn in share_fns.items():
+        df = counts_by_col[col]
+        max_rec = int(df["duration"].max()) if not df.empty else len(x_int)
+        x_full = np.arange(1, max(max_rec, len(x_int)) + 1)
+        for zlabel in zone_order:
+            curves = {}
+            for gwl in gwl_list:
+                full = share_fn(gwl, zlabel, x_full)
+                if full is None or full.sum() <= 0:
+                    continue
+                curves[gwl] = {
+                    "share": swed_mod._for_line(full[:len(x_int)]),
+                    "mean": float((x_full * full).sum() / full.sum()),
+                    "p_high": swed_mod._weighted_percentile(
+                        x_full, full, swed_mod.HIGH_DURATION_PCTILE),
+                }
+            panel_data[col].append(curves)
+
+    all_shares = [c["share"] for col in panel_data.values() for row in col for c in row.values()]
+    if do_split:
+        main_ylim = _shared_log_ylim([a[:split_idx] for a in all_shares])
+        zoom_ylim = _shared_log_ylim([a[split_idx - 1:] for a in all_shares])
+    else:
+        main_ylim = zoom_ylim = _shared_log_ylim(all_shares)
+
+    n_rows = len(zone_order)
+    fig = plt.figure(figsize=(swed_mod.FIG_WIDTH_IN * 1.55, swed_mod.FIG_WIDTH_IN * 1.75))
+    gs = GridSpec(n_rows + 1, 2, height_ratios=[0.8] + [1.0] * n_rows,
+                  left=0.11, right=0.97, top=0.93, bottom=0.09,
+                  hspace=0.65, wspace=0.30, figure=fig)
+
+    all_letters = [chr(ord("a") + k) for k in range(2 * (n_rows + 1))]
+    _add_map_row(fig, gs, zone_order, regions_shapefile, zone_of_poly, all_letters)
+
+    for i, zlabel in enumerate(zone_order):
+        pct = land_area_pct.get(zlabel)
+        lat_range_text = swed_mod._fmt_lat_range(zlabel)
+        zone_label_text = (f"{lat_range_text} ({pct:.1f}% of land area)" if pct is not None
+                            else lat_range_text)
+
+        for j, col in enumerate(panel_data):
+            curves = panel_data[col][i]
+
+            if do_split:
+                inner_gs = GridSpecFromSubplotSpec(
+                    1, 2, subplot_spec=gs[i + 1, j],
+                    width_ratios=swed_mod.DURATION_ZOOM_WIDTH_RATIOS, wspace=0.08)
+                ax_main = fig.add_subplot(inner_gs[0])
+                ax_zoom = fig.add_subplot(inner_gs[1])
+                windows = [(ax_main, slice(0, split_idx)), (ax_zoom, slice(split_idx - 1, None))]
+            else:
+                ax_main = fig.add_subplot(gs[i + 1, j])
+                ax_zoom = None
+                windows = [(ax_main, slice(None))]
+
+            for gwl in gwl_list:
+                c = curves.get(gwl)
+                if c is None:
+                    continue
+                color = swed_mod.GWL_COLORS.get(gwl, "gray")
+                for a, sl in windows:
+                    a.plot(x_int[sl], c["share"][sl], color=color, marker="o", markersize=2.2,
+                           linewidth=1.3, zorder=3)
+                    a.axvline(c["mean"], color=color, linestyle="--", linewidth=1.0,
+                              alpha=0.75, zorder=4)
+                    a.axvline(c["p_high"], color=color, linestyle=":", linewidth=1.0,
+                              alpha=0.75, zorder=4)
+
+            for a, ylim in ((ax_main, main_ylim), (ax_zoom, zoom_ylim)):
+                if a is None:
+                    continue
+                a.set_yscale("log")
+                if ylim is not None:
+                    a.set_ylim(*ylim)
+                a.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+                a.tick_params(labelsize=swed_mod.TICK_FONTSIZE)
+                a.grid(True, linestyle="--", alpha=0.3)
+                for spine in a.spines.values():
+                    spine.set_linewidth(0.4)
+
+            if do_split:
+                ax_main.set_xlim(0.5, duration_split_day + 0.5)
+                ax_zoom.set_xlim(duration_split_day - 0.5, max_duration_days + 0.5)
+                ax_main.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+                ax_zoom.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True, nbins=6))
+                if main_ylim is not None and zoom_ylim is not None:
+                    _add_split_break(fig, ax_main, ax_zoom, main_ylim, zoom_ylim,
+                                     duration_split_day)
+            else:
+                ax_main.set_xlim(0.5, max_duration_days + 0.5)
+                ax_main.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+
+            ax_main.spines["left"].set_color(swed_mod.ZONE_MAP_COLORS[zlabel])
+            ax_main.spines["left"].set_linewidth(2.2)
+
+            panel_letter = all_letters[2 + i * 2 + j]
+            ax_main.text(0.0, 1.05, panel_letter, transform=ax_main.transAxes,
+                         ha="left", va="bottom", fontsize=swed_mod.LETTER_FONTSIZE,
+                         fontweight="bold")
+            if j == 0:
+                ax_main.set_ylabel("Share of events", fontsize=swed_mod.AXIS_LABEL_FONTSIZE)
+                ax_main.text(0.13, 1.05, zone_label_text, transform=ax_main.transAxes,
+                             ha="left", va="bottom", fontsize=swed_mod.ZONE_TITLE_FONTSIZE,
+                             fontweight="bold", color=swed_mod.ZONE_MAP_COLORS[zlabel])
+            if i == n_rows - 1:
+                (ax_zoom if ax_zoom is not None else ax_main).set_xlabel(
+                    "Event duration (days)", fontsize=swed_mod.XLABEL_FONTSIZE)
+
+    gwl_handles = [
+        Line2D([0], [0], color=swed_mod.GWL_COLORS.get(gwl, "gray"), marker="o",
+               markersize=3, linewidth=1.6, label=swed_mod.GWL_LABELS.get(gwl, gwl))
+        for gwl in gwl_list
+    ]
+    extra_handles = [
+        Line2D([0], [0], color="black", linewidth=1.0, linestyle="--", label="Mean duration"),
+        Line2D([0], [0], color="black", linewidth=1.0, linestyle=":",
+               label=f"q{swed_mod.HIGH_DURATION_PCTILE:g} duration"),
+    ]
+    fig.legend(handles=gwl_handles + extra_handles, loc="lower center",
+               ncol=len(gwl_handles) + len(extra_handles), fontsize=swed_mod.LEGEND_FONTSIZE,
+               bbox_to_anchor=(0.5, 0.0), frameon=False, columnspacing=1.3, handlelength=1.8)
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return fig
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1235,14 +1419,6 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 5 - Plotting")
     print("=" * 60)
-    out_path = os.path.join(args.output_dir, "fig_duration_distribution_swed_swbd_ratio.png")
-    plot_swed_swbd_distributions(
-        swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
-        args.regions_shapefile, args.gwl_list, out_path, dpi=args.dpi,
-        max_duration_days=args.max_duration_days, min_events=args.min_events,
-    )
-    print(f"  Saved -> {out_path}")
-
     out_path_split = os.path.join(
         args.output_dir, "fig_duration_distribution_swed_swbd_ratio_split.png")
     plot_swed_swbd_distributions_split(
@@ -1252,6 +1428,16 @@ def main():
         duration_split_day=args.duration_split_day,
     )
     print(f"  Saved -> {out_path_split}")
+
+    out_path_share = os.path.join(
+        args.output_dir, "fig_duration_distribution_swed_swbd_share_split.png")
+    plot_swed_swbd_share_split(
+        swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
+        args.regions_shapefile, args.gwl_list, out_path_share, dpi=args.dpi,
+        max_duration_days=args.share_max_duration_days, min_events=args.min_events,
+        duration_split_day=args.duration_split_day,
+    )
+    print(f"  Saved -> {out_path_share}")
 
 
 if __name__ == "__main__":
