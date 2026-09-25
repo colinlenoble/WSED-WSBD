@@ -1300,6 +1300,13 @@ def plot_gwl_valuebyalpha_wasserstein(
         interpolation="nearest", cmap=cmo.cm.balance, vmin=-diff_vmax, vmax=diff_vmax,
         rasterized=True,
     )
+    if hatchings is not None:
+        # Same black failed-evaluation layer as panel a.
+        ax_b.contourf(
+            da_mask_ref.lon, da_mask_ref.lat, failed_eval_band_a.astype(float),
+            levels=[0.5, 1], colors=["black"],
+            transform=ccrs.PlateCarree(), zorder=6,
+        )
     draw_wcf_zero_overlay(ax_b, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
     shp_band.boundary.plot(ax=ax_b, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)

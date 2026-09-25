@@ -737,6 +737,75 @@ def _drop_isolated_points(arr):
     return out
 
 
+def _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly, min_events=5):
+    """
+    {"SWED": fn, "SWBD": fn}, each fn(gwl, zone, x) -> that (zone, GWL)'s
+    pooled duration-share curve evaluated at durations `x`, or None if it
+    has too few events (min_events). SWED is swed_mod._group_counts's
+    equal-GCM-weighted arr_share; SWBD is zone_group_counts_swbd's
+    area-weighted mean of each region's equal-GCM-weighted curve -- both
+    normalized by the group's total over *every* duration on record, so a
+    curve evaluated on a cropped `x` is simply the full curve's head.
+    Shared by the ratio and the share figures so both plot the same curves.
+    """
+    def _swed_share(gwl, zlabel, x):
+        group = swed_mod._group_counts(swed_counts_df, gwl, zlabel, x)
+        if group is None:
+            return None
+        arr_share, _, _, _, raw_total = group
+        return arr_share if raw_total >= min_events else None
+
+    def _swbd_share(gwl, zlabel, x):
+        return zone_group_counts_swbd(
+            swbd_counts_df, gwl, zlabel, zone_of_poly, area_of_poly, x,
+            min_events=min_events)
+
+    return {"SWED": _swed_share, "SWBD": _swbd_share}
+
+
+def _add_map_row(fig, gs, zone_order, regions_shapefile, zone_of_poly, letters):
+    """Row-0 locator maps (SWED latitude bands | SWBD region attribution),
+    each with its title and panel letter -- shared by every figure here."""
+    ax_map_swed, _ = swed_mod._add_locator_map(fig, gs[0, 0], zone_order)
+    ax_map_swbd = _add_region_zone_map(fig, gs[0, 1], regions_shapefile, zone_of_poly)
+    for ax_map, label, letter in ((ax_map_swed, "SWED", letters[0]),
+                                   (ax_map_swbd, "SWBD (region attribution)", letters[1])):
+        bbox = ax_map.get_position()
+        fig.text((bbox.x0 + bbox.x1) / 2, bbox.y1 + 0.012, label, ha="center", va="bottom",
+                  fontsize=swed_mod.ZONE_TITLE_FONTSIZE, fontweight="bold")
+        fig.text(bbox.x0 - 0.02, bbox.y1 + 0.012, letter, ha="left", va="bottom",
+                  fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
+
+
+def _add_split_break(fig, ax_main, ax_zoom, main_ylim, zoom_ylim, split_day):
+    """
+    Broken-axis decorations between a short-term sub-panel and its
+    persistent-event sub-panel: split-day line, x-limits are left to the
+    caller, right-side y-ticks on the zoom panel, diagonal break marks on
+    both spines, and dotted bridges from the split day in the main
+    sub-panel (at the zoom sub-panel's own y-min/y-max) to the zoom
+    sub-panel's left corners -- same convention as
+    fig_duration_distribution_latitude.py's plot_distributions.
+    """
+    ax_main.axvline(split_day, color=swed_mod.DURATION_SPLIT_LINE_COLOR,
+                     linewidth=0.8, linestyle="-", zorder=1)
+    ax_zoom.yaxis.tick_right()
+
+    d = 0.02  # half-length (axes fraction) of each diagonal break mark
+    break_kwargs = dict(color="black", linewidth=0.8, clip_on=False, zorder=5)
+    for y0 in (0, 1):
+        ax_main.plot((1 - d, 1 + d), (y0 - d, y0 + d), transform=ax_main.transAxes, **break_kwargs)
+        ax_zoom.plot((-d, d), (y0 - d, y0 + d), transform=ax_zoom.transAxes, **break_kwargs)
+    for y_zoom, y_frac_zoom in ((zoom_ylim[1], 1), (zoom_ylim[0], 0)):
+        y_anchor = min(max(y_zoom, main_ylim[0]), main_ylim[1])
+        fig.add_artist(ConnectionPatch(
+            xyA=(split_day, y_anchor), coordsA=ax_main.transData,
+            xyB=(0, y_frac_zoom), coordsB=ax_zoom.transAxes,
+            color=swed_mod.DURATION_SPLIT_LINE_COLOR, linewidth=0.7,
+            linestyle=":", zorder=1,
+        ))
+
+
 def _gather_ratio_panel_data(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
                               gwl_list, x_int, zone_order, min_events=5):
     """
@@ -749,28 +818,16 @@ def _gather_ratio_panel_data(swed_counts_df, swbd_counts_df, zone_of_poly, area_
     {"ratios": {gwl: arr_or_None}}.
     """
     ratio_gwls = [g for g in gwl_list if g != BASELINE_GWL]
-
-    def _swed_share(gwl, zlabel):
-        group = swed_mod._group_counts(swed_counts_df, gwl, zlabel, x_int)
-        if group is None:
-            return None
-        arr_share, _, _, _, raw_total = group
-        return arr_share if raw_total >= min_events else None
-
-    def _swbd_share(gwl, zlabel):
-        return zone_group_counts_swbd(
-            swbd_counts_df, gwl, zlabel, zone_of_poly, area_of_poly, x_int,
-            min_events=min_events)
-
-    share_fns = {"SWED": _swed_share, "SWBD": _swbd_share}
+    share_fns = _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
+                            min_events=min_events)
 
     panel_data = {col: [] for col in share_fns}
     for zlabel in zone_order:
         for col, share_fn in share_fns.items():
-            base = share_fn(BASELINE_GWL, zlabel)
+            base = share_fn(BASELINE_GWL, zlabel, x_int)
             ratios = {}
             for gwl in ratio_gwls:
-                arr = share_fn(gwl, zlabel)
+                arr = share_fn(gwl, zlabel, x_int)
                 if arr is None or base is None:
                     ratios[gwl] = None
                     continue
@@ -873,16 +930,7 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     # SWED and SWBD are now full, independently-readable panels.
     all_letters = [chr(ord("a") + k) for k in range(2 * (n_rows + 1))]
 
-    ax_map_swed, _ = swed_mod._add_locator_map(fig, gs[0, 0], zone_order)
-    ax_map_swbd = _add_region_zone_map(fig, gs[0, 1], regions_shapefile, zone_of_poly)
-    for ax_map, label in ((ax_map_swed, "SWED"), (ax_map_swbd, "SWBD (region attribution)")):
-        bbox = ax_map.get_position()
-        fig.text((bbox.x0 + bbox.x1) / 2, bbox.y1 + 0.012, label, ha="center", va="bottom",
-                  fontsize=swed_mod.ZONE_TITLE_FONTSIZE, fontweight="bold")
-    for ax_map, letter in ((ax_map_swed, all_letters[0]), (ax_map_swbd, all_letters[1])):
-        bbox = ax_map.get_position()
-        fig.text(bbox.x0 - 0.02, bbox.y1 + 0.012, letter, ha="left", va="bottom",
-                  fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
+    _add_map_row(fig, gs, zone_order, regions_shapefile, zone_of_poly, all_letters)
 
     for i, zlabel in enumerate(zone_order):
         pct = land_area_pct.get(zlabel)
@@ -998,16 +1046,7 @@ def plot_swed_swbd_distributions_split(swed_counts_df, swbd_counts_df, land_area
 
     all_letters = [chr(ord("a") + k) for k in range(2 * (n_rows + 1))]
 
-    ax_map_swed, _ = swed_mod._add_locator_map(fig, gs[0, 0], zone_order)
-    ax_map_swbd = _add_region_zone_map(fig, gs[0, 1], regions_shapefile, zone_of_poly)
-    for ax_map, label in ((ax_map_swed, "SWED"), (ax_map_swbd, "SWBD (region attribution)")):
-        bbox = ax_map.get_position()
-        fig.text((bbox.x0 + bbox.x1) / 2, bbox.y1 + 0.012, label, ha="center", va="bottom",
-                  fontsize=swed_mod.ZONE_TITLE_FONTSIZE, fontweight="bold")
-    for ax_map, letter in ((ax_map_swed, all_letters[0]), (ax_map_swbd, all_letters[1])):
-        bbox = ax_map.get_position()
-        fig.text(bbox.x0 - 0.02, bbox.y1 + 0.012, letter, ha="left", va="bottom",
-                  fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
+    _add_map_row(fig, gs, zone_order, regions_shapefile, zone_of_poly, all_letters)
 
     for i, zlabel in enumerate(zone_order):
         pct = land_area_pct.get(zlabel)
@@ -1059,39 +1098,11 @@ def plot_swed_swbd_distributions_split(swed_counts_df, swbd_counts_df, land_area
                     spine.set_linewidth(0.4)
 
             if do_split:
-                ax_main.axvline(duration_split_day, color=swed_mod.DURATION_SPLIT_LINE_COLOR,
-                                 linewidth=0.8, linestyle="-", zorder=1)
                 ax_main.set_xlim(0.5, duration_split_day + 0.5)
                 ax_zoom.set_xlim(duration_split_day - 0.5, max_duration_days + 0.5)
                 ax_main.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
                 ax_zoom.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True, nbins=6))
-                # Persistent-event sub-panel's y-axis on the right, matching
-                # fig_duration_distribution_latitude.py's own broken-axis
-                # convention -- reads as clearly distinct from the short-term
-                # sub-panel's left-side labels rather than a missing duplicate.
-                ax_zoom.yaxis.tick_right()
-
-                d = 0.02  # half-length (axes fraction) of each diagonal break mark
-                break_kwargs = dict(color="black", linewidth=0.8, clip_on=False, zorder=5)
-                for y0 in (0, 1):
-                    ax_main.plot((1 - d, 1 + d), (y0 - d, y0 + d),
-                                 transform=ax_main.transAxes, **break_kwargs)
-                    ax_zoom.plot((-d, d), (y0 - d, y0 + d),
-                                 transform=ax_zoom.transAxes, **break_kwargs)
-                # Dotted bridge from the split day in the main sub-panel (at
-                # the zoomed sub-panel's own y-min/y-max) to the zoomed
-                # sub-panel's top-left/bottom-left corners, so the break
-                # reads as a continuation of the same curves rather than two
-                # unrelated plots.
-                for y_zoom, y_frac_zoom in ((zoom_ylim[1], 1), (zoom_ylim[0], 0)):
-                    y_anchor = min(max(y_zoom, main_ylim[0]), main_ylim[1])
-                    zoom_link = ConnectionPatch(
-                        xyA=(duration_split_day, y_anchor), coordsA=ax_main.transData,
-                        xyB=(0, y_frac_zoom), coordsB=ax_zoom.transAxes,
-                        color=swed_mod.DURATION_SPLIT_LINE_COLOR, linewidth=0.7,
-                        linestyle=":", zorder=1,
-                    )
-                    fig.add_artist(zoom_link)
+                _add_split_break(fig, ax_main, ax_zoom, main_ylim, zoom_ylim, duration_split_day)
             else:
                 ax_main.set_xlim(0.5, max_duration_days + 0.5)
                 ax_main.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
