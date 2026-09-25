@@ -249,7 +249,7 @@ def plot_red_period_change(
             ax.annotate(
                 f"$\\mathbf{{{panellabels[r * 3 + c]}}}$",
                 xy=(0.02, 1.02), xycoords="axes fraction",
-                ha="left", va="bottom", fontsize=6,
+                ha="left", va="bottom", fontsize=8,
                 path_effects=[withStroke(linewidth=1.5, foreground="white")],
             )
             if r == 0:

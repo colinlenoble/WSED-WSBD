@@ -497,7 +497,7 @@ def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
         ax.annotate(
             f"$\\mathbf{{{panel_letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=title_fontsize,
+            ha="left", va="bottom", fontsize=8,
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
     if title:
@@ -595,6 +595,20 @@ def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
         ratio = supply.abs().mean() / demand.abs().mean()
         print(f"  [INFO] {gwl_label}: avg |supply effect| / avg |demand effect| "
               f"(days of baseline demand) = {ratio:.3f}")
+
+
+def _print_combined_effect_direction_stats(df_gwl, gwl_label, share_re="current"):
+    """Diagnostic across all polygons at a given GWL: how many regions have a
+    positive (increasing) vs. negative (decreasing) flat multi-model-mean
+    Combined_Effect -- SWBDs change relative to 0.61 C, same metric/weighting
+    as plot_main_gwl_maps -- out of how many regions have a finite value."""
+    combined = (_mmm_combined(df_gwl, share_re, vmax=None)["Combined_Effect"]
+                .replace([np.inf, -np.inf], np.nan).dropna())
+    n_total = len(combined)
+    n_up    = int((combined > 0).sum())
+    n_down  = int((combined < 0).sum())
+    print(f"  [INFO] {gwl_label}: multi-model mean SWBDs increasing in "
+          f"{n_up}/{n_total} regions, decreasing in {n_down}/{n_total}")
 
 
 # =============================================================================
@@ -735,6 +749,8 @@ def plot_main_gwl_maps(df_gwl15, df_gwl2, df_gwl3,
                        shapefile_path, hatch_df, output_dir,
                        dpi=300, share_re="current"):
     cmap, norm = _make_cmap(vmin=-100, vmax=800)
+    for df_gwl, gwl_label in ((df_gwl15, "1.5°C"), (df_gwl2, "2°C"), (df_gwl3, "3°C")):
+        _print_combined_effect_direction_stats(df_gwl, gwl_label, share_re)
     fig = _three_panel_map(
         df_gwl15, df_gwl2, df_gwl3, shapefile_path, hatch_df, cmap, norm,
         value_fn=_mmm_combined, value_col="Combined_Effect",
@@ -1483,7 +1499,7 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
             ax.annotate(
                 f"$\\mathbf{{{letter}}}$",
                 xy=(0.02, 1.10), xycoords="axes fraction",
-                ha="left", va="bottom", fontsize=5.5, color=title_color,
+                ha="left", va="bottom", fontsize=8, color=title_color,
                 clip_on=False,
             )
             ax.text(0.5, 1.10, label, transform=ax.transAxes,
@@ -1504,7 +1520,7 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.10), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=5.5, color=title_color,
+            ha="left", va="bottom", fontsize=8, color=title_color,
             clip_on=False,
         )
         ax.text(0.5, 1.10, label, transform=ax.transAxes,
@@ -1660,7 +1676,7 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
             ax.annotate(
                 f"$\\mathbf{{{letter}}}$",
                 xy=(0.02, 1.10), xycoords="axes fraction",
-                ha="left", va="bottom", fontsize=5.5, color=title_color,
+                ha="left", va="bottom", fontsize=8, color=title_color,
                 clip_on=False,
             )
             ax.text(0.5, 1.10, label, transform=ax.transAxes,
@@ -1681,7 +1697,7 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.10), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=5.5, color=title_color,
+            ha="left", va="bottom", fontsize=8, color=title_color,
             clip_on=False,
         )
         ax.text(0.5, 1.10, label, transform=ax.transAxes,
@@ -2064,7 +2080,7 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
             ax.annotate(
                 f"$\\mathbf{{{PANEL_LETTERS[panel]}}}$",
                 xy=(0.02, 1.02), xycoords="axes fraction",
-                ha="left", va="bottom", fontsize=6,
+                ha="left", va="bottom", fontsize=8,
                 path_effects=[withStroke(linewidth=1.5, foreground="white")],
             )
             ax.set_title(
@@ -2097,6 +2113,87 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
                       borderpad=0.4)
     _save_fig(fig, os.path.join(output_dir, "supp",
                                 f"suppfig_re_share_effect.png"), dpi)
+
+
+def plot_re_share_effect_absolute(gwl_dfs_by_share, shapefile_path, hatch_df,
+                                  output_dir, tag, dpi=300):
+    """Same 3x3 grid layout as plot_re_share_effect, but each panel plots the
+    absolute change in cumulative residual load (GWL - GWL0.61) normalized by
+    each region's non-thermosensitive baseline demand (_mmm_absolute_days),
+    so the anomaly reads in "days of baseline demand" instead of percent --
+    see plot_main_gwl_maps_absolute for the analogous main-figure twin."""
+    TOT_RE_VALS   = [0.25, 0.5, 0.75]
+    GWL_TITLES    = ["1.5°C", "2.0°C", "3.0°C"]
+    PANEL_LETTERS = list("abcdefghi")
+
+    abs_vals = []
+    for tot_re in TOT_RE_VALS:
+        for gwl_idx in [0, 1, 2]:
+            eff = (_mmm_absolute_days(gwl_dfs_by_share[tot_re][gwl_idx], share_re="current")
+                   ["Absolute_Days"].replace([np.inf, -np.inf], np.nan).dropna())
+            if len(eff):
+                abs_vals.append(np.abs(eff.values))
+    vmax_days = (max(1.0, np.ceil(np.nanpercentile(np.concatenate(abs_vals), 95)))
+                 if abs_vals else 1.0)
+    cmap = plt.get_cmap("RdYlGn_r")
+    norm = mcolors.TwoSlopeNorm(vmin=-vmax_days, vcenter=0, vmax=vmax_days)
+
+    fig_w = FIG_WIDTH_IN
+    fig_h = fig_w * ((5.2 * 3 + 1.4) / (8.5 * 3)) * 1.35
+    fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+    gs    = fig.add_gridspec(3, 3, hspace=0.30, wspace=0.04,
+                             left=0.02, right=0.99, top=0.92, bottom=0.09)
+
+    gdf_base = gpd.read_file(shapefile_path)
+    gdf_base["poly_idx"] = gdf_base.index
+
+    panel = 0
+    for row, gwl_idx in enumerate([0, 1, 2]):
+        for col, tot_re in enumerate(TOT_RE_VALS):
+            ax     = fig.add_subplot(gs[row, col], projection=ccrs.EqualEarth())
+            df_gwl = gwl_dfs_by_share[tot_re][gwl_idx]
+            mmm    = _mmm_absolute_days(df_gwl, share_re="current")
+            gdf    = gdf_base.copy().merge(mmm, on="poly_idx", how="left")
+            gdf    = gdf.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
+            gdf["do_hatch"] = gdf["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
+            _draw_map(ax, gdf, "Absolute_Days", cmap, norm, hatch_df,
+                      title="", panel_letter="")
+            ax.annotate(
+                f"$\\mathbf{{{PANEL_LETTERS[panel]}}}$",
+                xy=(0.02, 1.02), xycoords="axes fraction",
+                ha="left", va="bottom", fontsize=8,
+                path_effects=[withStroke(linewidth=1.5, foreground="white")],
+            )
+            ax.set_title(
+                f"GWL {GWL_TITLES[row]}\nRenewable penetration: {int(tot_re * 100)}%",
+                fontsize=6, pad=4,
+            )
+            panel += 1
+
+    cbar_ax = fig.add_axes([0.25, 0.045, 0.50, 0.018])
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", extend="both")
+    cbar.set_label("Combined effect on SWBDs (days of baseline demand)", fontsize=6)
+    cbar.ax.tick_params(labelsize=5)
+
+    fig.text(0.5, 0.980, "Effect of renewable penetration level on SWBDs",
+             ha="center", va="top", fontsize=8, fontweight="bold")
+    fig.text(0.5, 0.948, "Multi-model mean, current mix, threshold = 0.99",
+             ha="center", va="top", fontsize=6, style="italic", color="#444444")
+
+    legend_handles = [
+        Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
+        Patch(facecolor="none", edgecolor="black", hatch="/" * 21,
+              label="Low model agreement"),
+    ]
+    last_panel = fig.axes[8]
+    last_panel.legend(handles=legend_handles, loc="upper center",
+                      bbox_to_anchor=(0.5, -0.08), bbox_transform=last_panel.transAxes,
+                      fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4,
+                      borderpad=0.4)
+    _save_fig(fig, os.path.join(output_dir, "supp",
+                                f"suppfig_re_share_effect_absolute_days.png"), dpi)
 
 
 # =============================================================================
@@ -2200,7 +2297,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     ax_c.annotate(
         "$\\mathbf{a}$",
         xy=(0.02, 1.02), xycoords="axes fraction",
-        ha="left", va="bottom", fontsize=6,
+        ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_c.set_title("Driver decomposition:\nRE share of absolute effect",
@@ -2258,7 +2355,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     ax_d.annotate(
         "$\\mathbf{d}$",
         xy=(0.02, 1.02), xycoords="axes fraction",
-        ha="left", va="bottom", fontsize=6,
+        ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_d.set_title("Uncertainty decomposition:\nRE share of inter-model spread",
@@ -2279,6 +2376,190 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
 
     _save_fig(fig, os.path.join(output_dir, "supp",
                                 "suppfig_combined_driver_effects.png"), dpi)
+
+
+def plot_supp_combined_driver_effects_absolute(df_gwl2, shapefile_path, hatch_df,
+                                               output_dir, share_re="current", dpi=300):
+    """Same 2x2 layout as plot_supp_combined_driver_effects, but panels a/b
+    (RE supply / demand effect) plot the absolute change in cumulative
+    residual load normalized by each region's baseline demand
+    (_mmm_supply_days/_mmm_demand_days) instead of percent change, so they
+    read in "days of baseline demand" -- see plot_main_gwl_maps_absolute for
+    the analogous main-figure twin. Panels c/d (driver and uncertainty
+    decomposition) already plot unitless ratios of raw model differences,
+    not percent, so they are unchanged from plot_supp_combined_driver_effects."""
+    proj  = ccrs.EqualEarth()
+    fig_w = FIG_WIDTH_IN
+    fig_h = fig_w * (12 / 20)
+    fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+    gs    = fig.add_gridspec(2, 2, hspace=0.70, wspace=0.18)
+    ax_a  = fig.add_subplot(gs[0, 1], projection=proj)
+    ax_b  = fig.add_subplot(gs[1, 0], projection=proj)
+    ax_c  = fig.add_subplot(gs[0, 0], projection=proj)
+    ax_d  = fig.add_subplot(gs[1, 1], projection=proj)
+
+    # Panel a: RE supply effect (days of baseline demand)
+    eff_re  = (_mmm_supply_days(df_gwl2, share_re)["Supply_Days"]
+              .replace([np.inf, -np.inf], np.nan).dropna())
+    vmax_re = max(1.0, np.ceil(np.nanpercentile(np.abs(eff_re.values), 95))) if len(eff_re) else 1.0
+    cmap_re = plt.get_cmap("RdYlGn_r")
+    norm_re = mcolors.TwoSlopeNorm(vmin=-vmax_re, vcenter=0, vmax=vmax_re)
+    gdf_re  = _build_gdf(shapefile_path, _mmm_supply_days(df_gwl2, share_re), hatch_df)
+    _draw_map(ax_a, gdf_re, "Supply_Days", cmap_re, norm_re, hatch_df,
+              "RE supply effect\n— 2.0°C warming", "b", title_fontsize=6)
+    sm_a = plt.cm.ScalarMappable(cmap=cmap_re, norm=norm_re)
+    sm_a.set_array([])
+    cb_a = fig.colorbar(sm_a, ax=ax_a, orientation="horizontal",
+                        fraction=0.046, pad=0.04, extend="both")
+    cb_a.set_label("RE supply effect on SWBDs (days of baseline demand)", fontsize=6)
+    cb_a.ax.tick_params(labelsize=5)
+    cb_a.outline.set_linewidth(0.4)
+
+    # Panel b: Demand (TAS) effect (days of baseline demand)
+    eff_tas  = (_mmm_demand_days(df_gwl2, share_re)["Demand_Days"]
+               .replace([np.inf, -np.inf], np.nan).dropna())
+    vmax_tas = max(1.0, np.ceil(np.nanpercentile(np.abs(eff_tas.values), 95))) if len(eff_tas) else 1.0
+    cmap_tas = plt.get_cmap("RdYlBu_r")
+    norm_tas = mcolors.TwoSlopeNorm(vmin=-vmax_tas, vcenter=0, vmax=vmax_tas)
+    gdf_tas  = _build_gdf(shapefile_path, _mmm_demand_days(df_gwl2, share_re), hatch_df)
+    _draw_map(ax_b, gdf_tas, "Demand_Days", cmap_tas, norm_tas, hatch_df,
+              "Demand effect\n— 2.0°C warming", "c", title_fontsize=6)
+    sm_b = plt.cm.ScalarMappable(cmap=cmap_tas, norm=norm_tas)
+    sm_b.set_array([])
+    cb_b = fig.colorbar(sm_b, ax=ax_b, orientation="horizontal",
+                        fraction=0.046, pad=0.04, extend="both")
+    cb_b.set_label("Demand effect on SWBDs (days of baseline demand)", fontsize=6)
+    cb_b.ax.tick_params(labelsize=5)
+    cb_b.outline.set_linewidth(0.4)
+
+    cmap_ratio = plt.get_cmap("PiYG_r")
+    norm_ratio = mcolors.Normalize(vmin=0, vmax=1)
+    gdf_base   = gpd.read_file(shapefile_path)
+    gdf_base["poly_idx"] = gdf_base.index
+
+    # Panel c: Driver decomposition (unchanged -- already a unitless ratio)
+    df_dec = df_gwl2[df_gwl2["share_re"] == share_re].copy()
+    df_dec = (df_dec[["poly_idx", "GCM", "cum_rl_ref", "cum_rl_ds_cf", "cum_rl_gwl"]]
+              .groupby(["GCM", "poly_idx"]).mean().reset_index()
+              .groupby("poly_idx")
+              .agg({"cum_rl_ref": "mean", "cum_rl_ds_cf": "mean", "cum_rl_gwl": "mean"})
+              .reset_index())
+    df_dec["RE_eff"]  = np.abs(df_dec["cum_rl_ds_cf"] - df_dec["cum_rl_ref"])
+    df_dec["TAS_eff"] = np.abs(df_dec["cum_rl_gwl"] - df_dec["cum_rl_ref"])
+    df_dec["ratio"]   = df_dec["RE_eff"] / (df_dec["RE_eff"] + df_dec["TAS_eff"])
+
+    gdf_c = (gdf_base.copy()
+             .merge(df_dec[["poly_idx", "ratio"]], on="poly_idx", how="left")
+             .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
+    gdf_c["do_hatch"] = gdf_c["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
+    gdf_c = gdf_c.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
+    vals_c   = gdf_c["ratio"].to_numpy()
+    nan_c    = ~np.isfinite(vals_c)
+    fcs_c    = [(1.0, 1.0, 1.0, 1.0) if n else cmap_ratio(norm_ratio(v))
+                for v, n in zip(vals_c, nan_c)]
+    hpats_c = np.where(gdf_c["do_hatch"].to_numpy(), "/" * 21, "")
+    ax_c.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15, zorder=1)
+    for geom, fc, hp, is_nan in zip(gdf_c.geometry, fcs_c, hpats_c, nan_c):
+        if geom is None:
+            continue
+        ax_c.add_geometries([geom], crs=ccrs.PlateCarree(),
+                            facecolor=fc, edgecolor="black", linewidth=0.15, zorder=2)
+        if is_nan:
+            ax_c.add_geometries([geom], crs=ccrs.PlateCarree(),
+                                facecolor="none", edgecolor="black",
+                                linewidth=0.0, hatch="\\" * 10, zorder=3)
+        if hp:
+            ax_c.add_geometries([geom], crs=ccrs.PlateCarree(),
+                                facecolor="none", edgecolor="black",
+                                linewidth=0.0, hatch=hp, zorder=4)
+    ax_c.set_global()
+    mask_poles(ax_c)
+    try:
+        ax_c.spines["geo"].set_visible(False)
+    except KeyError:
+        ax_c.outline_patch.set_visible(False)
+    ax_c.annotate(
+        "$\\mathbf{a}$",
+        xy=(0.02, 1.02), xycoords="axes fraction",
+        ha="left", va="bottom", fontsize=8,
+        path_effects=[withStroke(linewidth=1.5, foreground="white")],
+    )
+    ax_c.set_title("Driver decomposition:\nRE share of absolute effect",
+                   fontsize=6, pad=4)
+    sm_c = plt.cm.ScalarMappable(cmap=cmap_ratio, norm=norm_ratio)
+    sm_c.set_array([])
+    cb_c = fig.colorbar(sm_c, ax=ax_c, orientation="horizontal",
+                        fraction=0.046, pad=0.04)
+    cb_c.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
+    cb_c.set_label("RE supply contribution to total driver effect", fontsize=6)
+    cb_c.ax.tick_params(labelsize=5)
+    cb_c.outline.set_linewidth(0.4)
+
+    # Panel d: Uncertainty decomposition (unchanged -- already a unitless ratio)
+    df_unc = df_gwl2[df_gwl2["share_re"] == share_re].copy()
+    df_unc["RE_Effect"]   = df_unc["cum_rl_ds_cf"] - df_unc["cum_rl_ref"]
+    df_unc["Temp_Effect"] = df_unc["cum_rl_gwl"] - df_unc["cum_rl_ref"]
+    df_unc = (df_unc[["poly_idx", "GCM", "RE_Effect", "Temp_Effect"]]
+              .groupby(["GCM", "poly_idx"]).mean().reset_index()
+              .groupby("poly_idx")
+              .agg({"RE_Effect": "std", "Temp_Effect": "std"}).reset_index()
+              .rename(columns={"RE_Effect": "RE_Std", "Temp_Effect": "Temp_Std"}))
+    df_unc["ratio"] = df_unc["RE_Std"] / (df_unc["RE_Std"] + df_unc["Temp_Std"])
+
+    gdf_d = (gdf_base.copy()
+             .merge(df_unc[["poly_idx", "ratio"]], on="poly_idx", how="left")
+             .merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left"))
+    gdf_d["do_hatch"] = gdf_d["var"].le(config.AGREEMENT_THRESHOLD).fillna(False) & config.SHOW_AGREEMENT_HATCHING
+    gdf_d = gdf_d.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
+    vals_d   = gdf_d["ratio"].to_numpy()
+    nan_d    = ~np.isfinite(vals_d)
+    fcs_d    = [(1.0, 1.0, 1.0, 1.0) if n else cmap_ratio(norm_ratio(v))
+                for v, n in zip(vals_d, nan_d)]
+    hpats_d = np.where(gdf_d["do_hatch"].to_numpy(), "/" * 21, "")
+    ax_d.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15, zorder=1)
+    for geom, fc, hp, is_nan in zip(gdf_d.geometry, fcs_d, hpats_d, nan_d):
+        if geom is None:
+            continue
+        ax_d.add_geometries([geom], crs=ccrs.PlateCarree(),
+                            facecolor=fc, edgecolor="black", linewidth=0.15, zorder=2)
+        if is_nan:
+            ax_d.add_geometries([geom], crs=ccrs.PlateCarree(),
+                                facecolor="none", edgecolor="black",
+                                linewidth=0.0, hatch="\\" * 10, zorder=3)
+        if hp:
+            ax_d.add_geometries([geom], crs=ccrs.PlateCarree(),
+                                facecolor="none", edgecolor="black",
+                                linewidth=0.0, hatch=hp, zorder=4)
+    ax_d.set_global()
+    mask_poles(ax_d)
+    try:
+        ax_d.spines["geo"].set_visible(False)
+    except KeyError:
+        ax_d.outline_patch.set_visible(False)
+    ax_d.annotate(
+        "$\\mathbf{d}$",
+        xy=(0.02, 1.02), xycoords="axes fraction",
+        ha="left", va="bottom", fontsize=8,
+        path_effects=[withStroke(linewidth=1.5, foreground="white")],
+    )
+    ax_d.set_title("Uncertainty decomposition:\nRE share of inter-model spread",
+                   fontsize=6, pad=4)
+    sm_d = plt.cm.ScalarMappable(cmap=cmap_ratio, norm=norm_ratio)
+    sm_d.set_array([])
+    cb_d = fig.colorbar(sm_d, ax=ax_d, orientation="horizontal",
+                        fraction=0.046, pad=0.04)
+    cb_d.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
+    cb_d.set_label("RE supply std / (RE supply std + demand std)", fontsize=6)
+    cb_d.ax.tick_params(labelsize=5)
+    cb_d.outline.set_linewidth(0.4)
+    fig.legend(handles=[
+        Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
+        Patch(facecolor="none", edgecolor="black", hatch="/" * 21, label="Low model agreement"),
+    ], ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.52), bbox_transform=fig.transFigure,
+       fontsize=4, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
+
+    _save_fig(fig, os.path.join(output_dir, "supp",
+                                "suppfig_combined_driver_effects_absolute_days.png"), dpi)
 
 
 # =============================================================================
@@ -2417,6 +2698,8 @@ def main():
         #                    args.output_dir, tag, "current", dpi=args.dpi)
         plot_supp_combined_driver_effects(df_gwl2, PATHS["shapefile"], hatch_df,
                                           args.output_dir, share_re="current", dpi=args.dpi)
+        plot_supp_combined_driver_effects_absolute(df_gwl2, PATHS["shapefile"], hatch_df,
+                                                    args.output_dir, share_re="current", dpi=args.dpi)
         # plot_supp_re_variability(df_gwl2, PATHS["shapefile"], hatch_df,
         #                          args.output_dir, tag, "current", dpi=args.dpi)
 
@@ -2435,6 +2718,8 @@ def main():
         }
         plot_re_share_effect(gwl_dfs_by_share, PATHS["shapefile"], hatch_df,
                              args.output_dir, "re_share_effect", dpi=args.dpi)
+        plot_re_share_effect_absolute(gwl_dfs_by_share, PATHS["shapefile"], hatch_df,
+                                      args.output_dir, "re_share_effect", dpi=args.dpi)
 
     print("\nDone.")
 

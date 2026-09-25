@@ -115,7 +115,7 @@ REFERENCE = "default"
 # =============================================================================
 FIG_WIDTH_IN = 5.15          # LaTeX single-column width, matches fig1.FIG_WIDTH_IN
 SUPTITLE_FONTSIZE = 8
-PANEL_LETTER_FONTSIZE = 7
+PANEL_LETTER_FONTSIZE = 8
 AXIS_LABEL_FONTSIZE = 6
 TICK_FONTSIZE = 5
 LEGEND_FONTSIZE = 6

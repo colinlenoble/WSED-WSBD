@@ -74,8 +74,9 @@ import cartopy.crs as ccrs
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 from matplotlib.lines import Line2D
+from matplotlib.patches import ConnectionPatch
 
 # Reused rather than duplicated: SWED cache + shared constants/helpers (zone
 # edges, GWL colors, the locator map, the equal-GCM-weighted pooling
@@ -100,6 +101,14 @@ SWBD_MAIN_MIX    = "current"
 # period (see fig_duration_distribution_latitude.py's own GWL0-61 handling).
 BASELINE_GWL  = "GWL0-61"
 RATIO_YLABEL  = "Ratio nb of events\nat each GWL divided\nby reference 0.61°C"
+
+# Day at which plot_swed_swbd_distributions_split breaks each panel into a
+# wide "short term" sub-panel (duration <= DURATION_SPLIT_DAY, own y-range
+# tight around ratio=1) and a narrower "persistent event" sub-panel
+# (duration > DURATION_SPLIT_DAY, own wider y-range) -- same broken-axis
+# convention/day as fig_duration_distribution_latitude.py's own
+# DURATION_SPLIT_DAY, reused here via swed_mod rather than duplicated.
+DURATION_SPLIT_DAY_DEFAULT = swed_mod.DURATION_SPLIT_DAY
 
 
 # =============================================================================
@@ -151,6 +160,18 @@ def parse_args():
                          help="Path to this script's own SWBD counts cache CSV (default: "
                               "<output_dir>/swbd_duration_counts_cache.csv).")
     parser.add_argument("--recompute_swbd", action="store_true", default=False)
+    parser.add_argument("--geometry_cache_json", default=None,
+                         help="Path to this script's own region/zone-geometry cache JSON "
+                              "(land_area_pct + zone_of_poly + area_of_poly -- see "
+                              "save_geometry_cache/load_geometry_cache). Default: "
+                              "<output_dir>/swed_swbd_geometry_cache.json. Together with "
+                              "--swed_cache_csv/--swbd_cache_csv, lets the whole figure be "
+                              "rebuilt purely from cache -- no --regions_shapefile/"
+                              "--shapefile/--era5_grid_path access needed -- once all three "
+                              "caches exist, e.g. for iterating on the plot locally.")
+    parser.add_argument("--recompute_geometry", action="store_true", default=False,
+                         help="Ignore any existing geometry cache and rebuild region/zone "
+                              "assignment + land-area shares from the raw shapefiles/ERA5 grid.")
     parser.add_argument("--output_dir", default="../final_figs")
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--max_duration_days", type=float, default=12.0,
@@ -160,6 +181,11 @@ def parse_args():
                               "per-duration GWL/baseline ratio is built from too few "
                               "events per zone to be meaningful).")
     parser.add_argument("--min_events", type=int, default=5)
+    parser.add_argument("--duration_split_day", type=float, default=DURATION_SPLIT_DAY_DEFAULT,
+                         help="Day at which plot_swed_swbd_distributions_split's broken-axis "
+                              f"panels split short-term from persistent events (default: "
+                              f"{DURATION_SPLIT_DAY_DEFAULT:g}, matching "
+                              "fig_duration_distribution_latitude.py's own DURATION_SPLIT_DAY).")
     return parser.parse_args()
 
 
@@ -402,6 +428,70 @@ def load_swbd_counts_cache(path, thr, tot_re, mix, ssp, suffix_shp):
 
 
 # =============================================================================
+# Region/zone-geometry cache: land_area_pct + zone_of_poly + area_of_poly --
+# the other "raw data" this figure needs besides the two counts caches above.
+# Unlike those (one row per gwl/GCM/run/..., naturally a CSV), these three
+# are small dicts/one dict, so a single JSON file holds all three plus a
+# metadata block, same "check metadata before trusting the cache" convention
+# as save_counts_cache/save_swbd_counts_cache. Once this cache and both
+# counts caches exist, the whole figure can be rebuilt with no
+# --regions_shapefile/--shapefile/--era5_grid_path access at all -- e.g. to
+# tweak plot_swed_swbd_distributions[_split] locally without the HPC-only
+# preprocessed archive or even the (much smaller, but not always at hand)
+# shapefiles.
+# =============================================================================
+
+def _geometry_cache_meta(regions_shapefile, shapefile, era5_grid_path):
+    return {
+        "regions_shapefile": os.path.abspath(regions_shapefile),
+        "shapefile": os.path.abspath(shapefile),
+        "era5_grid_path": os.path.abspath(era5_grid_path) if era5_grid_path else None,
+        "lat_zone_edges": swed_mod.LAT_ZONE_EDGES,
+    }
+
+
+def save_geometry_cache(path, land_area_pct, zone_of_poly, area_of_poly, meta):
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    payload = {
+        "meta": meta,
+        "land_area_pct": land_area_pct,
+        # JSON object keys must be strings -- poly_idx (int) is restored on load.
+        "zone_of_poly": {str(k): v for k, v in zone_of_poly.items()},
+        "area_of_poly": {str(k): v for k, v in area_of_poly.items()},
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f)
+
+
+def load_geometry_cache(path, meta):
+    """
+    Returns (land_area_pct, zone_of_poly, area_of_poly) if `path` exists and
+    was built with the same regions_shapefile/shapefile/era5_grid_path/
+    lat_zone_edges as `meta`; otherwise None (caller falls back to rebuilding
+    from the raw shapefiles/ERA5 grid). Same stale/foreign-cache guard
+    convention as load_counts_cache/load_swbd_counts_cache.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        print(f"  [cache] {path} is not readable JSON -- ignoring.")
+        return None
+    if payload.get("meta") != meta:
+        print(f"  [cache] {path} was built with different settings {payload.get('meta')} "
+              f"than requested {meta} -- ignoring and rebuilding.")
+        return None
+    land_area_pct = payload["land_area_pct"]
+    zone_of_poly = {int(k): v for k, v in payload["zone_of_poly"].items()}
+    area_of_poly = {int(k): v for k, v in payload["area_of_poly"].items()}
+    return land_area_pct, zone_of_poly, area_of_poly
+
+
+# =============================================================================
 # Two-level pooling: equal-GCM-weighted per region, then area-weighted across
 # a zone's regions
 # =============================================================================
@@ -547,6 +637,80 @@ def _drop_isolated_points(arr):
     return out
 
 
+def _gather_ratio_panel_data(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
+                              gwl_list, x_int, zone_order, min_events=5):
+    """
+    Pass-1 gather shared by plot_swed_swbd_distributions and
+    plot_swed_swbd_distributions_split: for every (zone, {SWED, SWBD}) panel,
+    each non-baseline GWL's duration-share ratio to the GWL0-61 baseline
+    (see the two functions' own docstrings for what the ratio means and how
+    gaps/isolated points are handled). Returns (panel_data, ratio_gwls) --
+    panel_data[col] is a list, one dict per zone in zone_order, each holding
+    {"ratios": {gwl: arr_or_None}}.
+    """
+    ratio_gwls = [g for g in gwl_list if g != BASELINE_GWL]
+
+    def _swed_share(gwl, zlabel):
+        group = swed_mod._group_counts(swed_counts_df, gwl, zlabel, x_int)
+        if group is None:
+            return None
+        arr_share, _, _, _, raw_total = group
+        return arr_share if raw_total >= min_events else None
+
+    def _swbd_share(gwl, zlabel):
+        return zone_group_counts_swbd(
+            swbd_counts_df, gwl, zlabel, zone_of_poly, area_of_poly, x_int,
+            min_events=min_events)
+
+    share_fns = {"SWED": _swed_share, "SWBD": _swbd_share}
+
+    panel_data = {col: [] for col in share_fns}
+    for zlabel in zone_order:
+        for col, share_fn in share_fns.items():
+            base = share_fn(BASELINE_GWL, zlabel)
+            ratios = {}
+            for gwl in ratio_gwls:
+                arr = share_fn(gwl, zlabel)
+                if arr is None or base is None:
+                    ratios[gwl] = None
+                    continue
+                base_safe = np.where(base > 0, base, np.nan)
+                ratio = np.where(arr > 0, arr / base_safe, np.nan)
+                ratio = _drop_isolated_points(ratio)
+                ratios[gwl] = ratio if np.any(np.isfinite(ratio)) else None
+            panel_data[col].append({"ratios": ratios})
+    return panel_data, ratio_gwls
+
+
+def _shared_ratio_ylim_windows(panel_data, split_idx, outlier_pct=2.0, pad=1.08):
+    """
+    Twin of _shared_ratio_ylim for plot_swed_swbd_distributions_split's
+    broken-axis panels: two shared ranges instead of one -- (main_ylim,
+    zoom_ylim) -- computed separately over every panel's short-term window
+    (x_int[:split_idx], i.e. days 1..DURATION_SPLIT_DAY) and persistent
+    window (x_int[split_idx - 1:], i.e. DURATION_SPLIT_DAY..max_duration_days,
+    day DURATION_SPLIT_DAY itself repeated in both so the two sub-panels
+    visually connect -- same overlap convention as
+    fig_duration_distribution_latitude.py's plot_distributions). Each range
+    is otherwise identical in spirit to _shared_ratio_ylim (outlier-percentile
+    bound, folded around ratio=1, never narrower than a 4x/0.25x span) --
+    just scoped to its own window rather than the full duration range, so the
+    short-term sub-panel isn't stretched to fit the persistent tail's much
+    larger ratio swings.
+    """
+    main_arrays, zoom_arrays = [], []
+    for col in panel_data.values():
+        for row in col:
+            for arr in row["ratios"].values():
+                if arr is None:
+                    continue
+                main_arrays.append(arr[:split_idx])
+                zoom_arrays.append(arr[split_idx - 1:])
+    main_ylim = _shared_ratio_ylim(main_arrays, outlier_pct=outlier_pct, pad=pad)
+    zoom_ylim = _shared_ratio_ylim(zoom_arrays, outlier_pct=outlier_pct, pad=pad)
+    return main_ylim, zoom_ylim
+
+
 def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                                   zone_of_poly, area_of_poly, regions_shapefile,
                                   gwl_list, output_path, dpi=300,
@@ -580,21 +744,6 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     """
     x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
     zone_order = list(reversed(swed_mod.LAT_ZONE_LABELS))
-    ratio_gwls = [g for g in gwl_list if g != BASELINE_GWL]
-
-    def _swed_share(gwl, zlabel):
-        group = swed_mod._group_counts(swed_counts_df, gwl, zlabel, x_int)
-        if group is None:
-            return None
-        arr_share, _, _, _, raw_total = group
-        return arr_share if raw_total >= min_events else None
-
-    def _swbd_share(gwl, zlabel):
-        return zone_group_counts_swbd(
-            swbd_counts_df, gwl, zlabel, zone_of_poly, area_of_poly, x_int,
-            min_events=min_events)
-
-    share_fns = {"SWED": _swed_share, "SWBD": _swbd_share}
 
     # Pass 1: gather every panel's ratio curves up front, so the one shared
     # ratio y-axis can be fixed before anything is drawn. A duration with
@@ -603,21 +752,9 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     # gap, not dropped for the whole curve -- only points left isolated by
     # that gap (no valid neighbor on either side, so they'd draw as a
     # disconnected floating marker) are removed; see _drop_isolated_points.
-    panel_data = {col: [] for col in share_fns}
-    for zlabel in zone_order:
-        for col, share_fn in share_fns.items():
-            base = share_fn(BASELINE_GWL, zlabel)
-            ratios = {}
-            for gwl in ratio_gwls:
-                arr = share_fn(gwl, zlabel)
-                if arr is None or base is None:
-                    ratios[gwl] = None
-                    continue
-                base_safe = np.where(base > 0, base, np.nan)
-                ratio = np.where(arr > 0, arr / base_safe, np.nan)
-                ratio = _drop_isolated_points(ratio)
-                ratios[gwl] = ratio if np.any(np.isfinite(ratio)) else None
-            panel_data[col].append({"ratios": ratios})
+    panel_data, ratio_gwls = _gather_ratio_panel_data(
+        swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
+        gwl_list, x_int, zone_order, min_events=min_events)
 
     all_ratio_arrays = [arr for col in panel_data.values() for row in col
                          for arr in row["ratios"].values()]
@@ -653,7 +790,7 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
         zone_label_text = (f"{lat_range_text} ({pct:.1f}% of land area)" if pct is not None
                             else lat_range_text)
 
-        for j, col in enumerate(share_fns):
+        for j, col in enumerate(panel_data):
             row = panel_data[col][i]
             ax_left = fig.add_subplot(gs[i + 1, j])
 
@@ -709,6 +846,193 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     return fig
 
 
+def plot_swed_swbd_distributions_split(swed_counts_df, swbd_counts_df, land_area_pct,
+                                        zone_of_poly, area_of_poly, regions_shapefile,
+                                        gwl_list, output_path, dpi=300,
+                                        max_duration_days=12.0, min_events=5,
+                                        duration_split_day=DURATION_SPLIT_DAY_DEFAULT):
+    """
+    Broken-axis twin of plot_swed_swbd_distributions -- same data, same
+    2-column x 6-row layout, locator maps, ratio definition, gap/isolated-
+    point handling and GWL styling, but each of the 10 ratio panels is now
+    itself split into two side-by-side sub-panels (same convention as
+    fig_duration_distribution_latitude.py's plot_distributions main/zoom
+    split): a wide "short term" sub-panel (day 1..duration_split_day, ratios
+    that stay close to 1) and a narrower "persistent event" sub-panel
+    (duration_split_day..max_duration_days, where ratios can swing much
+    farther from 1). Each sub-panel type gets its own shared log-scale
+    y-range (_shared_ratio_ylim_windows) instead of the single figure-wide
+    range plot_swed_swbd_distributions uses -- so the short-term sub-panel
+    isn't stretched flat by whatever wide range the persistent tail needs,
+    and small near-1 differences between GWLs actually become visible. Day
+    duration_split_day is repeated at the start of the persistent sub-panel
+    (same overlap convention as the other file) so the break reads as a
+    continuation, reinforced by dotted connector lines and diagonal break
+    marks on both spines at the split.
+
+    Produces a second, independent output file -- plot_swed_swbd_distributions
+    itself is untouched, so the single-axis version stays available for
+    direct comparison against this split one.
+    """
+    x_int = np.arange(1, int(np.ceil(max_duration_days)) + 1)
+    zone_order = list(reversed(swed_mod.LAT_ZONE_LABELS))
+    split_idx = int(duration_split_day)  # x_int[:split_idx] == days 1..duration_split_day
+    do_split = max_duration_days > duration_split_day
+
+    panel_data, ratio_gwls = _gather_ratio_panel_data(
+        swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
+        gwl_list, x_int, zone_order, min_events=min_events)
+
+    if do_split:
+        main_ylim, zoom_ylim = _shared_ratio_ylim_windows(panel_data, split_idx)
+    else:
+        main_ylim = zoom_ylim = _shared_ratio_ylim(
+            [arr for col in panel_data.values() for row in col for arr in row["ratios"].values()])
+    main_yticks, zoom_yticks = _ratio_yticks(main_ylim), _ratio_yticks(zoom_ylim)
+
+    n_rows = len(zone_order)
+    fig = plt.figure(figsize=(swed_mod.FIG_WIDTH_IN * 1.55, swed_mod.FIG_WIDTH_IN * 1.75))
+    gs = GridSpec(n_rows + 1, 2, height_ratios=[0.8] + [1.0] * n_rows,
+                  left=0.11, right=0.97, top=0.93, bottom=0.09,
+                  hspace=0.65, wspace=0.30, figure=fig)
+
+    all_letters = [chr(ord("a") + k) for k in range(2 * (n_rows + 1))]
+
+    ax_map_swed, _ = swed_mod._add_locator_map(fig, gs[0, 0], zone_order)
+    ax_map_swbd = _add_region_zone_map(fig, gs[0, 1], regions_shapefile, zone_of_poly)
+    for ax_map, label in ((ax_map_swed, "SWED"), (ax_map_swbd, "SWBD (region attribution)")):
+        bbox = ax_map.get_position()
+        fig.text((bbox.x0 + bbox.x1) / 2, bbox.y1 + 0.012, label, ha="center", va="bottom",
+                  fontsize=swed_mod.ZONE_TITLE_FONTSIZE, fontweight="bold")
+    for ax_map, letter in ((ax_map_swed, all_letters[0]), (ax_map_swbd, all_letters[1])):
+        bbox = ax_map.get_position()
+        fig.text(bbox.x0 - 0.02, bbox.y1 + 0.012, letter, ha="left", va="bottom",
+                  fontsize=swed_mod.LETTER_FONTSIZE, fontweight="bold")
+
+    for i, zlabel in enumerate(zone_order):
+        pct = land_area_pct.get(zlabel)
+        lat_range_text = swed_mod._fmt_lat_range(zlabel)
+        zone_label_text = (f"{lat_range_text} ({pct:.1f}% of land area)" if pct is not None
+                            else lat_range_text)
+
+        for j, col in enumerate(panel_data):
+            row = panel_data[col][i]
+
+            if do_split:
+                inner_gs = GridSpecFromSubplotSpec(
+                    1, 2, subplot_spec=gs[i + 1, j],
+                    width_ratios=swed_mod.DURATION_ZOOM_WIDTH_RATIOS, wspace=0.08)
+                ax_main = fig.add_subplot(inner_gs[0])
+                # No sharey with ax_main: the persistent-event sub-panel gets
+                # its own (usually wider) shared range, computed separately
+                # by _shared_ratio_ylim_windows.
+                ax_zoom = fig.add_subplot(inner_gs[1])
+                windows = [(ax_main, slice(0, split_idx)), (ax_zoom, slice(split_idx - 1, None))]
+            else:
+                ax_main = fig.add_subplot(gs[i + 1, j])
+                ax_zoom = None
+                windows = [(ax_main, slice(None))]
+
+            for a, _sl in windows:
+                a.axhline(1.0, color="black", linewidth=0.8, linestyle="--", zorder=1)
+            for gwl in ratio_gwls:
+                arr = row["ratios"].get(gwl)
+                if arr is None:
+                    continue
+                color = swed_mod.GWL_COLORS.get(gwl, "gray")
+                for a, sl in windows:
+                    a.plot(x_int[sl], arr[sl], color=color, marker="o", markersize=2.2,
+                           linewidth=1.3, zorder=3)
+
+            for a, ylim, yticks in ((ax_main, main_ylim, main_yticks),
+                                     (ax_zoom, zoom_ylim, zoom_yticks)):
+                if a is None:
+                    continue
+                a.set_yscale("log")
+                a.set_ylim(*ylim)
+                a.set_yticks(yticks)
+                a.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(_ratio_tick_label))
+                a.yaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+                a.tick_params(labelsize=swed_mod.TICK_FONTSIZE)
+                a.grid(True, linestyle="--", alpha=0.3)
+                for spine in a.spines.values():
+                    spine.set_linewidth(0.4)
+
+            if do_split:
+                ax_main.axvline(duration_split_day, color=swed_mod.DURATION_SPLIT_LINE_COLOR,
+                                 linewidth=0.8, linestyle="-", zorder=1)
+                ax_main.set_xlim(0.5, duration_split_day + 0.5)
+                ax_zoom.set_xlim(duration_split_day - 0.5, max_duration_days + 0.5)
+                ax_main.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+                ax_zoom.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True, nbins=6))
+                # Persistent-event sub-panel's y-axis on the right, matching
+                # fig_duration_distribution_latitude.py's own broken-axis
+                # convention -- reads as clearly distinct from the short-term
+                # sub-panel's left-side labels rather than a missing duplicate.
+                ax_zoom.yaxis.tick_right()
+
+                d = 0.02  # half-length (axes fraction) of each diagonal break mark
+                break_kwargs = dict(color="black", linewidth=0.8, clip_on=False, zorder=5)
+                for y0 in (0, 1):
+                    ax_main.plot((1 - d, 1 + d), (y0 - d, y0 + d),
+                                 transform=ax_main.transAxes, **break_kwargs)
+                    ax_zoom.plot((-d, d), (y0 - d, y0 + d),
+                                 transform=ax_zoom.transAxes, **break_kwargs)
+                # Dotted bridge from the split day in the main sub-panel (at
+                # the zoomed sub-panel's own y-min/y-max) to the zoomed
+                # sub-panel's top-left/bottom-left corners, so the break
+                # reads as a continuation of the same curves rather than two
+                # unrelated plots.
+                for y_zoom, y_frac_zoom in ((zoom_ylim[1], 1), (zoom_ylim[0], 0)):
+                    y_anchor = min(max(y_zoom, main_ylim[0]), main_ylim[1])
+                    zoom_link = ConnectionPatch(
+                        xyA=(duration_split_day, y_anchor), coordsA=ax_main.transData,
+                        xyB=(0, y_frac_zoom), coordsB=ax_zoom.transAxes,
+                        color=swed_mod.DURATION_SPLIT_LINE_COLOR, linewidth=0.7,
+                        linestyle=":", zorder=1,
+                    )
+                    fig.add_artist(zoom_link)
+            else:
+                ax_main.set_xlim(0.5, max_duration_days + 0.5)
+                ax_main.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+
+            ax_main.spines["left"].set_color(swed_mod.ZONE_MAP_COLORS[zlabel])
+            ax_main.spines["left"].set_linewidth(2.2)
+
+            panel_letter = all_letters[2 + i * 2 + j]
+            ax_main.text(0.0, 1.05, panel_letter, transform=ax_main.transAxes,
+                         ha="left", va="bottom", fontsize=swed_mod.LETTER_FONTSIZE,
+                         fontweight="bold")
+            if j == 0:
+                ax_main.set_ylabel(RATIO_YLABEL, fontsize=swed_mod.AXIS_LABEL_FONTSIZE)
+                ax_main.text(0.13, 1.05, zone_label_text, transform=ax_main.transAxes,
+                             ha="left", va="bottom", fontsize=swed_mod.ZONE_TITLE_FONTSIZE,
+                             fontweight="bold", color=swed_mod.ZONE_MAP_COLORS[zlabel])
+            if i == n_rows - 1:
+                # Placed on the persistent-event sub-panel when split (its
+                # own axis, not shared with the short-term one) so the label
+                # doesn't have to describe both windows at once.
+                (ax_zoom if ax_zoom is not None else ax_main).set_xlabel(
+                    "Event duration (days)", fontsize=swed_mod.XLABEL_FONTSIZE)
+
+    gwl_handles = [
+        Line2D([0], [0], color=swed_mod.GWL_COLORS.get(gwl, "gray"), marker="o",
+               markersize=3, linewidth=1.6, label=swed_mod.GWL_LABELS.get(gwl, gwl))
+        for gwl in ratio_gwls
+    ]
+    baseline_label = swed_mod.GWL_LABELS.get(BASELINE_GWL, BASELINE_GWL)
+    extra_handles = [
+        Line2D([0], [0], color="black", linewidth=0.8, linestyle="--",
+               label=f"Ratio = 1 ({baseline_label})"),
+    ]
+    fig.legend(handles=gwl_handles + extra_handles, loc="lower center",
+               ncol=len(gwl_handles) + len(extra_handles), fontsize=swed_mod.LEGEND_FONTSIZE,
+               bbox_to_anchor=(0.5, 0.0), frameon=False, columnspacing=1.3, handlelength=1.8)
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return fig
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -718,20 +1042,29 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 60)
-    print("STEP 1 - Region -> latitude-zone assignment (max overlap) + area weights")
+    print("STEP 1/2 - Region/zone geometry: assignment + area weights + land area share")
     print("=" * 60)
-    zone_of_poly, area_of_poly = assign_regions_to_zones(args.regions_shapefile)
-    print(f"  {len(zone_of_poly)} regions assigned across "
-          f"{len(set(zone_of_poly.values()))} zones")
-
-    print("\n" + "=" * 60)
-    print("STEP 2 - SWED land area share per zone (ERA5 reference grid)")
-    print("=" * 60)
-    era5_lat, era5_lon = swed_mod.load_era5_reference_grid(
-        args.preprocessed_path, era5_grid_path=args.era5_grid_path)
-    land_area_pct = swed_mod.compute_land_area_share_per_zone(era5_lat, era5_lon, args.shapefile)
-    for z, pct in land_area_pct.items():
-        print(f"  {z}: {pct:.1f}% of land area")
+    geometry_cache_path = args.geometry_cache_json or os.path.join(
+        args.output_dir, "swed_swbd_geometry_cache.json")
+    geometry_meta = _geometry_cache_meta(args.regions_shapefile, args.shapefile, args.era5_grid_path)
+    cached_geometry = None if args.recompute_geometry else load_geometry_cache(
+        geometry_cache_path, geometry_meta)
+    if cached_geometry is not None:
+        land_area_pct, zone_of_poly, area_of_poly = cached_geometry
+        print(f"  Loaded cached geometry from {geometry_cache_path} -- skipping "
+              f"--regions_shapefile/--shapefile/--era5_grid_path access.")
+    else:
+        zone_of_poly, area_of_poly = assign_regions_to_zones(args.regions_shapefile)
+        print(f"  {len(zone_of_poly)} regions assigned across "
+              f"{len(set(zone_of_poly.values()))} zones")
+        era5_lat, era5_lon = swed_mod.load_era5_reference_grid(
+            args.preprocessed_path, era5_grid_path=args.era5_grid_path)
+        land_area_pct = swed_mod.compute_land_area_share_per_zone(era5_lat, era5_lon, args.shapefile)
+        for z, pct in land_area_pct.items():
+            print(f"  {z}: {pct:.1f}% of land area")
+        save_geometry_cache(geometry_cache_path, land_area_pct, zone_of_poly, area_of_poly,
+                             geometry_meta)
+        print(f"  Saved geometry cache -> {geometry_cache_path}")
 
     print("\n" + "=" * 60)
     print("STEP 3 - SWED event-duration counts (cached)")
@@ -778,6 +1111,16 @@ def main():
         max_duration_days=args.max_duration_days, min_events=args.min_events,
     )
     print(f"  Saved -> {out_path}")
+
+    out_path_split = os.path.join(
+        args.output_dir, "fig_duration_distribution_swed_swbd_ratio_split.png")
+    plot_swed_swbd_distributions_split(
+        swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
+        args.regions_shapefile, args.gwl_list, out_path_split, dpi=args.dpi,
+        max_duration_days=args.max_duration_days, min_events=args.min_events,
+        duration_split_day=args.duration_split_day,
+    )
+    print(f"  Saved -> {out_path_split}")
 
 
 if __name__ == "__main__":

@@ -169,6 +169,19 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--wcf_zero_mask_path",
+        default=config.WCF_ZERO_MASK_NC_PATH,
+        help=(
+            "Path to the cached wcf-zero land mask (.nc, built by fig1.py's "
+            "build_wcf_zero_mask()/save_wcf_zero_mask()). Land pixels where "
+            "ERA5 wcf is exactly 0 over the whole reference period; greyed "
+            "out on every gridded map here, independent of the no-wind "
+            "quantile mask and of any agreement hatching. If not found, "
+            "this overlay is skipped."
+        ),
+    )
+
     # --- Shapefile / output ---
     parser.add_argument(
         "--shapefile",
@@ -493,25 +506,39 @@ def build_land_mask(ref_2d, shapefile_path):
     return mask
 
 
-def build_era5_wind_mask(preprocessed_path, target_lat, target_lon):
+def load_wcf_zero_mask(path):
     """
-    True where ERA5 has a usable wind resource at a pixel: the 10th-percentile
-    wcf over the full ERA5 record is strictly positive. Built directly from
-    the raw ERA5 wcf record (not any GCM output), then interpolated (nearest)
-    onto (target_lat, target_lon). Used to grey out land pixels with no wind
-    potential; sea pixels are left alone by the caller (intersected with the
-    land shapefile), so they stay white rather than grey.
+    Load the wcf-zero land mask built by fig1.py's build_wcf_zero_mask()/
+    save_wcf_zero_mask() (land pixels, per shp_re, where ERA5 wcf is exactly
+    0 across the whole reference period). This is the sole "no wind
+    resource" grey layer on the gridded maps in this file -- replaces the
+    quantile-based (10th-percentile wcf > 0) mask this module used to build
+    itself, which crashed on newer xarray (interp() rejects bool dtype) and
+    duplicated what fig1.py already computes. Independent of any
+    GCM-trend-agreement hatching -- see draw_wcf_zero_overlay.
     """
-    rea_files, _ = match_files(os.path.join(preprocessed_path, "ERA5", "wcf_day*"))
-    if not rea_files:
-        raise FileNotFoundError(
-            f"No ERA5 wcf file found under {preprocessed_path}/ERA5/ "
-            "to build the wind-availability mask."
+    return xr.open_dataarray(path).astype(bool)
+
+
+def draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp, target_lat, target_lon, zorder=7):
+    """
+    Light-grey overlay for land pixels excluded because ERA5 wcf is exactly
+    0 across the whole reference period (see load_wcf_zero_mask). Drawn at
+    a higher zorder than agreement-hatching's black layer so it stays
+    visible on top of it regardless of the hatching's own state at the same
+    pixel. No-op if wcf_zero_mask is None.
+    """
+    if wcf_zero_mask is None:
+        return
+    wcf0 = wcf_zero_mask.astype(float).interp(
+        lat=target_lat, lon=target_lon, method="nearest").values
+    grey = np.asarray(land_shp) & (wcf0 > 0.5)
+    if grey.any():
+        ax.contourf(
+            target_lon, target_lat, grey.astype(float),
+            levels=[0.5, 1], colors=["lightgrey"],
+            transform=ccrs.PlateCarree(), zorder=zorder,
         )
-    wcf_era5 = open_dataset_any(rea_files[0])
-    wcf_q10  = wcf_era5.wcf.quantile(0.1, dim="time").load()
-    wcf_era5.close()
-    return (wcf_q10 > 0).interp(lat=target_lat, lon=target_lon, method="nearest")
 
 
 def _reduce_to_2d(da):
@@ -702,7 +729,7 @@ def plot_gwl_valuebyalpha_discrete(
     regions=None,
     n_bins_change=5,
     n_bins_sev=5,
-    era5_wind_mask=None,
+    wcf_zero_mask=None,
 ):
     if regions is None:
         regions = [
@@ -789,17 +816,6 @@ def plot_gwl_valuebyalpha_discrete(
     )
     land_shp   = rasterize_shapefile(shp_band, da_mask.shape, t_mask)
     land_shp   = land_shp[::-1, :]
-    # Grey layer: land pixels with no ERA5 wind resource (10th-percentile
-    # wcf <= 0). Intersected with land_shp so the sea stays white, not grey.
-    _wind_float = era5_wind_mask.astype(float).interp(
-        lat=da_mask.lat, lon=da_mask.lon, method="nearest"
-    )
-    no_wind_mask = land_shp & (_wind_float.values < 0.5)
-    ax_map.contourf(
-        da_mask.lon, da_mask.lat, no_wind_mask.astype(float),
-        levels=[0.5, 1], colors=["grey"],
-        transform=ccrs.PlateCarree(), zorder=5,
-    )
     shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
 
@@ -816,6 +832,8 @@ def plot_gwl_valuebyalpha_discrete(
             transform=ccrs.PlateCarree(), zorder=6,
         )
 
+    draw_wcf_zero_overlay(ax_map, wcf_zero_mask, land_shp, da_mask.lat, da_mask.lon)
+
     if map_title is None:
         map_title = f"Projected change in annual severity under {gwl_label} warming"
     elif "{gwl_label}" in map_title:
@@ -824,7 +842,7 @@ def plot_gwl_valuebyalpha_discrete(
     ax_map.annotate(
         "$\\mathbf{a}$",
         xy=(0.02, 1.02), xycoords="axes fraction",
-        ha="left", va="bottom", fontsize=7,
+        ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_map.set_title(map_title, fontsize=7, pad=6)
@@ -944,7 +962,7 @@ def plot_gwl_valuebyalpha_discrete(
         ax_ts.annotate(
             f"$\\mathbf{{{panellabels[ridx]}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=6,
+            ha="left", va="bottom", fontsize=8,
         )
         ax_ts.set_title(reg['name'], fontsize=6)
         if ridx == 0:
@@ -958,7 +976,6 @@ def plot_supp_valuebyalpha_stacked(
     gwl_items,
     shapefile_path,
     da_mask_ref,
-    no_wind_mask,
     hatchings=None,
     agreement_threshold=config.AGREEMENT_THRESHOLD,
     change_edges=None,
@@ -969,6 +986,7 @@ def plot_supp_valuebyalpha_stacked(
     alpha_levels=None,
     relchange_label="Relative change (%)",
     sev_label="Average annual\nseverity (0.61 °C)",
+    wcf_zero_mask=None,
 ):
     """
     Supplementary figure: value-by-alpha maps for multiple GWL levels stacked
@@ -977,8 +995,7 @@ def plot_supp_valuebyalpha_stacked(
     Parameters
     ----------
     gwl_items : list of dict with keys 'rgba_map', 'extent', 'gwl_label'
-    da_mask_ref : 2-D DataArray (one realization) used for the no-wind contour
-    no_wind_mask : 2-D boolean array (True = no wind potential)
+    da_mask_ref : 2-D DataArray (one realization) used for the wcf-zero contour
     """
     if change_edges is None:
         change_edges = [-100, -25, -10, 10, 25, 100]
@@ -992,7 +1009,6 @@ def plot_supp_valuebyalpha_stacked(
     shp = gpd.read_file(shapefile_path)
     shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     lat_ok = (da_mask_ref.lat >= MAP_LAT_SOUTH) & (da_mask_ref.lat <= MAP_LAT_NORTH)
-    no_wind_mask_band = no_wind_mask.astype(float) * lat_ok.values[:, None]
 
     _transform_ref = rasterio.transform.from_bounds(
         da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
@@ -1029,11 +1045,6 @@ def plot_supp_valuebyalpha_stacked(
             interpolation="nearest",
             rasterized=True,
         )
-        ax.contourf(
-            da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
-            levels=[0.5, 1], colors=["grey"],
-            transform=ccrs.PlateCarree(), zorder=5,
-        )
         shp_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                transform=ccrs.PlateCarree(), zorder=10)
 
@@ -1049,6 +1060,8 @@ def plot_supp_valuebyalpha_stacked(
                 levels=[0.5, 1], colors=["black"],
                 transform=ccrs.PlateCarree(), zorder=6,
             )
+
+        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
 
         panel_letter = ascii_lowercase[i]
         panel_gwl    = gwl_label.replace(".0°C", "°C")
@@ -1146,7 +1159,7 @@ def plot_gwl_valuebyalpha_wasserstein(
     rgba_map, extent, gwl_label,
     rel_diff, diff_extent,
     shapefile_path,
-    da_mask_ref, no_wind_mask,
+    da_mask_ref,
     hatchings=None,
     agreement_threshold=config.AGREEMENT_THRESHOLD,
     change_edges=None, sev_edges=None, n_bins_change=5, n_bins_sev=5,
@@ -1155,6 +1168,7 @@ def plot_gwl_valuebyalpha_wasserstein(
     sev_label="Average annual\nseverity (0.61 °C)",
     diff_label="Difference in relative change,\ninverse-W2 minus multi-model mean (pp)",
     diff_vmax=None,
+    wcf_zero_mask=None,
 ):
     """
     Two-panel supplementary figure for one GWL level:
@@ -1179,7 +1193,6 @@ def plot_gwl_valuebyalpha_wasserstein(
     shp = gpd.read_file(shapefile_path)
     shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     lat_ok = (da_mask_ref.lat >= MAP_LAT_SOUTH) & (da_mask_ref.lat <= MAP_LAT_NORTH)
-    no_wind_mask_band = no_wind_mask.astype(float) * lat_ok.values[:, None]
 
     _transform_ref = rasterio.transform.from_bounds(
         da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
@@ -1200,10 +1213,6 @@ def plot_gwl_valuebyalpha_wasserstein(
         rgba_map, extent=extent, origin="lower", transform=ccrs.PlateCarree(),
         interpolation="nearest", rasterized=True,
     )
-    ax_a.contourf(
-        da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
-        levels=[0.5, 1], colors=["grey"], transform=ccrs.PlateCarree(), zorder=5,
-    )
     shp_band.boundary.plot(ax=ax_a, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     if hatchings is not None:
@@ -1217,9 +1226,10 @@ def plot_gwl_valuebyalpha_wasserstein(
             levels=[0.5, 1], colors=["black"],
             transform=ccrs.PlateCarree(), zorder=6,
         )
+    draw_wcf_zero_overlay(ax_a, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
     ax_a.annotate(
         "$\\mathbf{a}$", xy=(0.02, 0.99), xycoords="axes fraction",
-        ha="left", va="bottom", fontsize=7,
+        ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_a.set_title(f"Inverse-Wasserstein-weighted annual severity change under {gwl_label} warming",
@@ -1254,15 +1264,12 @@ def plot_gwl_valuebyalpha_wasserstein(
         interpolation="nearest", cmap=cmo.cm.balance, vmin=-diff_vmax, vmax=diff_vmax,
         rasterized=True,
     )
-    ax_b.contourf(
-        da_mask_ref.lon, da_mask_ref.lat, no_wind_mask_band,
-        levels=[0.5, 1], colors=["grey"], transform=ccrs.PlateCarree(), zorder=5,
-    )
+    draw_wcf_zero_overlay(ax_b, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
     shp_band.boundary.plot(ax=ax_b, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     ax_b.annotate(
         "$\\mathbf{b}$", xy=(0.02, 0.99), xycoords="axes fraction",
-        ha="left", va="bottom", fontsize=7,
+        ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_b.set_title("Difference vs. multi-model mean", fontsize=7, pad=6)
@@ -1714,13 +1721,17 @@ def main():
     ref_2d = _reduce_to_2d(ds_baseline.duration)
     mask   = build_land_mask(ref_2d, args.shapefile)
 
-    # Wind-availability mask (True = usable wind resource), built directly
-    # from the raw ERA5 wcf record (10th-percentile wcf > 0). Land pixels
-    # where this is False are greyed out on the maps.
-    print(f"  Building ERA5 wind-availability mask (10th-percentile wcf > 0) ...")
-    era5_wind_mask = build_era5_wind_mask(
-        args.preprocessed_path, target_lat=ref_2d.lat, target_lon=ref_2d.lon
-    )
+    # wcf-zero land mask (land pixels where ERA5 wcf is exactly 0 over the
+    # whole reference period), built and cached by fig1.py. This is the
+    # sole "no wind resource" grey layer on the maps below -- see
+    # draw_wcf_zero_overlay. Independent of any agreement hatching.
+    wcf_zero_mask = None
+    if args.wcf_zero_mask_path is not None and os.path.exists(args.wcf_zero_mask_path):
+        print(f"  Loading wcf-zero land mask from {args.wcf_zero_mask_path} ...")
+        wcf_zero_mask = load_wcf_zero_mask(args.wcf_zero_mask_path)
+    elif args.wcf_zero_mask_path is not None:
+        print(f"  [warn] wcf-zero mask file not found: {args.wcf_zero_mask_path}. "
+              f"Run fig1.py first to build it. Skipping this overlay.")
 
     # ------------------------------------------------------------------
     # STEP 2 - Regional DataFrame
@@ -1778,7 +1789,6 @@ def main():
     supp_items          = []
     supp_meta           = {}   # change_edges, sev_edges, color_levels, alpha_levels
     da_mask_ref_supp    = None
-    no_wind_mask_supp   = None
 
     for level in args.gwl_levels:
         gwl_key   = level_to_key[level]
@@ -1848,7 +1858,7 @@ def main():
             relchange_label="Relative change (%)",
             sev_label="Average annual\nseverity (0.61 °C)",
             lat_min=-60, lat_max=68,
-            era5_wind_mask=era5_wind_mask,
+            wcf_zero_mask=wcf_zero_mask,
         )
         out_path = os.path.join(args.output_dir, "main", fname)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -1869,20 +1879,10 @@ def main():
                 "change_edges": _cedges, "sev_edges": _sedges,
                 "color_levels": _clvl,   "alpha_levels": _alvl,
             }
-        # Build the no-wind mask once (same grid for all GWLs)
+        # Reference grid for the supplementary figures' wcf-zero overlay
+        # (same grid for all GWLs)
         if da_mask_ref_supp is None:
-            _shp_tmp   = gpd.read_file(args.shapefile)
             da_mask_ref_supp = da_ref_freq.isel(realization=0).load()
-            _t = rasterio.transform.from_bounds(
-                da_mask_ref_supp.lon.min().item(), da_mask_ref_supp.lat.min().item(),
-                da_mask_ref_supp.lon.max().item(), da_mask_ref_supp.lat.max().item(),
-                len(da_mask_ref_supp.lon), len(da_mask_ref_supp.lat),
-            )
-            _land = rasterize_shapefile(_shp_tmp, da_mask_ref_supp.shape, _t)[::-1, :]
-            _wf = era5_wind_mask.astype(float).interp(
-                lat=da_mask_ref_supp.lat, lon=da_mask_ref_supp.lon, method="nearest"
-            )
-            no_wind_mask_supp = _land & (_wf.values < 0.5)
         # ----------------------------------------------------------------
 
         # ------ Inverse-Wasserstein-weighted supplementary figure ------
@@ -1926,10 +1926,11 @@ def main():
                     rgba_map=_rgba_w, extent=_extent_w, gwl_label=gwl_label,
                     rel_diff=rel_change_w - rel_change_mmm, diff_extent=_extent_w,
                     shapefile_path=args.shapefile,
-                    da_mask_ref=da_mask_ref_supp, no_wind_mask=no_wind_mask_supp,
+                    da_mask_ref=da_mask_ref_supp,
                     hatchings=hatchings, agreement_threshold=args.agreement_threshold,
                     change_edges=_cedges_w, sev_edges=_sedges_w,
                     color_levels=_clvl_w, alpha_levels=_alvl_w,
+                    wcf_zero_mask=wcf_zero_mask,
                 )
                 fname_w = f"suppfig_projected_change_valuebyalpha_{gwl_key}_wasserstein.png"
                 out_w = os.path.join(args.output_dir, "supp", fname_w)
@@ -1954,9 +1955,9 @@ def main():
             gwl_items=supp_items,
             shapefile_path=args.shapefile,
             da_mask_ref=da_mask_ref_supp,
-            no_wind_mask=no_wind_mask_supp,
             hatchings=hatchings,
             agreement_threshold=args.agreement_threshold,
+            wcf_zero_mask=wcf_zero_mask,
             **supp_meta,
         )
         out_supp = os.path.join(args.output_dir, "supp", "fig_supp_valuebyalpha_all_gwl.png")

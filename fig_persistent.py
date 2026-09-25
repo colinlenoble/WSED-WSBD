@@ -524,7 +524,7 @@ def plot_valuebyalpha_persistent(
     ax_map.annotate(
         "$\\mathbf{a}$",
         xy=(0.02, 1.02), xycoords="axes fraction",
-        ha="left", va="bottom", fontsize=7,
+        ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_map.set_title(map_title, fontsize=7, pad=6)
@@ -610,7 +610,7 @@ def plot_valuebyalpha_persistent(
         ax_ts.annotate(
             f"$\\mathbf{{{rinfo['label']}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=6,
+            ha="left", va="bottom", fontsize=8,
         )
 
     ax_map.spines["geo"].set_visible(False)
@@ -704,7 +704,7 @@ def plot_valuebyalpha_decomposition(
         ax.annotate(
             f"$\\mathbf{{{panellabels[i]}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=7,
+            ha="left", va="bottom", fontsize=8,
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
         ax.set_title(label, fontsize=7, pad=6)
@@ -812,7 +812,7 @@ def plot_freq_by_duration_change_persistent(
         ax.annotate(
             f"$\\mathbf{{{panellabels[i]}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=6,
+            ha="left", va="bottom", fontsize=8,
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
         ax.set_title(f"> {thr} days", fontsize=6)
@@ -925,7 +925,7 @@ def plot_reference_persistent_drought(
         ax.annotate(
             f"$\\mathbf{{{panellabels[idx]}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=5,
+            ha="left", va="bottom", fontsize=8,
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
         cbar_ax = fig.axes[-1]

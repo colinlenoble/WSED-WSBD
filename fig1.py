@@ -106,6 +106,14 @@ def parse_args():
     parser.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
     parser.add_argument("--ref_end",   default=config.SHEAR_REF_PERIOD[1])
     parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
+    parser.add_argument(
+        "--wcf_zero_mask_path", default=config.WCF_ZERO_MASK_NC_PATH,
+        help=(
+            "Path to the cached wcf-zero land mask (.nc, built by "
+            "build_wcf_zero_mask()). Loaded if present; otherwise it is "
+            "computed from the ERA5 reference-period record and saved here."
+        ),
+    )
     parser.add_argument("--output_dir", default="../final_figs")
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--n_boot", type=int, default=2000)
@@ -400,6 +408,79 @@ def build_land_mask(ds_final, shapefile_path):
     return xr.DataArray(mask, dims=("lat", "lon"), coords={"lat": da.lat, "lon": da.lon})
 
 
+def build_wcf_zero_mask(path_preprocessed, reanalysis, ref_start, ref_end, shapefile_path):
+    """
+    Grey-out mask: land pixels (per shp_re, config.SHAPEFILE_PATH) where the
+    ERA5 wcf reanalysis is exactly 0 on every day of [ref_start, ref_end] --
+    flags a data/model artifact (no wind capacity factor ever computed
+    there), not a "low wind resource" judgement call. Independent of, and
+    meant to be drawn on top of, any GCM-trend-agreement hatching (see
+    fig3.py): a pixel is greyed out here regardless of whether it passes or
+    fails that separate test.
+    """
+    wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
+    if not wcf_files:
+        raise FileNotFoundError(
+            f"No wcf_day_* file found under {os.path.join(path_preprocessed, reanalysis)}")
+    wcf = open_dataset_any(wcf_files[0], chunks={"time": 1000, "lat": -1, "lon": -1})
+    wcf = wcf.convert_calendar("standard").sel(time=slice(ref_start, ref_end))
+    wcf_all_zero = (wcf.wcf == 0).all(dim="time").load()
+
+    land = build_land_mask_from_grid(
+        wcf_all_zero.lat.values, wcf_all_zero.lon.values, shapefile_path)
+    grey_mask = xr.DataArray(
+        land.astype(bool) & wcf_all_zero.values,
+        dims=("lat", "lon"),
+        coords={"lat": wcf_all_zero.lat, "lon": wcf_all_zero.lon},
+        name="wcf_zero_land_mask",
+    )
+    return grey_mask
+
+
+def save_wcf_zero_mask(mask_da, out_path):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    mask_da.astype(np.int8).to_netcdf(out_path)
+    print(f"  Saved wcf-zero land mask: {out_path}")
+
+
+def load_wcf_zero_mask(path):
+    return xr.open_dataarray(path).astype(bool)
+
+
+def get_or_build_wcf_zero_mask(path_preprocessed, reanalysis, ref_start, ref_end,
+                                shapefile_path, cache_path):
+    """Load the cached wcf-zero land mask if present, else build and cache it."""
+    if cache_path and os.path.exists(cache_path):
+        print(f"  Loading cached wcf-zero land mask: {cache_path}")
+        return load_wcf_zero_mask(cache_path)
+    print("  Building wcf-zero land mask (ERA5, reference period)  ")
+    mask_da = build_wcf_zero_mask(path_preprocessed, reanalysis, ref_start, ref_end, shapefile_path)
+    if cache_path:
+        save_wcf_zero_mask(mask_da, cache_path)
+    return mask_da
+
+
+def draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp, target_lat, target_lon, zorder=7):
+    """
+    Light-grey overlay for land pixels excluded because ERA5 wcf is exactly
+    0 across the whole reference period (see build_wcf_zero_mask). Drawn at
+    a higher zorder than the ocean mask/agreement hatching so it stays
+    visible over them regardless of those other masks' own state at the
+    same pixel. No-op if wcf_zero_mask is None.
+    """
+    if wcf_zero_mask is None:
+        return
+    wcf0 = wcf_zero_mask.astype(float).interp(
+        lat=target_lat, lon=target_lon, method="nearest").values
+    grey = np.asarray(land_shp) & (wcf0 > 0.5)
+    if grey.any():
+        ax.contourf(
+            target_lon, target_lat, grey.astype(float),
+            levels=[0.5, 1], colors=["lightgrey"],
+            transform=ccrs.PlateCarree(), zorder=zorder,
+        )
+
+
 def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
     y = np.asarray(y, dtype=np.float64)
     if y.size < 2 or np.all(np.isnan(y)):
@@ -446,6 +527,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
     lat_min=-60, lat_max=72,
     period_hist=(1982, 2001), period_comp=(2002, 2021),
     regions=None, n_boot=2000, n_bins_change=5, n_bins_sev=5,
+    wcf_zero_mask=None,
 ):
     # --- 1. Compound index ---
     da = (ds_final.frequency.where(mask == 1)
@@ -533,13 +615,14 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         levels=[0.5, 1], colors=["gray"],
         transform=ccrs.PlateCarree(), zorder=5,
     )
+    draw_wcf_zero_overlay(ax_map, wcf_zero_mask, land_mask, da_mask.lat, da_mask.lon)
     shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     ax_map.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
     ax_map.annotate(
         "$\\mathbf{a}$",
         xy=(0.02, 1.02), xycoords="axes fraction",
-        ha="left", va="bottom", fontsize=7,
+        ha="left", va="bottom", fontsize=8,
         path_effects=[withStroke(linewidth=1.5, foreground="white")],
     )
     ax_map.set_title(map_title, fontsize=7, pad=6)
@@ -625,7 +708,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         ax_ts.annotate(
             f"$\\mathbf{{{rinfo['label']}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=6,
+            ha="left", va="bottom", fontsize=8,
         )
         #ax_ts.set_title(rinfo['name'], fontsize=6)
 
@@ -640,7 +723,7 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
 # Figure 2 Interannual variability map
 # =============================================================================
 
-def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
+def plot_variability_map(ds_final, mask, shapefile_path, dpi=300, wcf_zero_mask=None):
     shapefile = gpd.read_file(shapefile_path)
     shapefile_band = shapefile.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
     pdd     = (ds_final.frequency * ds_final.severity * ds_final.duration).where(mask)
@@ -662,11 +745,12 @@ def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
         da_mask.lon.max().item(), da_mask.lat.max().item(),
         len(da_mask.lon), len(da_mask.lat),
     )
-    mask_plot = rasterize_shapefile(shapefile_band, da_mask.shape, t_mask)
-    mask_plot = mask_plot[::-1, :] & (da_mask.isnull())
+    land_plot = rasterize_shapefile(shapefile_band, da_mask.shape, t_mask)[::-1, :]
+    mask_plot = land_plot & (da_mask.isnull())
     ax.contourf(mask_plot.lon, mask_plot.lat, mask_plot.values.astype(float),
                 levels=[0.5, 1], colors=["gray"],
                 transform=ccrs.PlateCarree(), zorder=5)
+    draw_wcf_zero_overlay(ax, wcf_zero_mask, land_plot, da_mask.lat, da_mask.lon)
     shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                  transform=ccrs.PlateCarree(), zorder=10)
     ax.set_global()
@@ -687,6 +771,7 @@ def plot_variability_map(ds_final, mask, shapefile_path, dpi=300):
 def plot_mean_variables_6panel(
     ds_final, mask, shapefile_path, path_preprocessed, reanalysis,
     ref_start="1982-01-01", ref_end="2001-12-31",
+    wcf_zero_mask=None,
 ):
     lat_south, lat_north = -60, 68
     shapefile      = gpd.read_file(shapefile_path)
@@ -782,6 +867,8 @@ def plot_mean_variables_6panel(
                 levels=[0.5, 1], colors=["gray"],
                 transform=ccrs.PlateCarree(), zorder=5,
             )
+        land_for_panel = land_mask_comp if idx in (0, 1, 2, 3, 6) else land_mask_wcf
+        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_for_panel, ds.lat, ds.lon)
         ds.plot.pcolormesh(
             ax=ax, transform=ccrs.PlateCarree(),
             cmap=cmap_list[idx], vmin=vmin_list[idx], vmax=vmax_list[idx],
@@ -795,7 +882,7 @@ def plot_mean_variables_6panel(
         ax.annotate(
             f"$\\mathbf{{{panellabels[idx]}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=5,
+            ha="left", va="bottom", fontsize=8,
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
         # ax.set_title(title_list[idx], fontsize=5)
@@ -852,6 +939,7 @@ def plot_valuebyalpha_sensitivity(
     ds_005, mask_005, ds_02, mask_02, shapefile_path,
     period_hist=(1982, 2001), period_comp=(2002, 2021),
     n_bins_change=5, n_bins_sev=5,
+    wcf_zero_mask=None,
 ):
     shapefile = gpd.read_file(shapefile_path)
     shapefile_band = shapefile.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
@@ -893,6 +981,7 @@ def plot_valuebyalpha_sensitivity(
         ax.contourf(ocean_m.lon, ocean_m.lat, ocean_m.values.astype(float),
                     levels=[0.5, 1], colors=["gray"],
                     transform=ccrs.PlateCarree(), zorder=5)
+        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_m, da_m.lat, da_m.lon)
         shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                      transform=ccrs.PlateCarree(), zorder=10)
         ax.annotate(
@@ -961,6 +1050,7 @@ def plot_combined_threshold_sensitivity(
     shapefile_path, csv_thr95, csv_thr99, csv_thr995,
     period_hist=(1982, 2001), period_comp=(2002, 2021),
     n_bins_change=5, n_bins_sev=5, dpi=300,
+    wcf_zero_mask=None,
 ):
     shapefile = gpd.read_file(shapefile_path)
     shapefile_band = shapefile.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
@@ -1029,12 +1119,13 @@ def plot_combined_threshold_sensitivity(
         ax.contourf(ocean_m.lon, ocean_m.lat, ocean_m.values.astype(float),
                     levels=[0.5, 1], colors=["gray"],
                     transform=ccrs.PlateCarree(), zorder=5)
+        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_m, da_m.lat, da_m.lon)
         shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                      transform=ccrs.PlateCarree(), zorder=10)
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=6,
+            ha="left", va="bottom", fontsize=8,
             color=REF_COLOR if is_ref else "black",
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
@@ -1094,7 +1185,7 @@ def plot_combined_threshold_sensitivity(
         ax.annotate(
             f"$\\mathbf{{{letter}}}$",
             xy=(0.02, 1.02), xycoords="axes fraction",
-            ha="left", va="bottom", fontsize=6,
+            ha="left", va="bottom", fontsize=8,
             color=REF_COLOR if is_ref else "black",
             path_effects=[withStroke(linewidth=1.5, foreground="white")],
         )
@@ -1202,6 +1293,13 @@ def main():
     print("Building land mask")
     mask = build_land_mask(ds_final, args.shapefile)
 
+    print("Building/loading wcf-zero land mask")
+    wcf_zero_mask = get_or_build_wcf_zero_mask(
+        path_preprocessed=args.path_preprocessed, reanalysis=args.reanalysis,
+        ref_start=args.ref_start, ref_end=args.ref_end,
+        shapefile_path=args.shapefile, cache_path=args.wcf_zero_mask_path,
+    )
+
     print("Plotting value-by-alpha figure")
     fig1 = plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
         ds_final=ds_final, mask=mask, shapefile_path=args.shapefile,
@@ -1211,6 +1309,7 @@ def main():
         lat_min=-60, lat_max=75,
         period_hist=(1982, 2001), period_comp=(2002, 2021),
         n_boot=args.n_boot,
+        wcf_zero_mask=wcf_zero_mask,
     )
     out1 = os.path.join(args.output_dir, "main",
                         f"fig1_valuebyalpha_slides_{str(args.threshold).replace('.', '')}.png")
@@ -1220,7 +1319,8 @@ def main():
     print(f"Saved {out1}")
 
     print("Plotting variability map  ")
-    fig2 = plot_variability_map(ds_final, mask, args.shapefile, dpi=args.dpi)
+    fig2 = plot_variability_map(ds_final, mask, args.shapefile, dpi=args.dpi,
+                                wcf_zero_mask=wcf_zero_mask)
     out2 = os.path.join(args.output_dir, "supp", "suppfig2_pdd_std_map.png")
     os.makedirs(os.path.dirname(out2), exist_ok=True)
     fig2.savefig(out2, dpi=args.dpi, bbox_inches="tight")
@@ -1233,6 +1333,7 @@ def main():
         path_preprocessed=args.path_preprocessed,
         reanalysis=args.reanalysis,
         ref_start=args.ref_start, ref_end=args.ref_end,
+        wcf_zero_mask=wcf_zero_mask,
     )
     out3 = os.path.join(args.output_dir, "supp", "suppfig3_mean_variables_6panel.png")
     os.makedirs(os.path.dirname(out3), exist_ok=True)
@@ -1260,6 +1361,7 @@ def main():
             shapefile_path=args.shapefile,
             csv_thr95=csv_thr95, csv_thr99=csv_thr99, csv_thr995=csv_thr995,
             dpi=args.dpi,
+            wcf_zero_mask=wcf_zero_mask,
         )
         out_comb = os.path.join(args.output_dir, "supp",
                                 "suppfig_combined_threshold_sensitivity.png")
@@ -1274,7 +1376,8 @@ def main():
         mask_005 = build_land_mask(ds_005, args.shapefile)
         mask_02  = build_land_mask(ds_02,  args.shapefile)
         fig_sens = plot_valuebyalpha_sensitivity(
-            ds_005, mask_005, ds_02, mask_02, shapefile_path=args.shapefile)
+            ds_005, mask_005, ds_02, mask_02, shapefile_path=args.shapefile,
+            wcf_zero_mask=wcf_zero_mask)
         out_sens = os.path.join(args.output_dir, "supp",
                                 "suppfig_valuebyalpha_sensitivity.png")
         os.makedirs(os.path.dirname(out_sens), exist_ok=True)
