@@ -484,8 +484,8 @@ def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
-                              facecolor="none", edgecolor="black",
-                              linewidth=0.0, hatch=hp, zorder=4)
+                              facecolor="black", edgecolor="black",
+                              linewidth=0.0, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -1386,8 +1386,8 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
-                              facecolor="none", edgecolor="black",
-                              linewidth=0.0, hatch=hp, zorder=4)
+                              facecolor="black", edgecolor="black",
+                              linewidth=0.0, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -1406,7 +1406,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
 
     ax.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No renewable capacities"),
-        Patch(facecolor="none", edgecolor="black", hatch="/" * 21, label="Low model-agreement"),
+        Patch(facecolor="black", edgecolor="black", label="Low model-agreement"),
     ], loc="lower right", bbox_to_anchor=(1.0, 0.0), bbox_transform=ax.transAxes,
        fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
@@ -1546,7 +1546,7 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
         legend_ax.legend(handles=[
             Patch(facecolor="white", edgecolor="black", hatch="\\" * 10,
                   label="No RE capacities"),
-            Patch(facecolor="none", edgecolor="black", hatch="/" * 21,
+            Patch(facecolor="black", edgecolor="black",
                   label="Low model agreement"),
         ], loc="upper center", bbox_to_anchor=(0.5, -0.08),
            bbox_transform=legend_ax.transAxes,
@@ -1723,7 +1723,7 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
         legend_ax.legend(handles=[
             Patch(facecolor="white", edgecolor="black", hatch="\\" * 10,
                   label="No RE capacities"),
-            Patch(facecolor="none", edgecolor="black", hatch="/" * 21,
+            Patch(facecolor="black", edgecolor="black",
                   label="Low model agreement"),
         ], loc="upper center", bbox_to_anchor=(0.5, -0.08),
            bbox_transform=legend_ax.transAxes,
@@ -1872,8 +1872,8 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
                                linewidth=0.0, hatch="\\" * 10, zorder=3)
         if pid in hatch_set:
             ax2.add_geometries([geom], crs=ccrs.PlateCarree(),
-                               facecolor="none", edgecolor="black",
-                               linewidth=0.0, hatch=7 * "///", zorder=4)
+                               facecolor="black", edgecolor="black",
+                               linewidth=0.0, zorder=4)
 
     ax2.set_global()
     mask_poles(ax2)
@@ -1892,7 +1892,7 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
             Patch(facecolor="#91bfdb", edgecolor="none", label="Warming decreases SWBDs, Mix increases SWBDs"),
             Patch(facecolor="#8B4513", edgecolor="none", label="No change in mix"),
             Patch(facecolor="white",   edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
-            Patch(facecolor="none",    edgecolor="black", hatch=7 * "///",
+            Patch(facecolor="black",    edgecolor="black",
                   label="Low model agreement"),
         ],
         loc="upper center", fontsize=4, ncol=2,
@@ -1951,8 +1951,8 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
-                              facecolor="none", edgecolor="black",
-                              linewidth=0.0, hatch=hp, zorder=4)
+                              facecolor="black", edgecolor="black",
+                              linewidth=0.0, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -1971,7 +1971,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
     cb.ax.tick_params(labelsize=5)
     ax.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No renewable capacities"),
-        Patch(facecolor="none", edgecolor="black", hatch="/" * 21, label="Low model-agreement"),
+        Patch(facecolor="black", edgecolor="black", label="Low model-agreement"),
     ], loc="lower right", bbox_to_anchor=(1.0, 0.0), bbox_transform=ax.transAxes,
        fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
@@ -2024,8 +2024,8 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax.add_geometries([geom], crs=ccrs.PlateCarree(),
-                              facecolor="none", edgecolor="black",
-                              linewidth=0.0, hatch=hp, zorder=4)
+                              facecolor="black", edgecolor="black",
+                              linewidth=0.0, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -2042,7 +2042,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     cb.ax.tick_params(labelsize=5)
     ax.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No renewable capacities"),
-        Patch(facecolor="none", edgecolor="black", hatch="/" * 21, label="Low model-agreement"),
+        Patch(facecolor="black", edgecolor="black", label="Low model-agreement"),
     ], loc="lower right", bbox_to_anchor=(1.0, 0.0), bbox_transform=ax.transAxes,
        fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
@@ -2103,7 +2103,7 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
 
     legend_handles = [
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
-        Patch(facecolor="none", edgecolor="black", hatch="/" * 21,
+        Patch(facecolor="black", edgecolor="black",
               label="Low model agreement"),
     ]
     last_panel = fig.axes[8]
@@ -2184,7 +2184,7 @@ def plot_re_share_effect_absolute(gwl_dfs_by_share, shapefile_path, hatch_df,
 
     legend_handles = [
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
-        Patch(facecolor="none", edgecolor="black", hatch="/" * 21,
+        Patch(facecolor="black", edgecolor="black",
               label="Low model agreement"),
     ]
     last_panel = fig.axes[8]
@@ -2286,8 +2286,8 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
                                 linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax_c.add_geometries([geom], crs=ccrs.PlateCarree(),
-                                facecolor="none", edgecolor="black",
-                                linewidth=0.0, hatch=hp, zorder=4)
+                                facecolor="black", edgecolor="black",
+                                linewidth=0.0, zorder=4)
     ax_c.set_global()
     mask_poles(ax_c)
     try:
@@ -2344,8 +2344,8 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
                                 linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax_d.add_geometries([geom], crs=ccrs.PlateCarree(),
-                                facecolor="none", edgecolor="black",
-                                linewidth=0.0, hatch=hp, zorder=4)
+                                facecolor="black", edgecolor="black",
+                                linewidth=0.0, zorder=4)
     ax_d.set_global()
     mask_poles(ax_d)
     try:
@@ -2370,7 +2370,7 @@ def plot_supp_combined_driver_effects(df_gwl2, shapefile_path, hatch_df,
     cb_d.outline.set_linewidth(0.4)
     fig.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
-        Patch(facecolor="none", edgecolor="black", hatch="/" * 21, label="Low model agreement"),
+        Patch(facecolor="black", edgecolor="black", label="Low model agreement"),
     ], ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.52), bbox_transform=fig.transFigure,
        fontsize=4, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
@@ -2470,8 +2470,8 @@ def plot_supp_combined_driver_effects_absolute(df_gwl2, shapefile_path, hatch_df
                                 linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax_c.add_geometries([geom], crs=ccrs.PlateCarree(),
-                                facecolor="none", edgecolor="black",
-                                linewidth=0.0, hatch=hp, zorder=4)
+                                facecolor="black", edgecolor="black",
+                                linewidth=0.0, zorder=4)
     ax_c.set_global()
     mask_poles(ax_c)
     try:
@@ -2528,8 +2528,8 @@ def plot_supp_combined_driver_effects_absolute(df_gwl2, shapefile_path, hatch_df
                                 linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             ax_d.add_geometries([geom], crs=ccrs.PlateCarree(),
-                                facecolor="none", edgecolor="black",
-                                linewidth=0.0, hatch=hp, zorder=4)
+                                facecolor="black", edgecolor="black",
+                                linewidth=0.0, zorder=4)
     ax_d.set_global()
     mask_poles(ax_d)
     try:
@@ -2554,7 +2554,7 @@ def plot_supp_combined_driver_effects_absolute(df_gwl2, shapefile_path, hatch_df
     cb_d.outline.set_linewidth(0.4)
     fig.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
-        Patch(facecolor="none", edgecolor="black", hatch="/" * 21, label="Low model agreement"),
+        Patch(facecolor="black", edgecolor="black", label="Low model agreement"),
     ], ncol=2, loc="upper center", bbox_to_anchor=(0.5, 0.52), bbox_transform=fig.transFigure,
        fontsize=4, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 

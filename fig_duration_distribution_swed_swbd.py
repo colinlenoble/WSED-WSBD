@@ -172,6 +172,22 @@ def parse_args():
     parser.add_argument("--recompute_geometry", action="store_true", default=False,
                          help="Ignore any existing geometry cache and rebuild region/zone "
                               "assignment + land-area shares from the raw shapefiles/ERA5 grid.")
+    parser.add_argument("--plot_data_json", default=None,
+                         help="Path to a single-file bundle of every plotting input -- SWED "
+                              "counts, SWBD counts, land_area_pct, zone_of_poly, area_of_poly "
+                              "(see save_plot_data_cache/load_plot_data_cache). Default: "
+                              "<output_dir>/swed_swbd_plot_data_cache.json. If present (and "
+                              "built with matching settings), loading it alone skips every "
+                              "other raw-data step -- no CSV caches, shapefiles, ERA5 grid or "
+                              "preprocessed archive needed -- meant to be copied elsewhere "
+                              "(e.g. a laptop with none of this project's raw data mounted) "
+                              "to iterate on plot_swed_swbd_distributions[_split] or build "
+                              "alternative plots off the same data. Always (re)written at the "
+                              "end of the raw-data steps, whichever path produced them.")
+    parser.add_argument("--recompute_plot_data", action="store_true", default=False,
+                         help="Ignore any existing plot-data bundle even if present; fall back "
+                              "to the three separate caches/raw-data steps (still rewriting the "
+                              "bundle at the end).")
     parser.add_argument("--output_dir", default="../final_figs")
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--max_duration_days", type=float, default=12.0,
@@ -489,6 +505,90 @@ def load_geometry_cache(path, meta):
     zone_of_poly = {int(k): v for k, v in payload["zone_of_poly"].items()}
     area_of_poly = {int(k): v for k, v in payload["area_of_poly"].items()}
     return land_area_pct, zone_of_poly, area_of_poly
+
+
+# =============================================================================
+# Full plot-data bundle: every input plot_swed_swbd_distributions[_split]
+# needs (swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly,
+# area_of_poly), in one JSON file -- unlike the geometry cache above (which
+# still needs the two separate counts CSVs alongside it), loading this one
+# file is enough on its own to redraw either figure, tweak their styling, or
+# build an entirely different plot off the same underlying data -- no CSV
+# caches, shapefiles, ERA5 grid or HPC-only preprocessed archive needed at
+# all. Meant to be copied wherever the figure is actually being iterated on
+# (a laptop, without any of this project's raw data mounted), not as the
+# primary cache main() itself relies on run to run (that's still the three
+# separate, independently-invalidated caches above/below -- e.g. changing
+# only --swbd_thr shouldn't force SWED or the geometry to be rebuilt too).
+# =============================================================================
+
+def _plot_data_cache_meta(regions_shapefile, shapefile, era5_grid_path,
+                           threshold, ssp, swbd_thr, swbd_tot_re, swbd_mix, suffix_shp):
+    """Union of every setting that changes any of the 5 bundled pieces --
+    the SWED counts (swed_mod._cache_meta), the SWBD counts
+    (_swbd_cache_meta) and the geometry (_geometry_cache_meta)."""
+    return {
+        "swed": swed_mod._cache_meta(threshold, ssp),
+        "swbd": _swbd_cache_meta(swbd_thr, swbd_tot_re, swbd_mix, ssp, suffix_shp),
+        "geometry": _geometry_cache_meta(regions_shapefile, shapefile, era5_grid_path),
+    }
+
+
+def _df_to_json(df):
+    """Compact DataFrame JSON encoding: columns named once, plain row
+    lists after -- cheaper than pandas' default per-row-dict 'records'
+    orient, which repeats every column name on every row."""
+    return {"columns": list(df.columns), "data": df.to_numpy().tolist()}
+
+
+def _df_from_json(payload):
+    return pd.DataFrame(payload["data"], columns=payload["columns"])
+
+
+def save_plot_data_cache(path, swed_counts_df, swbd_counts_df, land_area_pct,
+                          zone_of_poly, area_of_poly, meta):
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    payload = {
+        "meta": meta,
+        "swed_counts": _df_to_json(swed_counts_df),
+        "swbd_counts": _df_to_json(swbd_counts_df),
+        "land_area_pct": land_area_pct,
+        "zone_of_poly": {str(k): v for k, v in zone_of_poly.items()},
+        "area_of_poly": {str(k): v for k, v in area_of_poly.items()},
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f)
+
+
+def load_plot_data_cache(path, meta):
+    """
+    Returns (swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly,
+    area_of_poly) if `path` exists and was built with the same settings as
+    `meta` (SWED threshold/ssp, SWBD thr/tot_re/mix/ssp/suffix_shp, and
+    regions_shapefile/shapefile/era5_grid_path/lat_zone_edges); otherwise
+    None. Same stale/foreign-cache guard convention as every other cache in
+    this file.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        print(f"  [cache] {path} is not readable JSON -- ignoring.")
+        return None
+    if payload.get("meta") != meta:
+        print(f"  [cache] {path} was built with different settings {payload.get('meta')} "
+              f"than requested {meta} -- ignoring and rebuilding.")
+        return None
+    swed_counts_df = _df_from_json(payload["swed_counts"])
+    swbd_counts_df = _df_from_json(payload["swbd_counts"])
+    land_area_pct = payload["land_area_pct"]
+    zone_of_poly = {int(k): v for k, v in payload["zone_of_poly"].items()}
+    area_of_poly = {int(k): v for k, v in payload["area_of_poly"].items()}
+    return swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly
 
 
 # =============================================================================
@@ -1041,65 +1141,85 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=" * 60)
-    print("STEP 1/2 - Region/zone geometry: assignment + area weights + land area share")
-    print("=" * 60)
-    geometry_cache_path = args.geometry_cache_json or os.path.join(
-        args.output_dir, "swed_swbd_geometry_cache.json")
-    geometry_meta = _geometry_cache_meta(args.regions_shapefile, args.shapefile, args.era5_grid_path)
-    cached_geometry = None if args.recompute_geometry else load_geometry_cache(
-        geometry_cache_path, geometry_meta)
-    if cached_geometry is not None:
-        land_area_pct, zone_of_poly, area_of_poly = cached_geometry
-        print(f"  Loaded cached geometry from {geometry_cache_path} -- skipping "
-              f"--regions_shapefile/--shapefile/--era5_grid_path access.")
-    else:
-        zone_of_poly, area_of_poly = assign_regions_to_zones(args.regions_shapefile)
-        print(f"  {len(zone_of_poly)} regions assigned across "
-              f"{len(set(zone_of_poly.values()))} zones")
-        era5_lat, era5_lon = swed_mod.load_era5_reference_grid(
-            args.preprocessed_path, era5_grid_path=args.era5_grid_path)
-        land_area_pct = swed_mod.compute_land_area_share_per_zone(era5_lat, era5_lon, args.shapefile)
-        for z, pct in land_area_pct.items():
-            print(f"  {z}: {pct:.1f}% of land area")
-        save_geometry_cache(geometry_cache_path, land_area_pct, zone_of_poly, area_of_poly,
-                             geometry_meta)
-        print(f"  Saved geometry cache -> {geometry_cache_path}")
+    plot_data_path = args.plot_data_json or os.path.join(
+        args.output_dir, "swed_swbd_plot_data_cache.json")
+    plot_data_meta = _plot_data_cache_meta(
+        args.regions_shapefile, args.shapefile, args.era5_grid_path,
+        args.threshold, args.ssp, args.swbd_thr, args.swbd_tot_re, args.swbd_mix, args.suffix_shp)
+    cached_plot_data = None if args.recompute_plot_data else load_plot_data_cache(
+        plot_data_path, plot_data_meta)
 
-    print("\n" + "=" * 60)
-    print("STEP 3 - SWED event-duration counts (cached)")
-    print("=" * 60)
-    swed_cache_path = args.swed_cache_csv or os.path.join(
-        args.output_dir, "event_duration_counts_cache.csv")
-    swed_counts_df = swed_mod.load_counts_cache(swed_cache_path, args.threshold, args.ssp)
-    if swed_counts_df is None:
-        swed_counts_df = swed_mod.build_counts_table(
-            args.preprocessed_path, args.gwl_list, args.ssp, args.threshold,
-            args.shapefile, [], args.exclude_gcm_run,
-        )
-        swed_mod.save_counts_cache(swed_counts_df, swed_cache_path, args.threshold, args.ssp)
-    print(f"  {len(swed_counts_df)} SWED cache rows")
-
-    print("\n" + "=" * 60)
-    print("STEP 4 - SWBD event-duration counts (cached)")
-    print("=" * 60)
-    swbd_cache_path = args.swbd_cache_csv or os.path.join(
-        args.output_dir, "swbd_duration_counts_cache.csv")
-    swbd_counts_df = None if args.recompute_swbd else load_swbd_counts_cache(
-        swbd_cache_path, args.swbd_thr, args.swbd_tot_re, args.swbd_mix, args.ssp, args.suffix_shp)
-    if swbd_counts_df is not None:
-        print(f"  Loaded cached SWBD counts from {swbd_cache_path} "
-              f"({len(swbd_counts_df)} rows) -- skipping the expensive rebuild.")
+    if cached_plot_data is not None:
+        print("=" * 60)
+        swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly = cached_plot_data
+        print(f"Loaded full plot-data bundle from {plot_data_path} -- skipping every raw-data "
+              f"step (no shapefiles/ERA5 grid/preprocessed archive access needed).")
+        print("=" * 60)
     else:
-        df_share = pd.read_csv(config.SHARE_RENEWABLE_CSV)
-        swbd_counts_df = build_swbd_counts_table(
-            args.preprocessed_path, args.gwl_list, args.ssp, args.reanalysis, args.suffix_shp,
-            args.swbd_thr, args.swbd_tot_re, args.swbd_mix, df_share, args.exclude_gcm_run,
-        )
-        save_swbd_counts_cache(
-            swbd_counts_df, swbd_cache_path, args.swbd_thr, args.swbd_tot_re,
-            args.swbd_mix, args.ssp, args.suffix_shp)
-        print(f"  Saved SWBD counts cache -> {swbd_cache_path}")
+        print("=" * 60)
+        print("STEP 1/2 - Region/zone geometry: assignment + area weights + land area share")
+        print("=" * 60)
+        geometry_cache_path = args.geometry_cache_json or os.path.join(
+            args.output_dir, "swed_swbd_geometry_cache.json")
+        cached_geometry = None if args.recompute_geometry else load_geometry_cache(
+            geometry_cache_path, plot_data_meta["geometry"])
+        if cached_geometry is not None:
+            land_area_pct, zone_of_poly, area_of_poly = cached_geometry
+            print(f"  Loaded cached geometry from {geometry_cache_path} -- skipping "
+                  f"--regions_shapefile/--shapefile/--era5_grid_path access.")
+        else:
+            zone_of_poly, area_of_poly = assign_regions_to_zones(args.regions_shapefile)
+            print(f"  {len(zone_of_poly)} regions assigned across "
+                  f"{len(set(zone_of_poly.values()))} zones")
+            era5_lat, era5_lon = swed_mod.load_era5_reference_grid(
+                args.preprocessed_path, era5_grid_path=args.era5_grid_path)
+            land_area_pct = swed_mod.compute_land_area_share_per_zone(
+                era5_lat, era5_lon, args.shapefile)
+            for z, pct in land_area_pct.items():
+                print(f"  {z}: {pct:.1f}% of land area")
+            save_geometry_cache(geometry_cache_path, land_area_pct, zone_of_poly, area_of_poly,
+                                 plot_data_meta["geometry"])
+            print(f"  Saved geometry cache -> {geometry_cache_path}")
+
+        print("\n" + "=" * 60)
+        print("STEP 3 - SWED event-duration counts (cached)")
+        print("=" * 60)
+        swed_cache_path = args.swed_cache_csv or os.path.join(
+            args.output_dir, "event_duration_counts_cache.csv")
+        swed_counts_df = swed_mod.load_counts_cache(swed_cache_path, args.threshold, args.ssp)
+        if swed_counts_df is None:
+            swed_counts_df = swed_mod.build_counts_table(
+                args.preprocessed_path, args.gwl_list, args.ssp, args.threshold,
+                args.shapefile, [], args.exclude_gcm_run,
+            )
+            swed_mod.save_counts_cache(swed_counts_df, swed_cache_path, args.threshold, args.ssp)
+        print(f"  {len(swed_counts_df)} SWED cache rows")
+
+        print("\n" + "=" * 60)
+        print("STEP 4 - SWBD event-duration counts (cached)")
+        print("=" * 60)
+        swbd_cache_path = args.swbd_cache_csv or os.path.join(
+            args.output_dir, "swbd_duration_counts_cache.csv")
+        swbd_counts_df = None if args.recompute_swbd else load_swbd_counts_cache(
+            swbd_cache_path, args.swbd_thr, args.swbd_tot_re, args.swbd_mix, args.ssp,
+            args.suffix_shp)
+        if swbd_counts_df is not None:
+            print(f"  Loaded cached SWBD counts from {swbd_cache_path} "
+                  f"({len(swbd_counts_df)} rows) -- skipping the expensive rebuild.")
+        else:
+            df_share = pd.read_csv(config.SHARE_RENEWABLE_CSV)
+            swbd_counts_df = build_swbd_counts_table(
+                args.preprocessed_path, args.gwl_list, args.ssp, args.reanalysis, args.suffix_shp,
+                args.swbd_thr, args.swbd_tot_re, args.swbd_mix, df_share, args.exclude_gcm_run,
+            )
+            save_swbd_counts_cache(
+                swbd_counts_df, swbd_cache_path, args.swbd_thr, args.swbd_tot_re,
+                args.swbd_mix, args.ssp, args.suffix_shp)
+            print(f"  Saved SWBD counts cache -> {swbd_cache_path}")
+
+        save_plot_data_cache(plot_data_path, swed_counts_df, swbd_counts_df, land_area_pct,
+                              zone_of_poly, area_of_poly, plot_data_meta)
+        print(f"\n  Saved full plot-data bundle -> {plot_data_path}")
 
     print("\n" + "=" * 60)
     print("STEP 5 - Plotting")
