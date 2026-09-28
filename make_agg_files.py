@@ -29,33 +29,33 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from itertools import groupby
 
 
-def compute_severity(comp_da, spp_ds, wpp_ds, spp_threshold, wpp_threshold):
+def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold):
     """
     Compute severity of the compound event as the expected shortfall.
-    For each day where a compound event occurs (i.e. compound_occurrence==1), 
-    compute the deficit for spp and wpp as (threshold - actual value) and then 
+    For each day where a compound event occurs (i.e. compound_occurrence==1),
+    compute the deficit for scf and wcf as (threshold - actual value) and then
     take their average. Finally, compute the mean of these deficits over time.
-    
+
     Parameters:
       comp_ds: Dataset with the binary 'compound_occurrence' variable.
-      spp_ds: Dataset with the 'spp' variable.
-      wpp_ds: Dataset with the 'wpp' variable.
-      spp_threshold: DataArray of spp threshold per region.
-      wpp_threshold: DataArray of wpp threshold per region.
-    
+      scf_ds: Dataset with the 'scf' variable.
+      wcf_ds: Dataset with the 'wcf' variable.
+      scf_threshold: DataArray of scf threshold per region.
+      wcf_threshold: DataArray of wcf threshold per region.
+
     Returns:
       severity: DataArray of average severity per region and per year
     """
 
-    deficit_spp = (spp_threshold - spp_ds["spp"])
-    deficit_wpp = (wpp_threshold - wpp_ds["wpp"])
-    
-    daily_deficit = ((deficit_spp + deficit_wpp)) * comp_da
-    
+    deficit_scf = (scf_threshold - scf_ds["scf"])
+    deficit_wcf = (wcf_threshold - wcf_ds["wcf"])
+
+    daily_deficit = ((deficit_scf + deficit_wcf)) * comp_da
+
     total_deficit = daily_deficit.resample(time='1Y').sum()
 
     severity = total_deficit
-    
+
     return severity
 
 
@@ -151,29 +151,35 @@ def load_agg_data_compound(preprocessed_path):
     '''
     ### Load aggregated data for compound events
     ### Parameters:
-    - preprocessed_path: path to the preprocessed data
-    - gwl: the global warming level
-    - rolling: the rolling window for the data
+    - preprocessed_path: path to the preprocessed data (per-GCM
+      wcf_agg_*/scf_agg_* aggregates written by calculate_cf.py, the same
+      files fig45.py/trend_sev_eval.py read for their own aggregated-domain
+      pipelines -- see config.AGREEMENT_AGGREGATED_NC_PATH's docstring)
 
     ### Returns:
     - data: the dataset with the aggregated data for compound events for every GCM, run, ssp and gwl
     that returns the duration, frequency and severity of the compound events per year and poly_idx
 
   '''
-    wpp_paths = glob.glob(os.path.join(preprocessed_path , '*/wpp_agg_*ssp*_ERA5_v1.nc'))
-    spp_paths = glob.glob(os.path.join(preprocessed_path , '*/spp_agg_*ssp*_ERA5_v1.nc'))
+    #the wcf_ref/scf_ref and GWL0-61 paths below are built by raw string
+    #concatenation, not os.path.join -- ensure a trailing separator so that
+    #works regardless of whether the caller passed one
+    preprocessed_path = os.path.join(preprocessed_path, '')
 
-    wpp_paths.sort()
-    spp_paths.sort()
+    wcf_paths = glob.glob(os.path.join(preprocessed_path , '*/wcf_agg_*ssp*_ERA5_v1.nc'))
+    scf_paths = glob.glob(os.path.join(preprocessed_path , '*/scf_agg_*ssp*_ERA5_v1.nc'))
 
-    gcm_list = [x.split('_')[-6] for x in wpp_paths]
-    run_list = [x.split('_')[-4] for x in wpp_paths]
-    ssp_list = [x.split('_')[-5] for x in wpp_paths]
-    gwl_list = [x.split('_')[-3] for x in wpp_paths]
-    print(gcm_list)    
+    wcf_paths.sort()
+    scf_paths.sort()
+
+    gcm_list = [x.split('_')[-6] for x in wcf_paths]
+    run_list = [x.split('_')[-4] for x in wcf_paths]
+    ssp_list = [x.split('_')[-5] for x in wcf_paths]
+    gwl_list = [x.split('_')[-3] for x in wcf_paths]
+    print(gcm_list)
     data = []
 
-    assert run_list == [x.split('_')[-4] for x in spp_paths]
+    assert run_list == [x.split('_')[-4] for x in scf_paths]
     print('Reading data...')
 
     realization_idx = 0
@@ -189,34 +195,41 @@ def load_agg_data_compound(preprocessed_path):
             print(f"Skipping EC-Earth3-Veg-LR r3i1p1f1")
             continue
 
-        wpp = xr.open_dataset(wpp_paths[i])
-        spp = xr.open_dataset(spp_paths[i])
+        wcf = xr.open_dataset(wcf_paths[i])
+        scf = xr.open_dataset(scf_paths[i])
 
         if gwl=='GWL0-61':
-            wpp_ref = xr.open_dataset(preprocessed_path + GCM + '/wpp_agg_ref_' +GCM+'_ERA5_v1.nc')
-            spp_ref = xr.open_dataset(preprocessed_path + GCM + '/spp_agg_ref_' +GCM+'_ERA5_v1.nc')
-            wpp_ref = wpp_ref.sel(time=slice('1982-01-01','2001-12-31'))
-            spp_ref = spp_ref.sel(time=slice('1982-01-01','2001-12-31'))
+            wcf_ref = xr.open_dataset(preprocessed_path + GCM + '/wcf_agg_ref_' +GCM+'_ERA5_v1.nc')
+            scf_ref = xr.open_dataset(preprocessed_path + GCM + '/scf_agg_ref_' +GCM+'_ERA5_v1.nc')
+            wcf_ref = wcf_ref.sel(time=slice('1982-01-01','2001-12-31'))
+            scf_ref = scf_ref.sel(time=slice('1982-01-01','2001-12-31'))
         else:
-            wpp_path = glob.glob(preprocessed_path + GCM + '/wpp_agg_*ssp*'+run_list[i]+'_GWL0-61_ERA5_v1.nc')
-            spp_path = glob.glob(preprocessed_path + GCM + '/spp_agg_*ssp*'+run_list[i]+'_GWL0-61_ERA5_v1.nc')
-            wpp_ref = xr.open_dataset(wpp_path[0])
-            spp_ref = xr.open_dataset(spp_path[0])
-        
+            wcf_path = glob.glob(preprocessed_path + GCM + '/wcf_agg_*ssp*'+run_list[i]+'_GWL0-61_ERA5_v1.nc')
+            scf_path = glob.glob(preprocessed_path + GCM + '/scf_agg_*ssp*'+run_list[i]+'_GWL0-61_ERA5_v1.nc')
+            wcf_ref = xr.open_dataset(wcf_path[0])
+            scf_ref = xr.open_dataset(scf_path[0])
 
-        wpp_thr = wpp_ref.where(wpp_ref.wpp>0).wpp.quantile(0.1, dim='time')
-        spp_thr = spp_ref.where(spp_ref.spp>0).spp.quantile(0.1, dim='time')
 
-        wpp['low_wind'] = xr.where(wpp.wpp <= wpp_thr,1 , 0)
-        spp['low_solar'] = xr.where(spp.spp <= spp_thr,1 , 0)
+        wcf_thr = wcf_ref.where(wcf_ref.wcf>0).wcf.quantile(0.1, dim='time')
+        scf_thr = scf_ref.where(scf_ref.scf>0).scf.quantile(0.1, dim='time')
 
-        compound = wpp.low_wind * spp.low_solar
+        wcf['low_wind'] = xr.where(wcf.wcf <= wcf_thr,1 , 0)
+        scf['low_solar'] = xr.where(scf.scf <= scf_thr,1 , 0)
+
+        compound = wcf.low_wind * scf.low_solar
         compound = compound.to_dataset(name='start_cooc')
 
-        severity_ds = compute_severity(compound.start_cooc, spp, wpp, spp_thr, wpp_thr) #here severity_ds has already been averaged over years
+        #here severity_ds has already been averaged over years; compute_severity
+        #returns a bare DataArray, wrap it so severity_ds.severity below works
+        severity_ds = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr).to_dataset(name='severity')
         ds_dur, ds_freq = duration_xr(compound.start_cooc)
 
-        severity_ds['time'] = severity_ds.time.dt.year.astype(str)
+        #integer year labels, matching duration_xr()'s ds_dur/ds_freq 'year'
+        #coordinate -- .astype(str) here used to silently turn every
+        #'severity' value into NaN below, since ds_final['severity'] =
+        #severity_ds.severity reindexes onto ds_final's existing int-labeled
+        #'year' index, and no string label ever matches an int one
+        severity_ds['time'] = severity_ds.time.dt.year
         severity_ds = severity_ds.rename({'time':'year'})
 
         ds_final = ds_dur.copy()
@@ -225,14 +238,14 @@ def load_agg_data_compound(preprocessed_path):
 
         ds_final = ds_final.expand_dims({'realization': [realization_idx]})
         realization_idx += 1
-        ds_final['GCM'] = GCM 
-        ds_final['run'] = run_list[i] 
+        ds_final['GCM'] = GCM
+        ds_final['run'] = run_list[i]
         ds_final['ssp'] = ssp_list[i]
         ds_final['gwl'] = gwl_list[i]
-        
+
         data.append(ds_final)
     data = xr.concat(data, dim='realization')
-    data = data.drop_dims('time')
+    data = data.drop_dims('time', errors='ignore')
     data['year'] = np.arange(1,21,1)
 
     return data
@@ -261,7 +274,7 @@ if __name__ == '__main__':
         'description': 'Annual statistics of compound energy drought events (simultaneous low-wind and low-solar days).',
         'threshold': '10th percentile of non-zero days over GWL0-61 reference window (ssp245)',
         'excluded': 'MIROC6; EC-Earth3-Veg-LR r3i1p1f1; GWL1',
-        'variables': 'duration [days], frequency [count/year], severity [wpp+spp deficit on event days], low_wind [days/year], low_solar [days/year]',
+        'variables': 'duration [days], frequency [count/year], severity [wcf+scf deficit on event days], low_wind [days/year], low_solar [days/year]',
         'source': 'ERA5-bias-corrected ISIMIP3b projections',
         'creation_date': '2026-03-30',
     }
