@@ -8,9 +8,11 @@ every figure uses the same style:
                 draw_wcf_zero_overlay(). The only grey used on the maps.
   - black dots: pixels / polygons where observed (ERA5) and projected (GCM)
                 trends disagree (agreement_pct <= config.AGREEMENT_THRESHOLD),
-                see draw_discrepancy_dots() (gridded maps) and
-                draw_discrepancy_dots_polygons() (polygon maps). Dots rather
+                see draw_discrepancy_dots() (gridded maps). Dots rather
                 than a solid fill, so the colour underneath still shows.
+  - black mask: same discrepancy criterion on the aggregated (polygon)
+                maps (fig45.py, suppfig7.py): polygons filled solid black,
+                see draw_discrepancy_mask_polygons().
 
 Kept free of config / heavy imports so any figure script can use it.
 """
@@ -137,6 +139,27 @@ def draw_discrepancy_dots_polygons(ax, geoms, zorder=4):
 
 
 # =============================================================================
+# Black mask: observation-projection trend discrepancy (aggregated maps)
+# =============================================================================
+
+DISCREPANCY_MASK_COLOR = "black"
+
+
+def draw_discrepancy_mask_polygons(ax, geoms, zorder=4):
+    """
+    Aggregated (polygon) maps: fill each geometry in geoms (lon/lat shapely
+    geometries) in solid black, hiding the colour underneath.
+    """
+    geoms = [g for g in geoms if g is not None and not g.is_empty]
+    if not geoms:
+        return
+    ax.add_geometries(geoms, crs=ccrs.PlateCarree(),
+                      facecolor=DISCREPANCY_MASK_COLOR,
+                      edgecolor=DISCREPANCY_MASK_COLOR,
+                      linewidth=0.15, zorder=zorder)
+
+
+# =============================================================================
 # Legend handles
 # =============================================================================
 
@@ -153,17 +176,26 @@ def discrepancy_legend_handle(label="Obs.-projection trend discrepancy"):
         markersize=2 * np.sqrt(DISCREPANCY_DOT_SIZE / np.pi), label=label)
 
 
+def discrepancy_mask_legend_handle(label="Obs.-projection trend discrepancy"):
+    return Patch(facecolor=DISCREPANCY_MASK_COLOR, edgecolor="none", label=label)
+
+
 def wcf_zero_legend_handle(label="Excluded: no wind capacity (wcf = 0)"):
     return Patch(facecolor=WCF_ZERO_COLOR, edgecolor="none", label=label)
 
 
-def add_exclusion_legend(ax, show_discrepancy=True, show_wcf_zero=True, **kwargs):
-    """Legend for the two exclusion layers, lower right of a map axes."""
+def add_exclusion_legend(ax, show_discrepancy=True, show_wcf_zero=True,
+                         discrepancy_style="dots", **kwargs):
+    """
+    Legend for the two exclusion layers, lower right of a map axes.
+    discrepancy_style: "dots" (gridded maps) or "mask" (aggregated maps).
+    """
     handles = []
     if show_wcf_zero:
         handles.append(wcf_zero_legend_handle())
     if show_discrepancy:
-        handles.append(discrepancy_legend_handle())
+        handles.append(discrepancy_mask_legend_handle() if discrepancy_style == "mask"
+                       else discrepancy_legend_handle())
     if not handles:
         return None
     opts = dict(loc="lower right", bbox_to_anchor=(1.0, -0.02), fontsize=4.5,

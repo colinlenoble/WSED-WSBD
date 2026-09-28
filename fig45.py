@@ -32,9 +32,9 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cmocean as cmo
 
-# Dot layer for low model agreement (obs.-projection trend discrepancy),
-# shared with fig1.py and fig3.py.
-from map_overlays import draw_discrepancy_dots_polygons, discrepancy_legend_handle
+# Black mask for low model agreement (obs.-projection trend discrepancy),
+# drawn in solid black on the aggregated polygon maps (see map_overlays.py).
+from map_overlays import draw_discrepancy_mask_polygons, discrepancy_mask_legend_handle
 
 
 # =============================================================================
@@ -477,7 +477,7 @@ def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
     fcs      = [(1.0, 1.0, 1.0, 1.0) if n else cmap(norm(v))
                 for v, n in zip(vals, nan_mask)]
     hpats = np.where(gdf2["do_hatch"].to_numpy(), "/" * density * 3, "")
-    dot_geoms = []   # low model agreement -> dots
+    dot_geoms = []   # low model agreement -> black mask
     for geom, fc, hp, is_nan in zip(gdf2.geometry, fcs, hpats, nan_mask):
         if geom is None:
             continue
@@ -489,7 +489,7 @@ def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             dot_geoms.append(geom)
-    draw_discrepancy_dots_polygons(ax, dot_geoms, zorder=4)
+    draw_discrepancy_mask_polygons(ax, dot_geoms, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -1379,7 +1379,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
                 for v, n in zip(vals, nan_mask)]
     hpats = np.where(gdf["do_hatch"].to_numpy(), "/" * 21, "")
     ax.add_feature(cfeature.COASTLINE, linewidth=0.25, zorder=1)
-    dot_geoms = []   # low model agreement -> dots
+    dot_geoms = []   # low model agreement -> black mask
     for geom, fc, hp, is_nan in zip(gdf.geometry, fcs, hpats, nan_mask):
         if geom is None:
             continue
@@ -1391,7 +1391,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             dot_geoms.append(geom)
-    draw_discrepancy_dots_polygons(ax, dot_geoms, zorder=4)
+    draw_discrepancy_mask_polygons(ax, dot_geoms, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -1410,7 +1410,7 @@ def plot_supp_decomp(df_gwl2, shapefile_path, hatch_df,
 
     ax.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No renewable capacities"),
-        discrepancy_legend_handle("Low model-agreement"),
+        discrepancy_mask_legend_handle("Low model-agreement"),
     ], loc="lower right", bbox_to_anchor=(1.0, 0.0), bbox_transform=ax.transAxes,
        fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
@@ -1550,7 +1550,7 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
         legend_ax.legend(handles=[
             Patch(facecolor="white", edgecolor="black", hatch="\\" * 10,
                   label="No RE capacities"),
-            discrepancy_legend_handle("Low model agreement"),
+            discrepancy_mask_legend_handle("Low model agreement"),
         ], loc="upper center", bbox_to_anchor=(0.5, -0.08),
            bbox_transform=legend_ax.transAxes,
            fontsize=5, framealpha=0.85, handlelength=1.5,
@@ -1726,7 +1726,7 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
         legend_ax.legend(handles=[
             Patch(facecolor="white", edgecolor="black", hatch="\\" * 10,
                   label="No RE capacities"),
-            discrepancy_legend_handle("Low model agreement"),
+            discrepancy_mask_legend_handle("Low model agreement"),
         ], loc="upper center", bbox_to_anchor=(0.5, -0.08),
            bbox_transform=legend_ax.transAxes,
            fontsize=5, framealpha=0.85, handlelength=1.5,
@@ -1863,7 +1863,7 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
     no_data_set = set(gdf_diff[no_data_mask]["poly_idx"].tolist())
     hatch_set   = set(idxs_to_hatch.tolist() if hasattr(idxs_to_hatch, "tolist") else list(idxs_to_hatch))
 
-    dot_geoms = []   # low model agreement -> dots
+    dot_geoms = []   # low model agreement -> black mask
     for geom, clr, pid in zip(gdf_diff.geometry, gdf_diff["color"], gdf_diff["poly_idx"]):
         if geom is None:
             continue
@@ -1876,7 +1876,7 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
         if pid in hatch_set:
             dot_geoms.append(geom)
 
-    draw_discrepancy_dots_polygons(ax2, dot_geoms, zorder=4)
+    draw_discrepancy_mask_polygons(ax2, dot_geoms, zorder=4)
     ax2.set_global()
     mask_poles(ax2)
     try:
@@ -1894,7 +1894,7 @@ def plot_supp_mix_effect(df_gwl2_curr, df_gwl2_fut,
             Patch(facecolor="#91bfdb", edgecolor="none", label="Warming decreases SWBDs, Mix increases SWBDs"),
             Patch(facecolor="#8B4513", edgecolor="none", label="No change in mix"),
             Patch(facecolor="white",   edgecolor="black", hatch="\\" * 10, label="No RE capacities"),
-            discrepancy_legend_handle("Low model agreement"),
+            discrepancy_mask_legend_handle("Low model agreement"),
         ],
         loc="upper center", fontsize=4, ncol=2,
         bbox_to_anchor=(0.5, -0.08), bbox_transform=ax2.transAxes,
@@ -1941,7 +1941,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
                 for v, n in zip(vals, nan_mask)]
     hpats = np.where(gdf["do_hatch"].to_numpy(), "/" * 21, "")
     ax.add_feature(cfeature.COASTLINE, linewidth=0.25, zorder=1)
-    dot_geoms = []   # low model agreement -> dots
+    dot_geoms = []   # low model agreement -> black mask
     for geom, fc, hp, is_nan in zip(gdf.geometry, fcs, hpats, nan_mask):
         if geom is None:
             continue
@@ -1953,7 +1953,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             dot_geoms.append(geom)
-    draw_discrepancy_dots_polygons(ax, dot_geoms, zorder=4)
+    draw_discrepancy_mask_polygons(ax, dot_geoms, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -1972,7 +1972,7 @@ def plot_supp_uncertainty_decomp(df_gwl2, shapefile_path, hatch_df,
     cb.ax.tick_params(labelsize=5)
     ax.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No renewable capacities"),
-        discrepancy_legend_handle("Low model-agreement"),
+        discrepancy_mask_legend_handle("Low model-agreement"),
     ], loc="lower right", bbox_to_anchor=(1.0, 0.0), bbox_transform=ax.transAxes,
        fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
@@ -2014,7 +2014,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
                 for v, n in zip(vals, nan_mask)]
     hpats = np.where(gdf["do_hatch"].to_numpy(), "/" * 21, "")
     ax.add_feature(cfeature.COASTLINE, linewidth=0.25, zorder=1)
-    dot_geoms = []   # low model agreement -> dots
+    dot_geoms = []   # low model agreement -> black mask
     for geom, fc, hp, is_nan in zip(gdf.geometry, fcs, hpats, nan_mask):
         if geom is None:
             continue
@@ -2026,7 +2026,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
                               linewidth=0.0, hatch="\\" * 10, zorder=3)
         if hp:
             dot_geoms.append(geom)
-    draw_discrepancy_dots_polygons(ax, dot_geoms, zorder=4)
+    draw_discrepancy_mask_polygons(ax, dot_geoms, zorder=4)
     ax.set_global()
     mask_poles(ax)
     try:
@@ -2043,7 +2043,7 @@ def plot_supp_re_variability(df_gwl2, shapefile_path, hatch_df,
     cb.ax.tick_params(labelsize=5)
     ax.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No renewable capacities"),
-        discrepancy_legend_handle("Low model-agreement"),
+        discrepancy_mask_legend_handle("Low model-agreement"),
     ], loc="lower right", bbox_to_anchor=(1.0, 0.0), bbox_transform=ax.transAxes,
        fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
@@ -2104,7 +2104,7 @@ def plot_re_share_effect(gwl_dfs_by_share, shapefile_path, hatch_df,
 
     legend_handles = [
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No solar-wind capacities"),
-        discrepancy_legend_handle("Low model agreement"),
+        discrepancy_mask_legend_handle("Low model agreement"),
     ]
     last_panel = fig.axes[8]
     last_panel.legend(handles=legend_handles, loc="upper center",
@@ -2184,7 +2184,7 @@ def plot_re_share_effect_absolute(gwl_dfs_by_share, shapefile_path, hatch_df,
 
     legend_handles = [
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No solar-wind capacities"),
-        discrepancy_legend_handle("Low model agreement"),
+        discrepancy_mask_legend_handle("Low model agreement"),
     ]
     last_panel = fig.axes[8]
     last_panel.legend(handles=legend_handles, loc="upper center",
@@ -2278,7 +2278,7 @@ def _driver_effects_figure(df_supply, supply_col, df_demand, demand_col,
              ha="center", va="top", fontsize=8, fontweight="bold")
     fig.legend(handles=[
         Patch(facecolor="white", edgecolor="black", hatch="\\" * 10, label="No RE capacity"),
-        discrepancy_legend_handle("Low model agreement"),
+        discrepancy_mask_legend_handle("Low model agreement"),
     ], ncol=2, loc="center", bbox_to_anchor=(0.5, 0.09 / fig_h), bbox_transform=fig.transFigure,
        fontsize=5, framealpha=0.85, handlelength=1.0, handletextpad=0.4, borderpad=0.4)
 
