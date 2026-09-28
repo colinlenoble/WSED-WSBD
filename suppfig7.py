@@ -165,6 +165,41 @@ def trend_for_metric(data_by_gwl, metric, comparison_gwl, reference_gwl,
 # Data loading
 # =============================================================================
 
+def _year_dim(da, var_name):
+    """The one dim of `da` besides realization/poly_idx -- its annual axis."""
+    candidates = [d for d in da.dims if d not in ("realization", "poly_idx")]
+    if len(candidates) != 1:
+        raise ValueError(
+            f"{var_name} has unexpected dims {da.dims}: expected exactly one "
+            f"dimension besides realization/poly_idx for the annual axis")
+    return candidates[0]
+
+
+def _align_year_axis(ds, variables=("frequency", "duration", "intensity")):
+    """
+    Normalise frequency/duration/intensity onto a single, positionally
+    -indexed 'year' dimension before combining them. On the raw aggregated
+    file (make_agg_files.py) frequency/duration come out of duration_xr()
+    already on a 'year' dim, while intensity (severity) keeps
+    resample(time=...)'s 'time' dim, renamed to 'year' with its labels
+    turned into strings -- so even after the rename, its 'year' coordinate
+    doesn't match frequency/duration's integer one. Left as-is, multiplying
+    the three together silently broadcasts the mismatched axes into a
+    spurious extra dimension instead of erroring loudly.
+    """
+    dims = {var: _year_dim(ds[var], var) for var in variables}
+    lengths = {var: ds[var].sizes[dims[var]] for var in variables}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"frequency/duration/intensity have mismatched year "
+                         f"axis lengths: {lengths}")
+    for var in variables:
+        da = ds[var].drop_vars(dims[var], errors="ignore")
+        if dims[var] != "year":
+            da = da.rename({dims[var]: "year"})
+        ds[var] = da
+    return ds.assign_coords(year=np.arange(1, lengths[variables[0]] + 1))
+
+
 def load_indicators(path):
     """
     Yearly indicators with the current terminology: frequency, duration,
@@ -178,6 +213,7 @@ def load_indicators(path):
         if "severity" not in ds:
             raise ValueError(f"{path} has neither 'intensity' nor legacy 'severity'")
         ds = ds.rename({"severity": "intensity"})
+    ds = _align_year_axis(ds)
     for var in ("frequency", "duration", "intensity"):
         ds[var] = ds[var].fillna(0)
     ds["severity"] = ds["frequency"] * ds["duration"] * ds["intensity"]
