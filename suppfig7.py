@@ -10,16 +10,17 @@ Supplementary figure 7: model agreement on projected RED severity changes
 
 Terminology: frequency (events/year), duration (days/event) and intensity
 (mean deficit on event days) are the three RED components; severity is
-their product, frequency x duration x intensity. Older files call intensity
-"severity"; it is renamed on load.
+their product, frequency x duration x intensity. make_agg_files.py calls
+intensity "severity"; it is renamed on load.
 
-Significance of the severity change (each GWL vs GWL0-61, per GCM/run) is
-always recomputed from --indicators_nc, the yearly indicator file built from
-every wcf/scf aggregate available (make_agg_files.py), with a paired
-permutation test + Benjamini-Hochberg FDR -- there is no separate
-precomputed significance file to fall back to, since --indicators_nc already
-covers every GCM/run/GWL combination. Panels c-d read a precomputed variance
-decomposition (--variability_nc).
+The yearly indicators are always rebuilt from scratch via
+make_agg_files.load_agg_data_compound(), which reads every per-GCM
+wpp_agg_*/spp_agg_* aggregate under --preprocessed_path -- there is no
+cached compound_years_agg_freq_sev_dur.nc to read instead (it no longer
+exists on disk). Significance of the severity change (each GWL vs GWL0-61,
+per GCM/run) is then computed on that rebuilt dataset with a paired
+permutation test + Benjamini-Hochberg FDR. Panels c-d read a precomputed
+variance decomposition (--variability_nc).
 
 Port of cell 26 of como24_group5/code_final/3.1.3 disagreements.ipynb.
 """
@@ -44,6 +45,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.colors import ListedColormap, BoundaryNorm, LogNorm
 
 from map_overlays import draw_discrepancy_mask_polygons, add_exclusion_legend
+from make_agg_files import load_agg_data_compound
 
 FIG_WIDTH_IN = 5.15
 MAP_EXTENT = [-180, 180, -58, 68]
@@ -73,15 +75,17 @@ def parse_args():
                     "decomposition (supplementary figure 7).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--indicators_nc",
-                        default=os.path.join(agg_dir, "compound_years_agg_freq_sev_dur.nc"),
-                        help="Yearly aggregated RED indicators (frequency, duration, "
-                             "intensity -- or legacy 'severity' -- per realization/year/poly_idx).")
+    parser.add_argument("--preprocessed_path", default=config.PATH_PREPROCESSED,
+                        help="Root of the per-GCM wpp_agg_*/spp_agg_* aggregates "
+                             "(make_agg_files.load_agg_data_compound()'s input). The "
+                             "yearly indicators (frequency, duration, intensity/severity) "
+                             "are always rebuilt from these from scratch -- there is no "
+                             "cached compound_years_agg_freq_sev_dur.nc to read instead.")
     parser.add_argument("--save_significance_nc", default=None,
                         help="Optional path to also save the recomputed severity trend "
                              "significance to (e.g. for reuse by other figures). Not read "
-                             "back in -- the significance is always recomputed from "
-                             "--indicators_nc.")
+                             "back in -- the significance is always recomputed from the "
+                             "rebuilt indicators.")
     parser.add_argument("--variability_nc",
                         default=os.path.join(agg_dir, "custom_regional_analysis_v1.nc"),
                         help="Precomputed variance decomposition (variables 'total' and 'I').")
@@ -93,7 +97,7 @@ def parse_args():
     parser.add_argument("--gwls", nargs=2, default=["GWL2", "GWL3"],
                         help="The two GWLs shown in panels a and b.")
     parser.add_argument("--shapefile_disag", default=config.SHAPEFILE_PATH_LIGHT,
-                        help="Shapefile matching the poly_idx of --indicators_nc.")
+                        help="Shapefile matching the poly_idx of the rebuilt indicators.")
     parser.add_argument("--shapefile_var", default=config.SHAPEFILE_PATH,
                         help="Shapefile matching the regions of --variability_nc.")
     parser.add_argument("--agreement_aggregated_nc", default=config.AGREEMENT_AGGREGATED_NC_PATH)
@@ -219,18 +223,20 @@ def _align_year_axis(ds, variables=("frequency", "duration", "intensity")):
     return ds.assign_coords(year=np.arange(1, lengths[variables[0]] + 1))
 
 
-def load_indicators(path):
+def load_indicators(preprocessed_path):
     """
     Yearly indicators with the current terminology: frequency, duration,
-    intensity, and severity = frequency x duration x intensity. Files written
-    by make_agg_files.py still store intensity under the legacy name
-    'severity'; it is renamed here.
+    intensity, and severity = frequency x duration x intensity. Rebuilt from
+    scratch every call via make_agg_files.load_agg_data_compound() (reads
+    every wpp_agg_*/spp_agg_* aggregate under `preprocessed_path`) -- there
+    is no cached compound_years_agg_freq_sev_dur.nc to read instead. That
+    function names intensity "severity"; it is renamed here.
     """
-    with xr.open_dataset(path) as src:
-        ds = src.load()
+    ds = load_agg_data_compound(preprocessed_path)
     if "intensity" not in ds:
         if "severity" not in ds:
-            raise ValueError(f"{path} has neither 'intensity' nor legacy 'severity'")
+            raise ValueError("load_agg_data_compound() returned neither "
+                             "'intensity' nor legacy 'severity'")
         ds = ds.rename({"severity": "intensity"})
     ds = _align_year_axis(ds)
     for var in ("frequency", "duration", "intensity"):
@@ -444,8 +450,9 @@ def plot_suppfig7(agreement_panels, shapefile_disag, discrepancy_idx,
 def main():
     args = parse_args()
 
-    print(f"Computing severity trend significance from {args.indicators_nc}")
-    ds = load_indicators(args.indicators_nc)
+    print(f"Rebuilding yearly RED indicators from {args.preprocessed_path}")
+    ds = load_indicators(args.preprocessed_path)
+    print("Computing severity trend significance")
     sig = compute_severity_significance(
         ds, gwls=args.gwls, alpha=args.alpha, ssp=args.ssp,
         reference_gwl=args.reference_gwl, n_resamples=args.n_resamples, seed=args.seed,
