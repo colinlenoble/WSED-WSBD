@@ -165,13 +165,28 @@ def trend_for_metric(data_by_gwl, metric, comparison_gwl, reference_gwl,
 # Data loading
 # =============================================================================
 
+def _squeeze_degenerate_dims(da, keep=("realization", "poly_idx", "year", "time")):
+    """
+    Drop any size-1 dimension of `da` besides `keep`. On the raw aggregated
+    file, intensity (severity) can carry a stray length-1 'year' or 'time'
+    dim alongside its real one -- a leftover from make_agg_files.py's
+    coordinate bookkeeping (e.g. an auxiliary year label promoted to its
+    own dimension), not a genuine second data axis.
+    """
+    degenerate = [d for d in da.dims if d not in ("realization", "poly_idx")
+                 and da.sizes[d] == 1]
+    return da.squeeze(degenerate, drop=True) if degenerate else da
+
+
 def _year_dim(da, var_name):
     """The one dim of `da` besides realization/poly_idx -- its annual axis."""
     candidates = [d for d in da.dims if d not in ("realization", "poly_idx")]
     if len(candidates) != 1:
+        sizes = {d: da.sizes[d] for d in candidates}
         raise ValueError(
-            f"{var_name} has unexpected dims {da.dims}: expected exactly one "
-            f"dimension besides realization/poly_idx for the annual axis")
+            f"{var_name} has unexpected dims {da.dims} (sizes {sizes} besides "
+            f"realization/poly_idx): expected exactly one non-degenerate "
+            f"dimension for the annual axis after squeezing size-1 dims")
     return candidates[0]
 
 
@@ -183,10 +198,14 @@ def _align_year_axis(ds, variables=("frequency", "duration", "intensity")):
     already on a 'year' dim, while intensity (severity) keeps
     resample(time=...)'s 'time' dim, renamed to 'year' with its labels
     turned into strings -- so even after the rename, its 'year' coordinate
-    doesn't match frequency/duration's integer one. Left as-is, multiplying
-    the three together silently broadcasts the mismatched axes into a
-    spurious extra dimension instead of erroring loudly.
+    doesn't match frequency/duration's integer one, and it can also retain
+    a stray degenerate ('time' or 'year') axis on top of the real one. Left
+    as-is, multiplying the three together silently broadcasts the
+    mismatched axes into a spurious extra dimension instead of erroring
+    loudly.
     """
+    for var in variables:
+        ds[var] = _squeeze_degenerate_dims(ds[var])
     dims = {var: _year_dim(ds[var], var) for var in variables}
     lengths = {var: ds[var].sizes[dims[var]] for var in variables}
     if len(set(lengths.values())) != 1:
