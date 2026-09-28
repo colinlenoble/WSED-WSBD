@@ -63,6 +63,7 @@ C_SUPPLY   = "#2ca02c"
 C_RL       = "#7b3294"
 C_THR      = "0.45"
 C_EVENT    = "#d62728"
+C_GAP      = "0.85"      # demand - supply surface
 EVENT_ALPHA = 0.30
 THR_STYLE  = dict(color=C_THR, ls="--", lw=0.6)
 MONTH_INITIALS = "JFMAMJJASOND"
@@ -205,14 +206,17 @@ def plot_swed_swbd_schema(wcf, scf, wthr, sthr, swed,
     sf_a, sf_b = fig.subfigures(1, 2, wspace=0.04)
 
     # -- panel a: SWED ------------------------------------------------------
+    thr_word = "seasonal threshold" if swed_method == "seasonal" else "threshold"
     ax_a = sf_a.subplots()
     ax_a.plot(t, wcf.sel(**sel).values, lw=0.6, color=C_WIND)
     ax_a.plot(t, scf.sel(**sel).values, lw=0.6, color=C_SOLAR)
-    for thr in (wthr, sthr):
+    # Each threshold in its own series' colour, so the two are distinguishable
+    for thr, color in ((wthr, C_WIND), (sthr, C_SOLAR)):
+        style = {**THR_STYLE, "color": color, "lw": 0.8}
         if isinstance(thr, xr.DataArray):
-            ax_a.plot(t, thr.sel(**sel).values, **THR_STYLE)
+            ax_a.plot(t, thr.sel(**sel).values, **style)
         else:
-            ax_a.axhline(thr, **THR_STYLE)
+            ax_a.axhline(thr, **style)
     _shade_events([ax_a], t, swed.sel(**sel).values)
 
     ax_a.set_ylabel("Capacity factor", fontsize=FS_AXIS_LABEL)
@@ -222,17 +226,27 @@ def plot_swed_swbd_schema(wcf, scf, wthr, sthr, swed,
     _legend(sf_a, [
         Line2D([0], [0], color=C_WIND, lw=0.8, label="Wind"),
         Line2D([0], [0], color=C_SOLAR, lw=0.8, label="Solar"),
-        Line2D([0], [0], label=(f"Seasonal threshold (P{swed_q * 100:g})" if swed_method == "seasonal"
-                                  else f"Threshold (P{swed_q * 100:g})"), **THR_STYLE),
+        Line2D([0], [0], label=f"Wind {thr_word} (P{swed_q * 100:g})",
+               **{**THR_STYLE, "color": C_WIND, "lw": 0.8}),
+        Line2D([0], [0], label=f"Solar {thr_word} (P{swed_q * 100:g})",
+               **{**THR_STYLE, "color": C_SOLAR, "lw": 0.8}),
         Patch(color=C_EVENT, alpha=EVENT_ALPHA, lw=0, label="SWED day"),
     ])
 
     # -- panel b: SWBD ------------------------------------------------------
     ax_b1, ax_b2 = sf_b.subplots(2, 1, sharex=True, height_ratios=[1.2, 1])
-    ax_b1.plot(t, demand.sel(**sel).values, lw=0.6, color=C_DEMAND)
-    ax_b1.plot(t, tot_re * supply.sel(**sel).values, lw=0.6, color=C_SUPPLY)
-    ax_b2.plot(t, rl.sel(**sel).values, lw=0.6, color=C_RL)
+    d_y  = demand.sel(**sel).values
+    s_y  = tot_re * supply.sel(**sel).values
+    rl_y = rl.sel(**sel).values
+    # Demand - supply gap as a surface: it is the residual load plotted below
+    ax_b1.fill_between(t, d_y, s_y, color=C_GAP, lw=0, zorder=1)
+    ax_b1.plot(t, d_y, lw=0.6, color=C_DEMAND, zorder=2)
+    ax_b1.plot(t, s_y, lw=0.6, color=C_SUPPLY, zorder=2)
+    ax_b2.plot(t, rl_y, lw=0.6, color=C_RL, zorder=2)
     ax_b2.axhline(rl_thr, **THR_STYLE)
+    # Residual load above the P99 threshold: where the SWBD days come from
+    ax_b2.fill_between(t, rl_y, rl_thr, where=rl_y > rl_thr, interpolate=True,
+                       color=C_EVENT, lw=0, zorder=3)
     _shade_events([ax_b1, ax_b2], t, swbd.sel(**sel).values)
 
     ax_b1.set_ylabel("Energy\n(normalised)", fontsize=FS_AXIS_LABEL)
@@ -246,7 +260,6 @@ def plot_swed_swbd_schema(wcf, scf, wthr, sthr, swed,
     _legend(sf_b, [
         Line2D([0], [0], color=C_DEMAND, lw=0.8, label="Demand"),
         Line2D([0], [0], color=C_SUPPLY, lw=0.8, label="Renewable supply"),
-        Line2D([0], [0], color=C_RL, lw=0.8, label="Residual load"),
         Line2D([0], [0], label=f"Threshold (P{swbd_q * 100:g})", **THR_STYLE),
         Patch(color=C_EVENT, alpha=EVENT_ALPHA, lw=0, label="SWBD day"),
     ])

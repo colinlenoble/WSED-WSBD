@@ -44,6 +44,9 @@ from itertools import groupby
 
 import cmocean as cmo
 
+# Grey "no wind capacity" layer, shared with fig3.py and fig45.py.
+from map_overlays import draw_wcf_zero_overlay
+
 # =============================================================================
 # Figure size constants (LaTeX-compatible)
 # =============================================================================
@@ -489,27 +492,6 @@ def fit_to_width(fig, width_in=FIG_WIDTH_IN, n_iter=4, tol=0.002):
     return fig
 
 
-def draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp, target_lat, target_lon, zorder=7):
-    """
-    Light-grey overlay for land pixels excluded because ERA5 wcf is exactly
-    0 across the whole reference period (see build_wcf_zero_mask). Drawn at
-    a higher zorder than the ocean mask/agreement hatching so it stays
-    visible over them regardless of those other masks' own state at the
-    same pixel. No-op if wcf_zero_mask is None.
-    """
-    if wcf_zero_mask is None:
-        return
-    wcf0 = wcf_zero_mask.astype(float).interp(
-        lat=target_lat, lon=target_lon, method="nearest").values
-    grey = np.asarray(land_shp) & (wcf0 > 0.5)
-    if grey.any():
-        ax.contourf(
-            target_lon, target_lat, grey.astype(float),
-            levels=[0.5, 1], colors=["lightgrey"],
-            transform=ccrs.PlateCarree(), zorder=zorder,
-        )
-
-
 def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
     y = np.asarray(y, dtype=np.float64)
     if y.size < 2 or np.all(np.isnan(y)):
@@ -551,8 +533,8 @@ def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
 def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
     ds_final, mask, shapefile_path,
     map_title="Projected change (color) weighted by annual severity (opacity)",
-    relchange_label="Relative change (2000-2019 vs 1980-1999) (%)",
-    sev_label="Annual severity (1980-1999 mean)",
+    relchange_label="Relative change (2002-2021 vs 1982-2001) (%)",
+    sev_label="Annual severity (1982-2001 mean)",
     lat_min=-60, lat_max=72,
     period_hist=(1982, 2001), period_comp=(2002, 2021),
     regions=None, n_boot=2000, n_bins_change=5, n_bins_sev=5,
@@ -639,12 +621,8 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
     land_mask  = rasterize_shapefile(shp_band, da_mask.shape, t_mask)
     land_mask  = land_mask[::-1, :]
     ocean_mask = land_mask & (da_mask.isnull())
-    ax_map.contourf(
-        ocean_mask.lon, ocean_mask.lat, ocean_mask.values.astype(float),
-        levels=[0.5, 1], colors=["gray"],
-        transform=ccrs.PlateCarree(), zorder=5,
-    )
-    draw_wcf_zero_overlay(ax_map, wcf_zero_mask, land_mask, da_mask.lat, da_mask.lon)
+    draw_wcf_zero_overlay(ax_map, wcf_zero_mask, land_mask, da_mask.lat, da_mask.lon,
+                          nan_data=ocean_mask)
     shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     ax_map.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
@@ -776,10 +754,8 @@ def plot_variability_map(ds_final, mask, shapefile_path, dpi=300, wcf_zero_mask=
     )
     land_plot = rasterize_shapefile(shapefile_band, da_mask.shape, t_mask)[::-1, :]
     mask_plot = land_plot & (da_mask.isnull())
-    ax.contourf(mask_plot.lon, mask_plot.lat, mask_plot.values.astype(float),
-                levels=[0.5, 1], colors=["gray"],
-                transform=ccrs.PlateCarree(), zorder=5)
-    draw_wcf_zero_overlay(ax, wcf_zero_mask, land_plot, da_mask.lat, da_mask.lon)
+    draw_wcf_zero_overlay(ax, wcf_zero_mask, land_plot, da_mask.lat, da_mask.lon,
+                          nan_data=mask_plot)
     shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                  transform=ccrs.PlateCarree(), zorder=10)
     ax.set_global()
@@ -889,15 +865,10 @@ def plot_mean_variables_6panel(
         ax.set_global()
         mask_poles(ax, lat_south, lat_north)
         ax.coastlines(resolution="50m", linewidth=0.15, color="black")
-        if idx in (0, 1, 2, 3, 6):
-            ax.contourf(
-                ocean_mask_comp.lon, ocean_mask_comp.lat,
-                ocean_mask_comp.values.astype(float),
-                levels=[0.5, 1], colors=["gray"],
-                transform=ccrs.PlateCarree(), zorder=5,
-            )
         land_for_panel = land_mask_comp if idx in (0, 1, 2, 3, 6) else land_mask_wcf
-        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_for_panel, ds.lat, ds.lon)
+        nan_for_panel  = ocean_mask_comp if idx in (0, 1, 2, 3, 6) else None
+        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_for_panel, ds.lat, ds.lon,
+                              nan_data=nan_for_panel)
         ds.plot.pcolormesh(
             ax=ax, transform=ccrs.PlateCarree(),
             cmap=cmap_list[idx], vmin=vmin_list[idx], vmax=vmax_list[idx],
@@ -1007,10 +978,8 @@ def plot_valuebyalpha_sensitivity(
         )
         land_m  = rasterize_shapefile(shapefile_band, da_m.shape, t_m)[::-1, :]
         ocean_m = land_m & (da_m.isnull())
-        ax.contourf(ocean_m.lon, ocean_m.lat, ocean_m.values.astype(float),
-                    levels=[0.5, 1], colors=["gray"],
-                    transform=ccrs.PlateCarree(), zorder=5)
-        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_m, da_m.lat, da_m.lon)
+        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_m, da_m.lat, da_m.lon,
+                              nan_data=ocean_m)
         shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                      transform=ccrs.PlateCarree(), zorder=10)
         ax.annotate(
@@ -1147,10 +1116,8 @@ def plot_combined_threshold_sensitivity(
         )
         land_m  = rasterize_shapefile(shapefile_band, da_m.shape, t_m)[::-1, :]
         ocean_m = land_m & (da_m.isnull())
-        ax.contourf(ocean_m.lon, ocean_m.lat, ocean_m.values.astype(float),
-                    levels=[0.5, 1], colors=["gray"],
-                    transform=ccrs.PlateCarree(), zorder=5)
-        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_m, da_m.lat, da_m.lon)
+        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_m, da_m.lat, da_m.lon,
+                              nan_data=ocean_m)
         shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
                                      transform=ccrs.PlateCarree(), zorder=10)
         ax.annotate(
@@ -1251,8 +1218,8 @@ def plot_combined_threshold_sensitivity(
 def compute_global_change_stats(ds_final, mask, n_bootstrap=1000, block_size=10):
     ds = ds_final.where(mask == 1)
     ds["annual_severity"] = ds["frequency"] * ds["severity"] * ds["duration"]
-    early = ds["annual_severity"].sel(year=slice(1980, 1999)).mean(dim="year")
-    late  = ds["annual_severity"].sel(year=slice(2000, 2019)).mean(dim="year")
+    early = ds["annual_severity"].sel(year=slice(1982, 2001)).mean(dim="year")
+    late  = ds["annual_severity"].sel(year=slice(2002, 2021)).mean(dim="year")
     weights      = np.cos(np.deg2rad(ds.lat))
     weights.name = "weights"
     global_early      = early.weighted(weights).mean(dim=["lat", "lon"]).values

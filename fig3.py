@@ -22,6 +22,10 @@ from scipy import stats
 # Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
 # (prefers a .zarr store when present, falls back to .nc).
 from io_utils import match_files, glob_any, open_dataset_any
+# Grey (no wind capacity) / dots (obs.-projection trend discrepancy)
+# exclusion layers, shared with fig1.py and fig45.py.
+from map_overlays import (draw_wcf_zero_overlay, draw_discrepancy_dots,
+                          add_exclusion_legend)
 
 import matplotlib
 matplotlib.use("Agg")
@@ -540,27 +544,6 @@ def fit_to_width(fig, width_in=FIG_WIDTH_IN, n_iter=4, tol=0.002):
     return fig
 
 
-def draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp, target_lat, target_lon, zorder=7):
-    """
-    Light-grey overlay for land pixels excluded because ERA5 wcf is exactly
-    0 across the whole reference period (see load_wcf_zero_mask). Drawn at
-    a higher zorder than agreement-hatching's black layer so it stays
-    visible on top of it regardless of the hatching's own state at the same
-    pixel. No-op if wcf_zero_mask is None.
-    """
-    if wcf_zero_mask is None:
-        return
-    wcf0 = wcf_zero_mask.astype(float).interp(
-        lat=target_lat, lon=target_lon, method="nearest").values
-    grey = np.asarray(land_shp) & (wcf0 > 0.5)
-    if grey.any():
-        ax.contourf(
-            target_lon, target_lat, grey.astype(float),
-            levels=[0.5, 1], colors=["lightgrey"],
-            transform=ccrs.PlateCarree(), zorder=zorder,
-        )
-
-
 def _reduce_to_2d(da):
     """Average out 'year' and 'realization' dims to obtain a (lat, lon) DataArray."""
     if "year" in da.dims:
@@ -840,19 +823,18 @@ def plot_gwl_valuebyalpha_discrete(
                            transform=ccrs.PlateCarree(), zorder=10)
 
     if hatchings is not None:
-        # Black layer: land pixels that failed the trend-agreement evaluation
+        # Dot hatching: land pixels that failed the trend-agreement evaluation
         # (agreement_pct <= agreement_threshold).
         _agree_float = hatchings.interp(
             lat=da_mask.lat, lon=da_mask.lon, method="nearest"
         )
         failed_eval_mask = land_shp & (_agree_float.values <= agreement_threshold)
-        ax_map.contourf(
-            da_mask.lon, da_mask.lat, failed_eval_mask.astype(float),
-            levels=[0.5, 1], colors=["black"],
-            transform=ccrs.PlateCarree(), zorder=6,
-        )
+        draw_discrepancy_dots(ax_map, failed_eval_mask, da_mask.lat, da_mask.lon)
 
-    draw_wcf_zero_overlay(ax_map, wcf_zero_mask, land_shp, da_mask.lat, da_mask.lon)
+    grey_drawn = draw_wcf_zero_overlay(ax_map, wcf_zero_mask, land_shp, da_mask.lat, da_mask.lon,
+                                       nan_data=da_mask.isnull().values)
+    add_exclusion_legend(ax_map, show_discrepancy=hatchings is not None,
+                         show_wcf_zero=grey_drawn)
 
     if map_title is None:
         map_title = f"Projected change in annual severity under {gwl_label} warming"
@@ -1075,19 +1057,20 @@ def plot_supp_valuebyalpha_stacked(
                                transform=ccrs.PlateCarree(), zorder=10)
 
         if hatchings is not None:
-            # Black layer: land pixels that failed the trend-agreement
+            # Dot hatching: land pixels that failed the trend-agreement
             # evaluation (agreement_pct <= agreement_threshold).
             _agree_float = hatchings.interp(
                 lat=da_mask_ref.lat, lon=da_mask_ref.lon, method="nearest"
             )
             failed_eval_band = land_shp_band & (_agree_float.values <= agreement_threshold)
-            ax.contourf(
-                da_mask_ref.lon, da_mask_ref.lat, failed_eval_band.astype(float),
-                levels=[0.5, 1], colors=["black"],
-                transform=ccrs.PlateCarree(), zorder=6,
-            )
+            draw_discrepancy_dots(ax, failed_eval_band, da_mask_ref.lat, da_mask_ref.lon)
 
-        draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
+        grey_drawn = draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp_band,
+                                           da_mask_ref.lat, da_mask_ref.lon,
+                                           nan_data=da_mask_ref.isnull().values)
+        if i == n - 1:
+            add_exclusion_legend(ax, show_discrepancy=hatchings is not None,
+                                 show_wcf_zero=grey_drawn)
 
         panel_letter = ascii_lowercase[i]
         panel_gwl    = gwl_label.replace(".0°C", "°C")
@@ -1250,17 +1233,17 @@ def plot_gwl_valuebyalpha_wasserstein(
     shp_band.boundary.plot(ax=ax_a, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     if hatchings is not None:
-        # Black layer: land pixels that failed the trend-agreement evaluation.
+        # Dot hatching: land pixels that failed the trend-agreement evaluation.
         _agree_float_a = hatchings.interp(
             lat=da_mask_ref.lat, lon=da_mask_ref.lon, method="nearest"
         )
         failed_eval_band_a = land_shp_band & (_agree_float_a.values <= agreement_threshold)
-        ax_a.contourf(
-            da_mask_ref.lon, da_mask_ref.lat, failed_eval_band_a.astype(float),
-            levels=[0.5, 1], colors=["black"],
-            transform=ccrs.PlateCarree(), zorder=6,
-        )
-    draw_wcf_zero_overlay(ax_a, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
+        draw_discrepancy_dots(ax_a, failed_eval_band_a, da_mask_ref.lat, da_mask_ref.lon)
+    grey_drawn = draw_wcf_zero_overlay(ax_a, wcf_zero_mask, land_shp_band,
+                                       da_mask_ref.lat, da_mask_ref.lon,
+                                       nan_data=da_mask_ref.isnull().values)
+    add_exclusion_legend(ax_a, show_discrepancy=hatchings is not None,
+                         show_wcf_zero=grey_drawn)
     ax_a.annotate(
         "$\\mathbf{a}$", xy=(0.02, 1.02), xycoords="axes fraction",
         ha="left", va="bottom", fontsize=8,
@@ -1301,13 +1284,10 @@ def plot_gwl_valuebyalpha_wasserstein(
         rasterized=True,
     )
     if hatchings is not None:
-        # Same black failed-evaluation layer as panel a.
-        ax_b.contourf(
-            da_mask_ref.lon, da_mask_ref.lat, failed_eval_band_a.astype(float),
-            levels=[0.5, 1], colors=["black"],
-            transform=ccrs.PlateCarree(), zorder=6,
-        )
-    draw_wcf_zero_overlay(ax_b, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon)
+        # Same failed-evaluation dot hatching as panel a.
+        draw_discrepancy_dots(ax_b, failed_eval_band_a, da_mask_ref.lat, da_mask_ref.lon)
+    draw_wcf_zero_overlay(ax_b, wcf_zero_mask, land_shp_band, da_mask_ref.lat, da_mask_ref.lon,
+                          nan_data=da_mask_ref.isnull().values)
     shp_band.boundary.plot(ax=ax_b, color="black", linewidth=0.15,
                            transform=ccrs.PlateCarree(), zorder=10)
     ax_b.annotate(
