@@ -141,6 +141,19 @@ def duration_xr(da):
     ds_freq = ds_freq.to_dataset(name='frequency')
     ds = ds.to_dataset(name='duration')
 
+    # Reindex onto the full calendar-year range of `da`: a year with zero
+    # events at every single poly_idx never becomes a level value coming out
+    # of the groupby loop above, so it's missing entirely (not just NaN).
+    # This also keeps duration/frequency calendar-complete like
+    # compute_severity's resample(time=...) output, so every realization
+    # ends up with the same number of years before load_agg_data_compound()
+    # concatenates them over 'realization' -- otherwise realizations with
+    # different sets of zero-event years would concat into a huge, mostly
+    # -NaN 'year' axis (the union of every realization's own distinct years).
+    full_years = np.unique(da.time.dt.year.values)
+    ds = ds.reindex(year=full_years, fill_value=0)
+    ds_freq = ds_freq.reindex(year=full_years, fill_value=0)
+
     return ds, ds_freq
 
 
@@ -236,6 +249,16 @@ def load_agg_data_compound(preprocessed_path):
         ds_final['frequency'] = ds_freq.frequency
         ds_final['severity'] = severity_ds.severity
 
+        # Relabel 'year' from absolute calendar years to a positional index
+        # (1..N, years since this realization's own 20-year window starts)
+        # before concatenating over 'realization' below -- different GWLs
+        # (and the same GWL across different GCMs) span different, largely
+        # non-overlapping absolute calendar years, so concatenating on the
+        # raw calendar-year labels would align by (disjoint) label instead
+        # of by within-window position, blowing 'year' up to the union of
+        # every realization's own distinct years instead of a common N.
+        ds_final = ds_final.assign_coords(year=np.arange(1, ds_final.sizes['year'] + 1))
+
         ds_final = ds_final.expand_dims({'realization': [realization_idx]})
         realization_idx += 1
         ds_final['GCM'] = GCM
@@ -246,7 +269,10 @@ def load_agg_data_compound(preprocessed_path):
         data.append(ds_final)
     data = xr.concat(data, dim='realization')
     data = data.drop_dims('time', errors='ignore')
-    data['year'] = np.arange(1,21,1)
+    #each realization already carries a clean positional 1..N 'year' index
+    #(see above), so this is now just a defensive final relabel -- sized to
+    #whatever 'year' actually came out as, instead of a hardcoded 20
+    data['year'] = np.arange(1, data.sizes['year'] + 1)
 
     return data
 
