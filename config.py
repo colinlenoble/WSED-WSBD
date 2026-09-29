@@ -55,7 +55,14 @@ WASSERSTEIN_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate
 WASSERSTEIN_AGGREGATED_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/agg_wasserstein_empirical_GCMs_aggregated_ERA5_v1.nc"
 SHARE_RENEWABLE_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/share_renewable.csv"
 POP_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ppp_2020_1km_Aggregated.tif"
-SUMMARY_FIGS_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures/"
+# Observed generation used to validate the regional reanalysis capacity factors
+# (validation/validate_cf_observations.py): Renewables.ninja v1.1 national
+# hourly capacity factors, and one ENTSO-E "Actual Generation per Production
+# Type" .xlsx export per country and year.
+NINJA_WIND_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ninja_europe_wind_v1.1/ninja_wind_europe_v1.1_current_national.csv"
+NINJA_PV_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ninja_europe_pv_v1.1/ninja_pv_europe_v1.1_merra2.csv"
+ENTSOE_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ENTSO-E/"
+SUMMARY_FIGS_DIR ="/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures/"
 
 # Glob pattern for the reanalysis daily 10 m/100 m wind files (u10/v10/u100/v100,
 # .nc or .zarr), used to fit the local wind shear exponent (see

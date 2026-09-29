@@ -13,21 +13,25 @@ Terminology: frequency (events/year), duration (days/event) and intensity
 their product, frequency x duration x intensity. make_agg_files.py calls
 intensity "severity"; it is renamed on load.
 
-The yearly indicators are always rebuilt from scratch via
-make_agg_files.load_agg_data_compound(), which reads every per-GCM
-wcf_agg_*/scf_agg_* aggregate under --preprocessed_path -- there is no
-cached compound_years_agg_freq_sev_dur.nc to read instead (it no longer
-exists on disk). Significance of the severity change (each GWL vs GWL0-61,
+The yearly indicators come from make_agg_files.load_agg_data_compound(),
+which reads every per-GCM wcf_agg_*/scf_agg_* aggregate under
+--preprocessed_path. The result is cached in
+<preprocessed_path>/agg_datasets/compound_years_agg_freq_sev_dur.nc and
+reused on later runs (--rebuild forces a recompute). Significance of the severity change (each GWL vs GWL0-61,
 per GCM/run) is then computed on that rebuilt dataset with a paired
 permutation test + Benjamini-Hochberg FDR.
 
 Panels c-d (variance decomposition) are also rebuilt from scratch, from the
 same wcf_agg_*/scf_agg_* files resampled monthly instead of yearly
-(load_agg_data_compound(..., freq='month')) at --variability_gwl, then run
+(load_agg_data_compound(..., freq='month'), cached in
+agg_datasets/compound_monthly_agg_freq_sev_dur.nc) at --variability_gwl, then run
 through custom_regional_analysis() -- a port of cell 2 of
 como24_group5/code_final/3.2 Variability decomposition.ipynb (that cell is
-missing its two `for` loops as saved in the notebook; restored here). There
-is no cached custom_regional_analysis_v1.nc to read instead.
+missing its two `for` loops as saved in the notebook; restored here).
+
+Both panel pairs are drawn on config.SHAPEFILE_PATH (shp_re): the _v1
+aggregates are built by calculate_cf.py on that shapefile, so their poly_idx
+is its row index.
 
 Port of cell 26 of como24_group5/code_final/3.1.3 disagreements.ipynb.
 """
@@ -91,11 +95,12 @@ def parse_args():
     )
     parser.add_argument("--preprocessed_path", default=config.PATH_PREPROCESSED,
                         help="Root of the per-GCM wcf_agg_*/scf_agg_* aggregates "
-                             "(make_agg_files.load_agg_data_compound()'s input). Both the "
-                             "yearly indicators (panels a-b) and the monthly variance "
-                             "decomposition (panels c-d) are always rebuilt from these from "
-                             "scratch -- there is no cached compound_years_agg_freq_sev_dur.nc "
-                             "or custom_regional_analysis_v1.nc to read instead.")
+                             "(make_agg_files.load_agg_data_compound()'s input). The yearly "
+                             "and monthly compound datasets built from them are cached under "
+                             "<preprocessed_path>/agg_datasets/.")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Recompute the yearly/monthly compound datasets from the "
+                             "wcf_agg_*/scf_agg_* aggregates and overwrite the cache.")
     parser.add_argument("--save_significance_nc", default=None,
                         help="Optional path to also save the recomputed severity trend "
                              "significance to (e.g. for reuse by other figures). Not read "
@@ -110,7 +115,7 @@ def parse_args():
     parser.add_argument("--reference_gwl", default="GWL0-61")
     parser.add_argument("--gwls", nargs=2, default=["GWL2", "GWL3"],
                         help="The two GWLs shown in panels a and b.")
-    parser.add_argument("--shapefile_disag", default=config.SHAPEFILE_PATH_LIGHT,
+    parser.add_argument("--shapefile_disag", default=config.SHAPEFILE_PATH,
                         help="Shapefile matching the poly_idx of the rebuilt indicators.")
     parser.add_argument("--shapefile_var", default=config.SHAPEFILE_PATH,
                         help="Shapefile matching the poly_idx of the rebuilt variance decomposition.")
@@ -256,15 +261,36 @@ def _rename_intensity_and_compute_severity(ds, dim_name):
     return ds
 
 
-def load_indicators(preprocessed_path):
+CACHE_FILES = {
+    "year": "compound_years_agg_freq_sev_dur.nc",
+    "month": "compound_monthly_agg_freq_sev_dur.nc",
+}
+
+
+def load_compound_cached(preprocessed_path, freq, rebuild=False):
+    """
+    make_agg_files.load_agg_data_compound(preprocessed_path, freq), cached in
+    <preprocessed_path>/agg_datasets/ (raw output, legacy 'severity' naming
+    kept so the file matches make_agg_files.py's own).
+    """
+    cache_path = os.path.join(preprocessed_path, "agg_datasets", CACHE_FILES[freq])
+    if os.path.exists(cache_path) and not rebuild:
+        print(f"  Loading cached {cache_path}")
+        return xr.open_dataset(cache_path).load()
+    ds = load_agg_data_compound(preprocessed_path, freq=freq)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    ds.to_netcdf(cache_path)
+    print(f"  Saved {cache_path}")
+    return ds
+
+
+def load_indicators(preprocessed_path, rebuild=False):
     """
     Yearly indicators with the current terminology: frequency, duration,
-    intensity, and severity = frequency x duration x intensity. Rebuilt from
-    scratch every call via make_agg_files.load_agg_data_compound() (reads
-    every wcf_agg_*/scf_agg_* aggregate under `preprocessed_path`) -- there
-    is no cached compound_years_agg_freq_sev_dur.nc to read instead.
+    intensity, and severity = frequency x duration x intensity, from
+    load_compound_cached(..., freq='year').
     """
-    ds = load_agg_data_compound(preprocessed_path, freq="year")
+    ds = load_compound_cached(preprocessed_path, "year", rebuild)
     return _rename_intensity_and_compute_severity(ds, "year")
 
 
@@ -320,16 +346,15 @@ def custom_regional_analysis(ds, var, gwl):
     )
 
 
-def load_variability(preprocessed_path, gwl):
+def load_variability(preprocessed_path, gwl, rebuild=False):
     """
     Variance decomposition of RED severity at `gwl` into internal (I) vs.
-    model (M) components, for panels c-d. Rebuilt from scratch every call:
-    the same wcf_agg_*/scf_agg_* aggregates as load_indicators(), resampled
-    monthly instead of yearly (load_agg_data_compound(..., freq='month')),
-    fed into custom_regional_analysis() -- there is no cached
-    custom_regional_analysis_v1.nc to read instead.
+    model (M) components, for panels c-d: the same wcf_agg_*/scf_agg_*
+    aggregates as load_indicators(), resampled monthly instead of yearly
+    (load_compound_cached(..., freq='month')), fed into
+    custom_regional_analysis().
     """
-    ds = load_agg_data_compound(preprocessed_path, freq="month")
+    ds = load_compound_cached(preprocessed_path, "month", rebuild)
     ds = _rename_intensity_and_compute_severity(ds, "month")
     return custom_regional_analysis(ds, "severity", gwl)
 
@@ -491,6 +516,9 @@ def plot_suppfig7(agreement_panels, shapefile_disag, discrepancy_idx,
 
     # -- c: total projection spread ------------------------------------------
     shp_var = gpd.read_file(shapefile_var)
+    if len(shp_var) != ds_var.sizes["poly_idx"]:
+        raise ValueError(f"{shapefile_var} has {len(shp_var)} polygons, "
+                         f"variance decomposition has {ds_var.sizes['poly_idx']}")
     shp_var["total"] = ds_var["total"].values
     shp_var["I"] = ds_var["I"].values
 
@@ -540,7 +568,7 @@ def main():
     args = parse_args()
 
     print(f"Rebuilding yearly RED indicators from {args.preprocessed_path}")
-    ds = load_indicators(args.preprocessed_path)
+    ds = load_indicators(args.preprocessed_path, args.rebuild)
     print("Computing severity trend significance")
     sig = compute_severity_significance(
         ds, gwls=args.gwls, alpha=args.alpha, ssp=args.ssp,
@@ -559,7 +587,7 @@ def main():
     discrepancy_idx = load_discrepancy_idx(args.agreement_aggregated_nc, args.agreement_threshold)
 
     print(f"Rebuilding monthly variance decomposition at {args.variability_gwl}")
-    ds_var = load_variability(args.preprocessed_path, args.variability_gwl)
+    ds_var = load_variability(args.preprocessed_path, args.variability_gwl, args.rebuild)
 
     print("Plotting supplementary figure 7")
     fig = plot_suppfig7(agreement_panels, args.shapefile_disag, discrepancy_idx,
