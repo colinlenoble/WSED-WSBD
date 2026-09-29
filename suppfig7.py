@@ -36,7 +36,15 @@ import pandas as pd
 import xarray as xr
 import geopandas as gpd
 import cartopy.crs as ccrs
+import inspect
 from scipy.stats import permutation_test
+
+# scipy renamed permutation_test's RNG-seed parameter from 'random_state' to
+# 'rng' in 1.15; detect once so this runs on either an older HPC scipy
+# (random_state) or a newer one (rng) without an explicit version check.
+_PERMUTATION_TEST_RNG_KW = (
+    "rng" if "rng" in inspect.signature(permutation_test).parameters else "random_state"
+)
 
 import matplotlib
 matplotlib.use("Agg")
@@ -155,7 +163,7 @@ def trend_for_metric(data_by_gwl, metric, comparison_gwl, reference_gwl,
         n_resamples=n_resamples,
         vectorized=True,
         axis=0,
-        rng=np.random.default_rng(seed),
+        **{_PERMUTATION_TEST_RNG_KW: np.random.default_rng(seed)},
     )
     coords = {"poly_idx": data_by_gwl.poly_idx.values}
     pvalues = xr.DataArray(test.pvalue, coords=coords, dims="poly_idx")
