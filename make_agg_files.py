@@ -29,7 +29,7 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from itertools import groupby
 
 
-def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold):
+def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold, freq='year'):
     """
     Compute severity of the compound event as the expected shortfall.
     For each day where a compound event occurs (i.e. compound_occurrence==1),
@@ -42,9 +42,12 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold):
       wcf_ds: Dataset with the 'wcf' variable.
       scf_threshold: DataArray of scf threshold per region.
       wcf_threshold: DataArray of wcf threshold per region.
+      freq: 'year' (default, annual buckets) or 'month' (monthly buckets --
+        used by load_agg_data_compound(..., freq='month') for the variance
+        -decomposition pipeline, suppfig7.load_variability()).
 
     Returns:
-      severity: DataArray of average severity per region and per year
+      severity: DataArray of average severity per region and per `freq`
     """
 
     deficit_scf = (scf_threshold - scf_ds["scf"])
@@ -52,7 +55,8 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold):
 
     daily_deficit = ((deficit_scf + deficit_wcf)) * comp_da
 
-    total_deficit = daily_deficit.resample(time='1Y').sum()
+    resample_rule = '1Y' if freq == 'year' else '1M'
+    total_deficit = daily_deficit.resample(time=resample_rule).sum()
 
     severity = total_deficit
 
@@ -61,51 +65,60 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold):
 
 
 
-def duration_xr(da):
+def duration_xr(da, freq='year'):
     """
     Compute event durations for each (event_id, poly_idx), handling cases where
     same event_id occurs in different regions (poly_idx).
-    
+
     Parameters:
     da (xr.DataArray): DataArray of 0 and 1 for compound event days
-    
+    freq: 'year' (default) or 'month' -- the period each event is assigned
+      to (by its start day), and the name of the returned time dimension.
+      With freq='month', periods are absolute calendar months
+      (year*12 + month) so the same calendar month in different years
+      doesn't collide.
+
     Returns:
-    ds (xr.Dataset): DataSet of mean duration of RES waves per year and poly_idx.
-    ds_freq (xr.Dataset): Number of events per poly_idx and year.
+    ds (xr.Dataset): DataSet of mean duration of RES waves per `freq` and poly_idx.
+    ds_freq (xr.Dataset): Number of events per poly_idx and `freq`.
     """
-    
+    dim = freq
+
     # Add dummy time at start to detect events starting at first step
     da_dur = xr.concat([
         xr.zeros_like(da.isel(time=0)).expand_dims(time=[pd.Timestamp('2000-01-01')]),
         da
         ], dim='time')
-        
+
     # Detect start of new events (transition from 0 to event_id)
     start_event = (da_dur.diff(dim='time', label='lower') > 0)  # transition to non-zero
     start_event['time'] = da.time
-    start_event['year'] = start_event.time.dt.year
+    if freq == 'year':
+        start_event[dim] = start_event.time.dt.year
+    else:
+        start_event[dim] = start_event.time.dt.year * 12 + start_event.time.dt.month
     # Build cumulative event counter for each poly_idx
     id_event = start_event.cumsum(dim='time') * da
     id_event = id_event.where(id_event > 0)  # Mask non-events
 
-    nb_event = start_event.groupby('year').sum(dim='time')
+    nb_event = start_event.groupby(dim).sum(dim='time')
 
     stacked_bis = start_event.stack(z=('poly_idx', 'time'))
-    valid_year = (stacked_bis.where(stacked_bis > 0)).dropna('z')
+    valid_period = (stacked_bis.where(stacked_bis > 0)).dropna('z')
 
-    # Now, to compute durations for each unique (id_event, poly_idx, year)
+    # Now, to compute durations for each unique (id_event, poly_idx, period)
     # Stack dimensions to flatten for easier manipulation
     stacked = id_event.stack(z=('poly_idx', 'time'))
 
     # Drop NaNs (non-event locations)
     valid = stacked.dropna('z')
 
-    # Extract corresponding event IDs, poly_idx, and year
+    # Extract corresponding event IDs and poly_idx
     event_ids = valid.values.astype(int)  # event ids
     poly_idxs = valid['poly_idx'].values  # poly_idx associated
 
     combined_keys = np.core.defchararray.add(
-            event_ids.astype(str), 
+            event_ids.astype(str),
             np.core.defchararray.add('-', poly_idxs.astype(str))
         )
 
@@ -126,33 +139,36 @@ def duration_xr(da):
     })
 
     dur_da = dur_da.to_dataset(name='duration')
-    valid_year = valid_year.rename({'z':'event_instance'})
-    dur_da['year'] = valid_year['year']
+    valid_period = valid_period.rename({'z':'event_instance'})
+    dur_da[dim] = valid_period[dim]
 
-    #create a new dataset that gives the mean duration for every year and every poly_idx
-    
+    #create a new dataset that gives the mean duration for every period and every poly_idx
+
     ds = []
     ds_freq = []
-    for y in np.unique(dur_da.year.values):
-        ds.append(dur_da.where(dur_da.year==y,drop=True).duration.groupby('poly_idx').mean().assign_coords(year=y))
-        ds_freq.append(dur_da.where(dur_da.year==y,drop=True).duration.groupby('poly_idx').count().assign_coords(year=y))
-    ds = xr.concat(ds, dim='year')
-    ds_freq = xr.concat(ds_freq, dim='year')
+    for p in np.unique(dur_da[dim].values):
+        ds.append(dur_da.where(dur_da[dim]==p,drop=True).duration.groupby('poly_idx').mean().assign_coords(**{dim: p}))
+        ds_freq.append(dur_da.where(dur_da[dim]==p,drop=True).duration.groupby('poly_idx').count().assign_coords(**{dim: p}))
+    ds = xr.concat(ds, dim=dim)
+    ds_freq = xr.concat(ds_freq, dim=dim)
     ds_freq = ds_freq.to_dataset(name='frequency')
     ds = ds.to_dataset(name='duration')
 
-    # Reindex onto the full calendar-year range of `da`: a year with zero
-    # events at every single poly_idx never becomes a level value coming out
-    # of the groupby loop above, so it's missing entirely (not just NaN).
-    # This also keeps duration/frequency calendar-complete like
-    # compute_severity's resample(time=...) output, so every realization
-    # ends up with the same number of years before load_agg_data_compound()
-    # concatenates them over 'realization' -- otherwise realizations with
-    # different sets of zero-event years would concat into a huge, mostly
-    # -NaN 'year' axis (the union of every realization's own distinct years).
-    full_years = np.unique(da.time.dt.year.values)
-    ds = ds.reindex(year=full_years, fill_value=0)
-    ds_freq = ds_freq.reindex(year=full_years, fill_value=0)
+    # Reindex onto the full period range of `da`: a period with zero events
+    # at every single poly_idx never becomes a level value coming out of the
+    # groupby loop above, so it's missing entirely (not just NaN). This also
+    # keeps duration/frequency calendar-complete like compute_severity's
+    # resample(time=...) output, so every realization ends up with the same
+    # number of periods before load_agg_data_compound() concatenates them
+    # over 'realization' -- otherwise realizations with different sets of
+    # zero-event periods would concat into a huge, mostly-NaN axis (the
+    # union of every realization's own distinct periods).
+    if freq == 'year':
+        full_periods = np.unique(da.time.dt.year.values)
+    else:
+        full_periods = np.unique(da.time.dt.year.values * 12 + da.time.dt.month.values)
+    ds = ds.reindex(**{dim: full_periods}, fill_value=0)
+    ds_freq = ds_freq.reindex(**{dim: full_periods}, fill_value=0)
 
     return ds, ds_freq
 
@@ -160,7 +176,7 @@ def duration_xr(da):
 
 
 
-def load_agg_data_compound(preprocessed_path):
+def load_agg_data_compound(preprocessed_path, freq='year'):
     '''
     ### Load aggregated data for compound events
     ### Parameters:
@@ -168,12 +184,19 @@ def load_agg_data_compound(preprocessed_path):
       wcf_agg_*/scf_agg_* aggregates written by calculate_cf.py, the same
       files fig45.py/trend_sev_eval.py read for their own aggregated-domain
       pipelines -- see config.AGREEMENT_AGGREGATED_NC_PATH's docstring)
+    - freq: 'year' (default; the yearly RED indicators consumed by
+      suppfig7.load_indicators()) or 'month' (monthly buckets, consumed by
+      suppfig7.load_variability() for the variance-decomposition panels --
+      port of the never-saved pipeline behind
+      compound_monthly_agg_freq_sev_dur.nc in
+      3.2 Variability decomposition.ipynb)
 
     ### Returns:
     - data: the dataset with the aggregated data for compound events for every GCM, run, ssp and gwl
-    that returns the duration, frequency and severity of the compound events per year and poly_idx
+    that returns the duration, frequency and severity of the compound events per `freq` and poly_idx
 
   '''
+    dim = freq
     #the wcf_ref/scf_ref and GWL0-61 paths below are built by raw string
     #concatenation, not os.path.join -- ensure a trailing separator so that
     #works regardless of whether the caller passed one
@@ -232,32 +255,36 @@ def load_agg_data_compound(preprocessed_path):
         compound = wcf.low_wind * scf.low_solar
         compound = compound.to_dataset(name='start_cooc')
 
-        #here severity_ds has already been averaged over years; compute_severity
-        #returns a bare DataArray, wrap it so severity_ds.severity below works
-        severity_ds = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr).to_dataset(name='severity')
-        ds_dur, ds_freq = duration_xr(compound.start_cooc)
+        #here severity_ds has already been averaged over each `freq` period;
+        #compute_severity returns a bare DataArray, wrap it so
+        #severity_ds.severity below works
+        severity_ds = compute_severity(compound.start_cooc, scf, wcf, scf_thr, wcf_thr, freq=freq).to_dataset(name='severity')
+        ds_dur, ds_freq = duration_xr(compound.start_cooc, freq=freq)
 
-        #integer year labels, matching duration_xr()'s ds_dur/ds_freq 'year'
-        #coordinate -- .astype(str) here used to silently turn every
+        #integer period labels, matching duration_xr()'s ds_dur/ds_freq
+        #`dim` coordinate -- a string label here would silently turn every
         #'severity' value into NaN below, since ds_final['severity'] =
         #severity_ds.severity reindexes onto ds_final's existing int-labeled
-        #'year' index, and no string label ever matches an int one
-        severity_ds['time'] = severity_ds.time.dt.year
-        severity_ds = severity_ds.rename({'time':'year'})
+        #index, and no string label ever matches an int one
+        if freq == 'year':
+            severity_ds['time'] = severity_ds.time.dt.year
+        else:
+            severity_ds['time'] = severity_ds.time.dt.year * 12 + severity_ds.time.dt.month
+        severity_ds = severity_ds.rename({'time': dim})
 
         ds_final = ds_dur.copy()
         ds_final['frequency'] = ds_freq.frequency
         ds_final['severity'] = severity_ds.severity
 
-        # Relabel 'year' from absolute calendar years to a positional index
-        # (1..N, years since this realization's own 20-year window starts)
+        # Relabel `dim` from absolute calendar periods to a positional index
+        # (1..N, periods since this realization's own 20-year window starts)
         # before concatenating over 'realization' below -- different GWLs
         # (and the same GWL across different GCMs) span different, largely
-        # non-overlapping absolute calendar years, so concatenating on the
-        # raw calendar-year labels would align by (disjoint) label instead
-        # of by within-window position, blowing 'year' up to the union of
-        # every realization's own distinct years instead of a common N.
-        ds_final = ds_final.assign_coords(year=np.arange(1, ds_final.sizes['year'] + 1))
+        # non-overlapping absolute calendar periods, so concatenating on the
+        # raw calendar labels would align by (disjoint) label instead of by
+        # within-window position, blowing `dim` up to the union of every
+        # realization's own distinct periods instead of a common N.
+        ds_final = ds_final.assign_coords(**{dim: np.arange(1, ds_final.sizes[dim] + 1)})
 
         ds_final = ds_final.expand_dims({'realization': [realization_idx]})
         realization_idx += 1
@@ -269,10 +296,10 @@ def load_agg_data_compound(preprocessed_path):
         data.append(ds_final)
     data = xr.concat(data, dim='realization')
     data = data.drop_dims('time', errors='ignore')
-    #each realization already carries a clean positional 1..N 'year' index
+    #each realization already carries a clean positional 1..N `dim` index
     #(see above), so this is now just a defensive final relabel -- sized to
-    #whatever 'year' actually came out as, instead of a hardcoded 20
-    data['year'] = np.arange(1, data.sizes['year'] + 1)
+    #whatever `dim` actually came out as, instead of a hardcoded 20
+    data[dim] = np.arange(1, data.sizes[dim] + 1)
 
     return data
 

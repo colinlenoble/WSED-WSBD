@@ -600,6 +600,19 @@ def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
         print(f"  [INFO] {gwl_label}: avg |supply effect| / avg |demand effect| "
               f"(days of baseline demand) = {ratio:.3f}")
 
+    # Joint sign of supply and demand drivers, per region (aligned on poly_idx).
+    joint = (_mmm_supply_days(df_gwl, share_re)
+             .merge(_mmm_demand_days(df_gwl, share_re), on="poly_idx")
+             .replace([np.inf, -np.inf], np.nan)
+             .dropna(subset=["Supply_Days", "Demand_Days"]))
+    s, d = joint["Supply_Days"], joint["Demand_Days"]
+    n_joint = len(joint)
+    print(f"  [INFO] {gwl_label}: supply > 0 & demand > 0 in {int(((s > 0) & (d > 0)).sum())}, "
+          f"supply < 0 & demand < 0 in {int(((s < 0) & (d < 0)).sum())}, "
+          f"supply > 0 & demand < 0 in {int(((s > 0) & (d < 0)).sum())}, "
+          f"supply < 0 & demand > 0 in {int(((s < 0) & (d > 0)).sum())} "
+          f"regions (out of {n_joint})")
+
 
 def _print_combined_effect_direction_stats(df_gwl, gwl_label, share_re="current"):
     """Diagnostic across all polygons at a given GWL: how many regions have a

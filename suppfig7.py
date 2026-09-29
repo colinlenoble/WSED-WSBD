@@ -15,12 +15,19 @@ intensity "severity"; it is renamed on load.
 
 The yearly indicators are always rebuilt from scratch via
 make_agg_files.load_agg_data_compound(), which reads every per-GCM
-wpp_agg_*/spp_agg_* aggregate under --preprocessed_path -- there is no
+wcf_agg_*/scf_agg_* aggregate under --preprocessed_path -- there is no
 cached compound_years_agg_freq_sev_dur.nc to read instead (it no longer
 exists on disk). Significance of the severity change (each GWL vs GWL0-61,
 per GCM/run) is then computed on that rebuilt dataset with a paired
-permutation test + Benjamini-Hochberg FDR. Panels c-d read a precomputed
-variance decomposition (--variability_nc).
+permutation test + Benjamini-Hochberg FDR.
+
+Panels c-d (variance decomposition) are also rebuilt from scratch, from the
+same wcf_agg_*/scf_agg_* files resampled monthly instead of yearly
+(load_agg_data_compound(..., freq='month')) at --variability_gwl, then run
+through custom_regional_analysis() -- a port of cell 2 of
+como24_group5/code_final/3.2 Variability decomposition.ipynb (that cell is
+missing its two `for` loops as saved in the notebook; restored here). There
+is no cached custom_regional_analysis_v1.nc to read instead.
 
 Port of cell 26 of como24_group5/code_final/3.1.3 disagreements.ipynb.
 """
@@ -77,26 +84,25 @@ GWL_LABELS = {"GWL1-5": "1.5°C", "GWL2": "2°C", "GWL3": "3°C"}
 # =============================================================================
 
 def parse_args():
-    agg_dir = os.path.join(config.PATH_PREPROCESSED, "agg_datasets")
     parser = argparse.ArgumentParser(
         description="Model agreement on RED severity changes and variability "
                     "decomposition (supplementary figure 7).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--preprocessed_path", default=config.PATH_PREPROCESSED,
-                        help="Root of the per-GCM wpp_agg_*/spp_agg_* aggregates "
-                             "(make_agg_files.load_agg_data_compound()'s input). The "
-                             "yearly indicators (frequency, duration, intensity/severity) "
-                             "are always rebuilt from these from scratch -- there is no "
-                             "cached compound_years_agg_freq_sev_dur.nc to read instead.")
+                        help="Root of the per-GCM wcf_agg_*/scf_agg_* aggregates "
+                             "(make_agg_files.load_agg_data_compound()'s input). Both the "
+                             "yearly indicators (panels a-b) and the monthly variance "
+                             "decomposition (panels c-d) are always rebuilt from these from "
+                             "scratch -- there is no cached compound_years_agg_freq_sev_dur.nc "
+                             "or custom_regional_analysis_v1.nc to read instead.")
     parser.add_argument("--save_significance_nc", default=None,
                         help="Optional path to also save the recomputed severity trend "
                              "significance to (e.g. for reuse by other figures). Not read "
                              "back in -- the significance is always recomputed from the "
                              "rebuilt indicators.")
-    parser.add_argument("--variability_nc",
-                        default=os.path.join(agg_dir, "custom_regional_analysis_v1.nc"),
-                        help="Precomputed variance decomposition (variables 'total' and 'I').")
+    parser.add_argument("--variability_gwl", default="GWL2",
+                        help="GWL at which the variance decomposition (panels c-d) is run.")
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--n_resamples", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
@@ -107,7 +113,7 @@ def parse_args():
     parser.add_argument("--shapefile_disag", default=config.SHAPEFILE_PATH_LIGHT,
                         help="Shapefile matching the poly_idx of the rebuilt indicators.")
     parser.add_argument("--shapefile_var", default=config.SHAPEFILE_PATH,
-                        help="Shapefile matching the regions of --variability_nc.")
+                        help="Shapefile matching the poly_idx of the rebuilt variance decomposition.")
     parser.add_argument("--agreement_aggregated_nc", default=config.AGREEMENT_AGGREGATED_NC_PATH)
     parser.add_argument("--agreement_threshold", type=float, default=config.AGREEMENT_THRESHOLD)
     parser.add_argument("--output_dir", default=config.SUMMARY_FIGS_DIR)
@@ -177,58 +183,77 @@ def trend_for_metric(data_by_gwl, metric, comparison_gwl, reference_gwl,
 # Data loading
 # =============================================================================
 
-def _squeeze_degenerate_dims(da, keep=("realization", "poly_idx", "year", "time")):
+def _squeeze_degenerate_dims(da, keep):
     """
     Drop any size-1 dimension of `da` besides `keep`. On the raw aggregated
-    file, intensity (severity) can carry a stray length-1 'year' or 'time'
-    dim alongside its real one -- a leftover from make_agg_files.py's
-    coordinate bookkeeping (e.g. an auxiliary year label promoted to its
-    own dimension), not a genuine second data axis.
+    file, intensity (severity) can carry a stray length-1 dim alongside its
+    real time axis -- a leftover from make_agg_files.py's coordinate
+    bookkeeping (e.g. an auxiliary year/month label promoted to its own
+    dimension), not a genuine second data axis.
     """
-    degenerate = [d for d in da.dims if d not in ("realization", "poly_idx")
-                 and da.sizes[d] == 1]
+    degenerate = [d for d in da.dims if d not in keep and da.sizes[d] == 1]
     return da.squeeze(degenerate, drop=True) if degenerate else da
 
 
-def _year_dim(da, var_name):
-    """The one dim of `da` besides realization/poly_idx -- its annual axis."""
-    candidates = [d for d in da.dims if d not in ("realization", "poly_idx")]
+def _time_dim(da, var_name, keep):
+    """The one dim of `da` besides `keep` -- its time axis (year or month)."""
+    candidates = [d for d in da.dims if d not in keep]
     if len(candidates) != 1:
         sizes = {d: da.sizes[d] for d in candidates}
         raise ValueError(
             f"{var_name} has unexpected dims {da.dims} (sizes {sizes} besides "
-            f"realization/poly_idx): expected exactly one non-degenerate "
-            f"dimension for the annual axis after squeezing size-1 dims")
+            f"{keep}): expected exactly one non-degenerate dimension for the "
+            f"time axis after squeezing size-1 dims")
     return candidates[0]
 
 
-def _align_year_axis(ds, variables=("frequency", "duration", "intensity")):
+def _align_time_axis(ds, dim_name, variables=("frequency", "duration", "intensity")):
     """
-    Normalise frequency/duration/intensity onto a single, positionally
-    -indexed 'year' dimension before combining them. On the raw aggregated
-    file (make_agg_files.py) frequency/duration come out of duration_xr()
-    already on a 'year' dim, while intensity (severity) keeps
-    resample(time=...)'s 'time' dim, renamed to 'year' with its labels
-    turned into strings -- so even after the rename, its 'year' coordinate
-    doesn't match frequency/duration's integer one, and it can also retain
-    a stray degenerate ('time' or 'year') axis on top of the real one. Left
-    as-is, multiplying the three together silently broadcasts the
-    mismatched axes into a spurious extra dimension instead of erroring
-    loudly.
+    Normalise `variables` onto a single, positionally-indexed `dim_name`
+    dimension before combining them. On the raw aggregated file
+    (make_agg_files.py) frequency/duration come out of duration_xr()
+    already on a `dim_name` dim, while intensity (severity) keeps
+    resample(time=...)'s 'time' dim, renamed to `dim_name` with its labels
+    turned into ints that don't line up with frequency/duration's own
+    within-window position -- and it can also retain a stray degenerate axis
+    on top of the real one. Left as-is, combining the variables would
+    silently broadcast the mismatched axes into a spurious extra dimension
+    instead of erroring loudly.
     """
+    keep = ("realization", "poly_idx")
     for var in variables:
-        ds[var] = _squeeze_degenerate_dims(ds[var])
-    dims = {var: _year_dim(ds[var], var) for var in variables}
+        ds[var] = _squeeze_degenerate_dims(ds[var], keep)
+    dims = {var: _time_dim(ds[var], var, keep) for var in variables}
     lengths = {var: ds[var].sizes[dims[var]] for var in variables}
     if len(set(lengths.values())) != 1:
-        raise ValueError(f"frequency/duration/intensity have mismatched year "
-                         f"axis lengths: {lengths}")
+        raise ValueError(f"{variables} have mismatched {dim_name} axis "
+                         f"lengths: {lengths}")
     for var in variables:
         da = ds[var].drop_vars(dims[var], errors="ignore")
-        if dims[var] != "year":
-            da = da.rename({dims[var]: "year"})
+        if dims[var] != dim_name:
+            da = da.rename({dims[var]: dim_name})
         ds[var] = da
-    return ds.assign_coords(year=np.arange(1, lengths[variables[0]] + 1))
+    return ds.assign_coords(**{dim_name: np.arange(1, lengths[variables[0]] + 1)})
+
+
+def _rename_intensity_and_compute_severity(ds, dim_name):
+    """
+    Shared finishing step for the yearly (load_indicators) and monthly
+    (load_variability) aggregates: rename make_agg_files.py's legacy
+    'severity' (really intensity) to 'intensity', align frequency/duration/
+    intensity onto a single `dim_name` axis (see _align_time_axis), fillna,
+    then compute severity = frequency x duration x intensity.
+    """
+    if "intensity" not in ds:
+        if "severity" not in ds:
+            raise ValueError("load_agg_data_compound() returned neither "
+                             "'intensity' nor legacy 'severity'")
+        ds = ds.rename({"severity": "intensity"})
+    ds = _align_time_axis(ds, dim_name)
+    for var in ("frequency", "duration", "intensity"):
+        ds[var] = ds[var].fillna(0)
+    ds["severity"] = ds["frequency"] * ds["duration"] * ds["intensity"]
+    return ds
 
 
 def load_indicators(preprocessed_path):
@@ -236,21 +261,77 @@ def load_indicators(preprocessed_path):
     Yearly indicators with the current terminology: frequency, duration,
     intensity, and severity = frequency x duration x intensity. Rebuilt from
     scratch every call via make_agg_files.load_agg_data_compound() (reads
-    every wpp_agg_*/spp_agg_* aggregate under `preprocessed_path`) -- there
-    is no cached compound_years_agg_freq_sev_dur.nc to read instead. That
-    function names intensity "severity"; it is renamed here.
+    every wcf_agg_*/scf_agg_* aggregate under `preprocessed_path`) -- there
+    is no cached compound_years_agg_freq_sev_dur.nc to read instead.
     """
-    ds = load_agg_data_compound(preprocessed_path)
-    if "intensity" not in ds:
-        if "severity" not in ds:
-            raise ValueError("load_agg_data_compound() returned neither "
-                             "'intensity' nor legacy 'severity'")
-        ds = ds.rename({"severity": "intensity"})
-    ds = _align_year_axis(ds)
-    for var in ("frequency", "duration", "intensity"):
-        ds[var] = ds[var].fillna(0)
-    ds["severity"] = ds["frequency"] * ds["duration"] * ds["intensity"]
-    return ds
+    ds = load_agg_data_compound(preprocessed_path, freq="year")
+    return _rename_intensity_and_compute_severity(ds, "year")
+
+
+def custom_regional_analysis(ds, var, gwl):
+    """
+    Split the spread of `ds[var]` (mean over 'month', at `gwl`) across
+    realizations into:
+      I - internal variability: average of the run-to-run variance for the
+          two models with more than one run (CanESM5, MPI-ESM2-1-LR)
+      M - model variability: variance across GCMs (first run of each)
+    both normalised by their sum (`total`). Scenario variability is ignored.
+
+    Port of cell 2 of como24_group5/code_final/3.2 Variability
+    decomposition.ipynb -- that cell is missing its two `for` loops (over
+    poly_idx, and over internal_models) as saved in the notebook; restored
+    here from the (correctly indented) loop bodies.
+    """
+    ds = ds.where(ds.gwl == gwl, drop=True)
+    x_temporal = ds[var].mean(dim="month")
+    poly_ids = x_temporal["poly_idx"].values
+    internal_models = ["CanESM5", "MPI-ESM2-1-LR"]
+
+    i_list, m_list, total_list = [], [], []
+    for p in poly_ids:
+        df = x_temporal.sel(poly_idx=p).to_dataframe(name="X")
+        df["GCM"] = ds["GCM"].values
+        df["run"] = ds["run"].values
+
+        # --- Internal variability: only for selected models -----------------
+        internal_vars = []
+        for model in internal_models:
+            subset = df[df["GCM"] == model]
+            if subset["run"].nunique() > 1:
+                internal_vars.append(subset.groupby("run")["X"].mean().var(ddof=1))
+        i_val = np.mean(internal_vars) if internal_vars else np.nan
+
+        # --- Model variability: only first run per GCM -----------------------
+        first_run_df = (
+            df.groupby(["GCM", "run"]).first().reset_index()
+            .sort_values("run").drop_duplicates(subset="GCM", keep="first")
+        )
+        m_val = first_run_df["X"].var(ddof=0)
+
+        # --- Normalise --------------------------------------------------------
+        total = i_val + m_val if not np.isnan(i_val) and not np.isnan(m_val) else np.nan
+        i_list.append(i_val / total if total and not np.isnan(total) else np.nan)
+        m_list.append(m_val / total if total and not np.isnan(total) else np.nan)
+        total_list.append(total)
+
+    return xr.Dataset(
+        {"I": ("poly_idx", i_list), "M": ("poly_idx", m_list), "total": ("poly_idx", total_list)},
+        coords={"poly_idx": poly_ids},
+    )
+
+
+def load_variability(preprocessed_path, gwl):
+    """
+    Variance decomposition of RED severity at `gwl` into internal (I) vs.
+    model (M) components, for panels c-d. Rebuilt from scratch every call:
+    the same wcf_agg_*/scf_agg_* aggregates as load_indicators(), resampled
+    monthly instead of yearly (load_agg_data_compound(..., freq='month')),
+    fed into custom_regional_analysis() -- there is no cached
+    custom_regional_analysis_v1.nc to read instead.
+    """
+    ds = load_agg_data_compound(preprocessed_path, freq="month")
+    ds = _rename_intensity_and_compute_severity(ds, "month")
+    return custom_regional_analysis(ds, "severity", gwl)
 
 
 def compute_severity_significance(ds, gwls, alpha, ssp, reference_gwl, n_resamples, seed):
@@ -476,7 +557,9 @@ def main():
         agreement_panels.append((incr, decr, GWL_LABELS.get(gwl, gwl)))
 
     discrepancy_idx = load_discrepancy_idx(args.agreement_aggregated_nc, args.agreement_threshold)
-    ds_var = xr.open_dataset(args.variability_nc)
+
+    print(f"Rebuilding monthly variance decomposition at {args.variability_gwl}")
+    ds_var = load_variability(args.preprocessed_path, args.variability_gwl)
 
     print("Plotting supplementary figure 7")
     fig = plot_suppfig7(agreement_panels, args.shapefile_disag, discrepancy_idx,
