@@ -439,11 +439,27 @@ def _panel_letter(ax, letter):
             ha="left", va="top", fontsize=8, fontweight="bold")
 
 
+def _align_to_shapefile(da, shp, what):
+    """
+    Reindex `da` (dim poly_idx) onto the shapefile's row index. poly_idx
+    values are shapefile row indices, but polygons with no valid grid cell
+    are absent from the aggregates; they come back as NaN (left unfilled).
+    """
+    unknown = np.setdiff1d(da["poly_idx"].values, shp.index.values)
+    if unknown.size:
+        raise ValueError(f"{what} has {unknown.size} poly_idx not in the shapefile "
+                         f"(e.g. {unknown[:5]}): wrong --shapefile?")
+    return da.reindex(poly_idx=shp.index.values)
+
+
 def _draw_bivariate(ax, shp, incr, decr, discrepancy_idx, letter, center_label):
+    incr = _align_to_shapefile(incr, shp, "significance data")
+    decr = _align_to_shapefile(decr, shp, "significance data")
     class_incr = np.digitize(incr.values, AGREEMENT_CLASS_THRESHOLDS, right=True)
     class_decr = np.digitize(decr.values, AGREEMENT_CLASS_THRESHOLDS, right=True)
     shp = shp.copy()
-    shp["var"] = class_decr * 3 + class_incr
+    shp["var"] = np.where(np.isnan(incr.values) | np.isnan(decr.values),
+                          np.nan, class_decr * 3 + class_incr)
 
     ax.coastlines(resolution="50m", color="black", linewidth=0.4, zorder=1)
     shp.boundary.plot(ax=ax, color="black", linewidth=0.15, transform=ccrs.PlateCarree())
@@ -495,8 +511,8 @@ def plot_suppfig7(agreement_panels, shapefile_disag, discrepancy_idx,
     shp_disag["poly_idx"] = shp_disag.index
     n_poly = agreement_panels[0][0].sizes["poly_idx"]
     if len(shp_disag) != n_poly:
-        raise ValueError(f"{shapefile_disag} has {len(shp_disag)} polygons, "
-                         f"significance data has {n_poly}")
+        print(f"  {shapefile_disag} has {len(shp_disag)} polygons, significance "
+              f"data has {n_poly}: {len(shp_disag) - n_poly} left blank (no data)")
 
     fig = plt.figure(figsize=(FIG_WIDTH_IN, FIG_WIDTH_IN * 0.65), dpi=300)
     gs = GridSpec(2, 2, hspace=0.0, wspace=0.0, figure=fig)
@@ -516,11 +532,8 @@ def plot_suppfig7(agreement_panels, shapefile_disag, discrepancy_idx,
 
     # -- c: total projection spread ------------------------------------------
     shp_var = gpd.read_file(shapefile_var)
-    if len(shp_var) != ds_var.sizes["poly_idx"]:
-        raise ValueError(f"{shapefile_var} has {len(shp_var)} polygons, "
-                         f"variance decomposition has {ds_var.sizes['poly_idx']}")
-    shp_var["total"] = ds_var["total"].values
-    shp_var["I"] = ds_var["I"].values
+    shp_var["total"] = _align_to_shapefile(ds_var["total"], shp_var, "variance decomposition").values
+    shp_var["I"] = _align_to_shapefile(ds_var["I"], shp_var, "variance decomposition").values
 
     total_positive = shp_var["total"].where(shp_var["total"] > 0).min()
     ax_c.coastlines(linewidth=0.25)
