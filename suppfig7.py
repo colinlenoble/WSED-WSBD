@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Supplementary figure 7: model agreement on projected RED severity changes
+Supplementary figure 7: model agreement on projected SWED severity changes
 (panels a-b) and variability decomposition of the projections (panels c-d).
 
   a - agreement across simulations on significant severity changes at GWL 2°C
   b - same at GWL 3°C
-  c - total projection spread of RED severity under 2°C warming
+  c - total projection spread of SWED severity under 2°C warming
   d - fraction of that spread explained by internal variability
 
 Terminology: frequency (events/year), duration (days/event) and intensity
-(mean deficit on event days) are the three RED components; severity is
+(mean deficit on event days) are the three SWED components; severity is
 their product, frequency x duration x intensity. make_agg_files.py calls
 intensity "severity"; it is renamed on load.
 
@@ -89,7 +89,7 @@ GWL_LABELS = {"GWL1-5": "1.5°C", "GWL2": "2°C", "GWL3": "3°C"}
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Model agreement on RED severity changes and variability "
+        description="Model agreement on SWED severity changes and variability "
                     "decomposition (supplementary figure 7).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -348,7 +348,7 @@ def custom_regional_analysis(ds, var, gwl):
 
 def load_variability(preprocessed_path, gwl, rebuild=False):
     """
-    Variance decomposition of RED severity at `gwl` into internal (I) vs.
+    Variance decomposition of SWED severity at `gwl` into internal (I) vs.
     model (M) components, for panels c-d: the same wcf_agg_*/scf_agg_*
     aggregates as load_indicators(), resampled monthly instead of yearly
     (load_compound_cached(..., freq='month')), fed into
@@ -392,7 +392,7 @@ def compute_severity_significance(ds, gwls, alpha, ssp, reference_gwl, n_resampl
     )
     out = trend.to_dataset(name="severity_trend")
     out["severity_trend"].attrs = {
-        "long_name": "Sign of significant change in RED severity (frequency x duration x intensity)",
+        "long_name": "Sign of significant change in SWED severity (frequency x duration x intensity)",
         "reference_gwl": reference_gwl,
         "test": f"two-sided paired permutation test, {n_resamples} resamples, "
                 f"Benjamini-Hochberg FDR at {2 * alpha}",
@@ -541,7 +541,7 @@ def plot_suppfig7(agreement_panels, shapefile_disag, discrepancy_idx,
     shp_var.plot(
         column="total", ax=ax_c, legend=True, transform=ccrs.PlateCarree(), cmap="Reds",
         norm=LogNorm(vmin=float(total_positive), vmax=float(shp_var["total"].max())),
-        legend_kwds={"label": "Total projection spread of RED severity under 2°C warming",
+        legend_kwds={"label": "Total projection spread of SWED severity under 2°C warming",
                      "orientation": "horizontal", "shrink": 0.6, "pad": 0.02},
     )
     ax_c.spines["geo"].set_visible(False)
@@ -580,7 +580,7 @@ def plot_suppfig7(agreement_panels, shapefile_disag, discrepancy_idx,
 def main():
     args = parse_args()
 
-    print(f"Rebuilding yearly RED indicators from {args.preprocessed_path}")
+    print(f"Rebuilding yearly SWED indicators from {args.preprocessed_path}")
     ds = load_indicators(args.preprocessed_path, args.rebuild)
     print("Computing severity trend significance")
     sig = compute_severity_significance(
