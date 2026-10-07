@@ -4,7 +4,8 @@ Extended Data Fig. 4: projected changes in annual SWED severity at 1.5, 2 and
 3 degC warming, stacked value-by-alpha maps without the regional violin
 panels (previously STEP 5 of fig3.py).
 
-Shares its ensemble building, land mask and CLI with main_figs/fig3.py.
+Shares its ensemble building, inverse-Wasserstein ensemble weighting, land
+mask and CLI with main_figs/fig3.py.
 """
 import os
 import sys
@@ -32,7 +33,7 @@ from string import ascii_lowercase
 from fig3 import (EQUAL_EARTH_ASPECT, FIG_WIDTH_IN, MAP_LAT_NORTH,
                   MAP_LAT_SOUTH, _compute_rgba_map, fit_to_width, mask_poles,
                   rasterize_shapefile)
-from fig3 import build_parser, prepare_inputs, iter_gwl_decomp
+from fig3 import build_parser, prepare_inputs, iter_gwl_decomp, ensemble_weight
 
 
 def plot_supp_valuebyalpha_stacked(
@@ -176,7 +177,8 @@ def main():
     da_mask_ref_supp = None
     for level, gwl_key, gwl_label, fields in iter_gwl_decomp(args, inputs):
         (da_ref_freq, da_ref_int, da_ref_dur,
-         da_proj_freq, da_proj_int, da_proj_dur, weight) = fields
+         da_proj_freq, da_proj_int, da_proj_dur, base_weight) = fields
+        weight, _ = ensemble_weight(da_proj_freq, base_weight, inputs)
         print(f"  Collecting rgba map ...")
         _rgba, _extent, _cedges, _sedges, _clvl, _alvl = _compute_rgba_map(
             da_ref_freq, da_ref_int, da_ref_dur,
@@ -193,7 +195,7 @@ def main():
         if da_mask_ref_supp is None:
             da_mask_ref_supp = da_ref_freq.isel(realization=0).load()
         del fields, da_ref_freq, da_ref_int, da_ref_dur
-        del da_proj_freq, da_proj_int, da_proj_dur, weight
+        del da_proj_freq, da_proj_int, da_proj_dur, weight, base_weight
         gc.collect()
 
     if not supp_items:

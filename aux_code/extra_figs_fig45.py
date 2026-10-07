@@ -42,7 +42,8 @@ from fig45 import (DICT_LABELS, FIG_WIDTH_IN, MAIN_MIX,
                    PATHS, REGION_NAMES, _add_colorbar, _build_gdf, _draw_map,
                    _make_cmap, _mmm_combined, _mmm_re, _mmm_tas, _save_fig,
                    _three_panel_map, load_gwl_dfs, load_hatch_agg,
-                   mask_poles)
+                   mask_poles, _load_wasserstein_agg,
+                   _wasserstein_weight_table, w2_weighted_mean)
 from suppfig8_driver_effects import _driver_effects_figure
 
 
@@ -51,7 +52,8 @@ def _print_combined_effect_direction_stats(df_gwl, gwl_label, share_re="current"
     positive (increasing) vs. negative (decreasing) flat multi-model-mean
     Combined_Effect -- SWBDs change relative to 0.61 C, same metric/weighting
     as plot_main_gwl_maps -- out of how many regions have a finite value."""
-    combined = (_mmm_combined(df_gwl, share_re, vmax=None)["Combined_Effect"]
+    combined = (_mmm_combined(df_gwl, share_re, vmax=None,
+                              weighting="mmm")["Combined_Effect"]
                 .replace([np.inf, -np.inf], np.nan).dropna())
     n_total = len(combined)
     n_up    = int((combined > 0).sum())
@@ -63,76 +65,19 @@ def _print_combined_effect_direction_stats(df_gwl, gwl_label, share_re="current"
 # =============================================================================
 # INVERSE-WASSERSTEIN-DISTANCE POLYGON WEIGHTING
 #
-# Aggregated-domain (poly_idx) twin of fig3.py's per-pixel inverse-W2
-# weighting (_build_wasserstein_pixel_weight): instead of the flat multi-model
-# mean used by _mmm() (equal weight per GCM, split evenly across its runs),
-# a realization whose bootstrap trend distribution is closer to ERA5's own at
-# a given polygon counts for more there. Source data is
-# trend_sev_eval_wasserstein.py's wasserstein_empirical_agg() output
-# (config.WASSERSTEIN_AGGREGATED_NC_PATH): dims (realization, poly_idx),
-# variables w2_distance/w2_normalized, per-realization GCM/run values.
+# Loader/weight table/weighted mean live in fig45.py (_load_wasserstein_agg,
+# _wasserstein_weight_table, w2_weighted_mean), where they are also the
+# default ensemble averaging of _mmm(). The wrappers below take an explicit
+# w2_table, for the companion figures that compare against the flat
+# multi-model mean (_mmm(..., weighting="mmm")).
 # =============================================================================
 
-def _load_wasserstein_agg(wasserstein_path=None):
-    """Open config.WASSERSTEIN_AGGREGATED_NC_PATH (or an override). Returns
-    None (with a warning) if the file is missing, so callers can skip the
-    inverse-W2-weighted companion figures gracefully rather than erroring."""
-    path = wasserstein_path or config.WASSERSTEIN_AGGREGATED_NC_PATH
-    if not os.path.exists(path):
-        print(f"  [WARN] Wasserstein aggregated file not found: {path} "
-              "-- inverse-W2-weighted companion figures skipped.")
-        return None
-    return xr.open_dataset(path)
-
-
-def _wasserstein_weight_table(ds_wasserstein, var="w2_normalized", eps=1e-3):
-    """
-    Long-format (GCM, run, poly_idx) -> weight table combining the usual
-    per-realization 1/n_gcm weight (de-duplicating multi-run GCMs, same
-    convention as fig3.py's add_severity_and_weights/
-    _build_wasserstein_pixel_weight) with the per-polygon inverse of that
-    realization's normalized empirical Wasserstein trend distance to ERA5
-    (ds_wasserstein's w2_normalized). eps floors w2_normalized so a
-    near-zero distance cannot make a single realization dominate a
-    polygon's weighted mean. Positional indexing (not a 'realization'
-    coordinate) matches fig3.py's own handling of this dataset.
-    """
-    gcms = np.asarray(ds_wasserstein["GCM"].values).astype(str)
-    runs = np.asarray(ds_wasserstein["run"].values).astype(str)
-    wcount = pd.Series(gcms).value_counts()
-    base_w = np.array([1.0 / wcount[g] / wcount.size for g in gcms])
-
-    w2     = ds_wasserstein[var].values                     # (realization, poly_idx)
-    inv_w2 = 1.0 / np.clip(w2, eps, None)
-    weight = inv_w2 * base_w[:, None]                        # (realization, poly_idx)
-
-    poly_idx     = ds_wasserstein["poly_idx"].values
-    n_real, n_poly = weight.shape
-    return pd.DataFrame({
-        "GCM":       np.repeat(gcms, n_poly),
-        "run":       np.repeat(runs, n_poly),
-        "poly_idx":  np.tile(poly_idx, n_real),
-        "w2_weight": weight.ravel(),
-    })
-
-
 def _mmm_wasserstein(df_gwl, effect_col, share_re, vmax, compute_fn, w2_table):
-    """Inverse-W2-weighted twin of _mmm(): per-polygon weighted average of
-    effect_col over (GCM, run) rows, using w2_table's weight instead of a
-    flat per-GCM mean. Rows with no matching (GCM, run, poly_idx) weight are
-    excluded, same as fig3.py's _build_wasserstein_pixel_weight."""
+    """Inverse-W2-weighted per-polygon mean of effect_col using w2_table
+    (see fig45.w2_weighted_mean)."""
     df = df_gwl[df_gwl["share_re"] == share_re].copy()
     compute_fn(df)
-    df["GCM"] = df["GCM"].astype(str)
-    df["run"] = df["run"].astype(str)
-    merged = df.merge(w2_table, on=["GCM", "run", "poly_idx"], how="inner")
-    merged = merged[np.isfinite(merged[effect_col]) & (merged["w2_weight"] > 0)]
-    if merged.empty:
-        return pd.DataFrame(columns=["poly_idx", effect_col])
-    merged["_wsum"] = merged[effect_col] * merged["w2_weight"]
-    grp = merged.groupby("poly_idx").agg(_wsum=("_wsum", "sum"),
-                                          _wtot=("w2_weight", "sum"))
-    out = (grp["_wsum"] / grp["_wtot"]).rename(effect_col).reset_index()
+    out = w2_weighted_mean(df, [effect_col], w2_table=w2_table)
     if vmax is not None:
         out.loc[out[effect_col] > vmax, effect_col] = vmax
     return out
@@ -215,26 +160,31 @@ def plot_main_gwl_maps_absolute_wasserstein(df_gwl15, df_gwl2, df_gwl3,
 def plot_gwl2_wasserstein_vs_mmm(df_gwl2, shapefile_path, hatch_df, w2_table,
                                  output_dir, dpi=300, share_re="current"):
     """
-    Two-panel supplementary companion to plot_main_gwl_maps, at GWL2 (2 deg C)
-    only. Aggregated (poly_idx) twin of fig3.py's
-    plot_gwl_valuebyalpha_wasserstein, using the same SWBDs relative-change (%)
-    metric as plot_main_gwl_maps (Combined_Effect) instead of fig3's pixel-level
-    value-by-alpha map:
+    Three-panel supplementary companion to the GWL maps, at GWL2 (2 deg C)
+    only -- aggregated (poly_idx) twin of
+    suppfig5_projected_change_wasserstein.py, using the SWBDs relative-change
+    (%) metric (Combined_Effect):
       a) average SWBDs change vs 0.61 deg C, weighted per polygon by each
-         realization's inverse normalized Wasserstein trend distance to ERA5 at
-         that polygon (_mmm_combined_wasserstein/_wasserstein_weight_table),
-         instead of the flat multi-model mean plot_main_gwl_maps uses. Same
-         colour scale as plot_main_gwl_maps so the two are directly comparable.
-      b) the difference this reweighting makes: (inverse-W2-weighted change)
-         minus (multi-model-mean change), in percentage points -- diverging
-         blue/orange (cmo.cm.balance), matching fig3's diff panel. Agreement
-         hatching is shown in (a) but, as in fig3's reference figure, omitted
-         in (b) since it describes trend agreement, not this reweighting.
+         realization's 1/n_gcm times its inverse normalized Wasserstein trend
+         distance to ERA5 at that polygon (_mmm_combined_wasserstein),
+      b) the flat multi-model mean (_mmm_combined(..., weighting="mmm")),
+         side by side with a on one shared continuous colour scale,
+      c) a - b in percentage points, full width, diverging (cmo.cm.balance)
+         on its own scale. Agreement masking is shown in a/b but omitted in
+         c, since it describes trend agreement, not this reweighting.
     """
-    cmap, norm = _make_cmap(vmin=-100, vmax=800)
-
-    df_flat = _mmm_combined(df_gwl2, share_re=share_re, vmax=None)
+    df_flat = _mmm_combined(df_gwl2, share_re=share_re, vmax=None, weighting="mmm")
     df_w2   = _mmm_combined_wasserstein(df_gwl2, w2_table, share_re=share_re, vmax=None)
+
+    # a/b: shared continuous scale from the data (2nd-98th percentile of
+    # both fields, centred on 0) rather than the fixed -100..800 % of the
+    # GWL maps, so the a-b differences stay visible.
+    ab = (pd.concat([df_flat["Combined_Effect"], df_w2["Combined_Effect"]])
+          .replace([np.inf, -np.inf], np.nan).dropna())
+    lo = min(-1.0, float(np.nanpercentile(ab, 2))) if len(ab) else -1.0
+    hi = max(1.0, float(np.nanpercentile(ab, 98))) if len(ab) else 1.0
+    cmap = plt.get_cmap("RdYlGn_r")
+    norm = mcolors.TwoSlopeNorm(vmin=lo, vcenter=0, vmax=hi)
 
     diff = df_flat.merge(df_w2, on="poly_idx", suffixes=("_flat", "_w2"))
     diff["Diff_Effect"] = diff["Combined_Effect_w2"] - diff["Combined_Effect_flat"]
@@ -248,31 +198,51 @@ def plot_gwl2_wasserstein_vs_mmm(df_gwl2, shapefile_path, hatch_df, w2_table,
     hatch_df_none = hatch_df.copy()
     hatch_df_none["var"] = np.nan
 
+    # Fixed inch layout: row 1 two half-width maps (a | b) + shared
+    # colorbar, row 2 one full-width map (c) + its colorbar.
+    aspect = 2.05   # width / height of a set_global() EqualEarth axes
+    fig_w  = FIG_WIDTH_IN
+    margin, hgap = 0.05, 0.10
+    half_w = (fig_w - 2 * margin - hgap) / 2
+    half_h = half_w / aspect
+    full_w = fig_w - 2 * margin
+    full_h = full_w / aspect
+    title_h, cbar_zone, row_gap, suptitle_h = 0.24, 0.50, 0.10, 0.20
+    fig_h  = (suptitle_h + title_h + half_h + cbar_zone + row_gap + title_h
+              + full_h + cbar_zone)
+    fig    = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+
+    def _rect(x_in, y_in, w_in, h_in):
+        return [x_in / fig_w, y_in / fig_h, w_in / fig_w, h_in / fig_h]
+
+    y_c   = cbar_zone
+    y_top = y_c + full_h + title_h + row_gap + cbar_zone
     proj  = ccrs.EqualEarth()
-    fig_w = FIG_WIDTH_IN
-    fig_h = fig_w * (15 / 14)
-    fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
-    gs    = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.55,
-                             bottom=0.10, top=0.95)
+    ax_a = fig.add_axes(_rect(margin, y_top, half_w, half_h), projection=proj)
+    ax_b = fig.add_axes(_rect(margin + half_w + hgap, y_top, half_w, half_h), projection=proj)
+    ax_c = fig.add_axes(_rect(margin, y_c, full_w, full_h), projection=proj)
 
-    ax_a  = fig.add_subplot(gs[0, 0], projection=proj)
-    gdf_a = _build_gdf(shapefile_path, df_w2, hatch_df)
-    _draw_map(ax_a, gdf_a, "Combined_Effect", cmap, norm, hatch_df,
-              "Inverse-Wasserstein-weighted SWBDs change under 2.0°C warming",
-              "a", title_fontsize=7)
+    _draw_map(ax_a, _build_gdf(shapefile_path, df_w2, hatch_df), "Combined_Effect",
+              cmap, norm, hatch_df, "Inverse-Wasserstein weighted", "a", title_fontsize=6)
+    _draw_map(ax_b, _build_gdf(shapefile_path, df_flat, hatch_df), "Combined_Effect",
+              cmap, norm, hatch_df, "Multi-model mean", "b", title_fontsize=6)
+    _draw_map(ax_c, _build_gdf(shapefile_path, diff, hatch_df_none), "Diff_Effect",
+              diff_cmap, diff_norm, hatch_df_none, "Difference (a $-$ b)", "c",
+              title_fontsize=7)
+    fig.suptitle("SWBDs change under 2.0°C warming", fontsize=7,
+                 y=1 - 0.04 / fig_h, va="top")
+
+    cbar_w = 0.5 * full_w
     _add_colorbar(fig, cmap, norm, "SWBDs change compared to 0.61°C (%)",
-                  pos=(0.25, 0.545, 0.5, 0.016))
-
-    ax_b  = fig.add_subplot(gs[1, 0], projection=proj)
-    gdf_b = _build_gdf(shapefile_path, diff, hatch_df_none)
-    _draw_map(ax_b, gdf_b, "Diff_Effect", diff_cmap, diff_norm, hatch_df_none,
-              "Difference vs. multi-model mean", "b", title_fontsize=7)
+                  pos=_rect((fig_w - cbar_w) / 2, y_top - 0.20, cbar_w, 0.07),
+                  extend="both")
     _add_colorbar(fig, diff_cmap, diff_norm,
-                  "Difference in SWBDs change,\ninverse-W2 minus multi-model mean (pp)",
-                  pos=(0.25, 0.035, 0.5, 0.016))
+                  "Difference, inverse-W2 weighted\nminus multi-model mean (pp)",
+                  pos=_rect((fig_w - cbar_w) / 2, y_c - 0.20, cbar_w, 0.07),
+                  extend="both")
 
     _save_fig(fig, os.path.join(output_dir, "supp",
-                                "suppfig_main_gwl_maps_GWL2_wasserstein.png"), dpi)
+                                "suppfig_main_gwl_maps_GWL2_wasserstein_vs_mmm.png"), dpi)
 
 
 def _print_effect_outliers(df_db, region_name, effect_col="RE_Effect", n_top=5):

@@ -99,7 +99,7 @@ def plot_re_share_effect_absolute(gwl_dfs_by_share, shapefile_path, hatch_df,
 
     fig.text(0.5, 0.995, "Effect of solar-wind penetration level on SWBDs",
              ha="center", va="top", fontsize=8, fontweight="bold")
-    fig.text(0.5, 0.970, "Multi-model mean, current mix, threshold = 0.99",
+    fig.text(0.5, 0.970, "Inverse-Wasserstein-weighted mean, current mix, threshold = 0.99",
              ha="center", va="top", fontsize=6, style="italic", color="#444444")
 
     legend_handles = [

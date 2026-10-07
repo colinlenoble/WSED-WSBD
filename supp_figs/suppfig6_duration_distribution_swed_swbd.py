@@ -40,6 +40,13 @@ Western China) doesn't count the same as a small one (e.g. a Caribbean
 island), the region-level analogue of the pixel-grid figures' cos(latitude)
 area weighting.
 
+With --weighting w2 (default), the equal-GCM pooling above becomes
+inverse-Wasserstein pooling: each (GCM, run)'s own duration share is
+weighted by 1/n_runs/n_GCM times the inverse of its normalized Wasserstein
+trend distance to ERA5 -- averaged over the zone's land pixels for SWED
+(fig_duration_distribution_latitude.zone_inv_w2), per polygon for SWBD
+(load_poly_inv_w2). --weighting mmm restores equal-GCM weighting.
+
 Figure layout (2 columns x 6 rows; see plot_swed_swbd_distributions): column
 0 is SWED, column 1 is SWBD. Row 0 holds each side's own locator map --
 SWED's is the flat per-zone latitude-band map (a pixel's zone is just its
@@ -218,6 +225,15 @@ def parse_args():
                               "fig_duration_distribution_latitude.py's 'full' figure -- "
                               "unlike the ratio, a share stays meaningful far into the tail).")
     parser.add_argument("--min_events", type=int, default=5)
+    parser.add_argument("--weighting", choices=["w2", "mmm"], default="w2",
+                        help="Ensemble pooling: 'w2' (default) weights each realization by "
+                             "1/n_gcm times the inverse of its normalized Wasserstein trend "
+                             "distance to ERA5 (zone mean for SWED, polygon for SWBD); 'mmm' "
+                             "is the flat equal-GCM weighting.")
+    parser.add_argument("--wasserstein_path", default=config.WASSERSTEIN_NC_PATH,
+                        help="Per-pixel Wasserstein file (SWED zone weights).")
+    parser.add_argument("--wasserstein_agg_path", default=config.WASSERSTEIN_AGGREGATED_NC_PATH,
+                        help="Per-polygon Wasserstein file (SWBD region weights).")
     parser.add_argument("--duration_split_day", type=float, default=DURATION_SPLIT_DAY_DEFAULT,
                          help="Day at which plot_swed_swbd_distributions_split's broken-axis "
                               f"panels split short-term from persistent events (default: "
@@ -617,7 +633,7 @@ def load_plot_data_cache(path, meta):
 # a zone's regions
 # =============================================================================
 
-def _region_group_counts(counts_df, gwl, poly_idx, x_int):
+def _region_group_counts(counts_df, gwl, poly_idx, x_int, inv_w2=None):
     """
     Equal-GCM-weighted share-of-events curve for a single region (poly_idx)
     -- same "normalize per GCM, then average with weight 1/n_GCM"
@@ -625,12 +641,16 @@ def _region_group_counts(counts_df, gwl, poly_idx, x_int):
     scoped to one region instead of one latitude zone. The building block
     zone_group_counts_swbd area-weights together across a zone's regions.
     Returns (arr_share, raw_total) or None if no GCM has data for this
-    (gwl, poly_idx).
+    (gwl, poly_idx). inv_w2 ({(GCM, run): weight} for this polygon): pool
+    with inverse-Wasserstein weights instead (swed_mod._group_counts_weighted).
     """
     sub = counts_df[(counts_df["gwl"] == gwl) & (counts_df["poly_idx"] == poly_idx)]
     if sub.empty:
         return None
     raw_total = float(sub["count"].sum())
+    if inv_w2 is not None:
+        pooled = swed_mod._group_counts_weighted(sub, x_int, inv_w2)
+        return None if pooled is None else (pooled[0], raw_total)
 
     gcm_series, gcm_totals = [], []
     for gcm, gsub in sub.groupby("GCM"):
@@ -652,7 +672,8 @@ def _region_group_counts(counts_df, gwl, poly_idx, x_int):
     return arr_share, raw_total
 
 
-def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_int, min_events=5):
+def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_int, min_events=5,
+                           poly_inv_w2=None):
     """
     Area-weighted mean, across every region assigned to `zone` (see
     assign_regions_to_zones), of each region's own equal-GCM-weighted
@@ -663,12 +684,14 @@ def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_i
     event count falls under min_events are excluded, same gating
     convention as plot_distributions'/build_swbd_counts_table callers'
     min_events. Returns arr_share, or None if no region in this zone
-    qualifies.
+    qualifies. poly_inv_w2 ({poly_idx: {(GCM, run): weight}}, see
+    load_poly_inv_w2): inverse-Wasserstein pooling within each region.
     """
     polys = [p for p, z in zone_of_poly.items() if z == zone]
     curves, weights = [], []
     for poly_idx in polys:
-        group = _region_group_counts(counts_df, gwl, poly_idx, x_int)
+        inv = None if poly_inv_w2 is None else poly_inv_w2.get(poly_idx, {})
+        group = _region_group_counts(counts_df, gwl, poly_idx, x_int, inv_w2=inv)
         if group is None:
             continue
         arr_share, raw_total = group
@@ -685,6 +708,40 @@ def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_i
     weights = np.array(weights)
     curves = np.array(curves)
     return (curves * weights[:, None]).sum(axis=0) / weights.sum()
+
+
+def load_poly_inv_w2(path, var="w2_normalized", eps=1e-3):
+    """{poly_idx: {(GCM, run): 1 / max(w2_normalized, eps)}} from the
+    per-polygon Wasserstein file (trend_sev_eval_wasserstein.py's
+    wasserstein_empirical_agg(); config.WASSERSTEIN_AGGREGATED_NC_PATH).
+    Read directly rather than via fig45.py, which needs make_rl_files/xclim."""
+    ds = xr.open_dataset(path)
+    gcms = np.asarray(ds.GCM.values).astype(str)
+    runs = np.asarray(ds.run.values).astype(str)
+    inv = 1.0 / np.clip(ds[var].values, eps, None)          # (realization, poly_idx)
+    out = {}
+    for j, poly in enumerate(ds.poly_idx.values):
+        out[int(poly)] = {(g, r): float(inv[i, j]) for i, (g, r) in enumerate(zip(gcms, runs))
+                          if np.isfinite(inv[i, j])}
+    ds.close()
+    return out
+
+
+def load_ensemble_weights(args):
+    """{"SWED": zone weights, "SWBD": polygon weights} for --weighting w2
+    (None for mmm). Missing files are a hard error: the figure never
+    silently falls back to equal-GCM weighting."""
+    if args.weighting != "w2":
+        return None
+    for path in (args.wasserstein_path, args.wasserstein_agg_path):
+        if not os.path.exists(path):
+            raise SystemExit(f"Wasserstein file not found: {path} -- run "
+                             "main_pipeline/trend_sev_eval_wasserstein.py first, or "
+                             "pass --weighting mmm.")
+    ds = xr.open_dataset(args.wasserstein_path)
+    swed = swed_mod.zone_inv_w2(ds, args.shapefile)
+    ds.close()
+    return {"SWED": swed, "SWBD": load_poly_inv_w2(args.wasserstein_agg_path)}
 
 
 # =============================================================================
@@ -758,7 +815,8 @@ def _drop_isolated_points(arr):
     return out
 
 
-def _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly, min_events=5):
+def _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly, min_events=5,
+               weights=None):
     """
     {"SWED": fn, "SWBD": fn}, each fn(gwl, zone, x) -> that (zone, GWL)'s
     pooled duration-share curve evaluated at durations `x`, or None if it
@@ -768,9 +826,12 @@ def _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly, min_e
     normalized by the group's total over *every* duration on record, so a
     curve evaluated on a cropped `x` is simply the full curve's head.
     Shared by the ratio and the share figures so both plot the same curves.
+    weights (load_ensemble_weights): inverse-Wasserstein pooling instead of
+    equal-GCM weighting on both sides.
     """
     def _swed_share(gwl, zlabel, x):
-        group = swed_mod._group_counts(swed_counts_df, gwl, zlabel, x)
+        inv = None if weights is None else weights["SWED"].get(zlabel, {})
+        group = swed_mod._group_counts(swed_counts_df, gwl, zlabel, x, inv_w2=inv)
         if group is None:
             return None
         arr_share, _, _, _, raw_total = group
@@ -779,7 +840,8 @@ def _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly, min_e
     def _swbd_share(gwl, zlabel, x):
         return zone_group_counts_swbd(
             swbd_counts_df, gwl, zlabel, zone_of_poly, area_of_poly, x,
-            min_events=min_events)
+            min_events=min_events,
+            poly_inv_w2=None if weights is None else weights["SWBD"])
 
     return {"SWED": _swed_share, "SWBD": _swbd_share}
 
@@ -828,7 +890,7 @@ def _add_split_break(fig, ax_main, ax_zoom, main_ylim, zoom_ylim, split_day):
 
 
 def _gather_ratio_panel_data(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
-                              gwl_list, x_int, zone_order, min_events=5):
+                              gwl_list, x_int, zone_order, min_events=5, weights=None):
     """
     Pass-1 gather shared by plot_swed_swbd_distributions and
     plot_swed_swbd_distributions_split: for every (zone, {SWED, SWBD}) panel,
@@ -840,7 +902,7 @@ def _gather_ratio_panel_data(swed_counts_df, swbd_counts_df, zone_of_poly, area_
     """
     ratio_gwls = [g for g in gwl_list if g != BASELINE_GWL]
     share_fns = _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
-                            min_events=min_events)
+                            min_events=min_events, weights=weights)
 
     panel_data = {col: [] for col in share_fns}
     for zlabel in zone_order:
@@ -892,7 +954,7 @@ def _shared_ratio_ylim_windows(panel_data, split_idx, outlier_pct=2.0, pad=1.08)
 def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
                                   zone_of_poly, area_of_poly, regions_shapefile,
                                   gwl_list, output_path, dpi=300,
-                                  max_duration_days=12.0, min_events=5):
+                                  max_duration_days=12.0, min_events=5, weights=None):
     """
     2-column x 6-row layout: column 0 is SWED, column 1 is SWBD.
 
@@ -932,7 +994,7 @@ def plot_swed_swbd_distributions(swed_counts_df, swbd_counts_df, land_area_pct,
     # disconnected floating marker) are removed; see _drop_isolated_points.
     panel_data, ratio_gwls = _gather_ratio_panel_data(
         swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
-        gwl_list, x_int, zone_order, min_events=min_events)
+        gwl_list, x_int, zone_order, min_events=min_events, weights=weights)
 
     all_ratio_arrays = [arr for col in panel_data.values() for row in col
                          for arr in row["ratios"].values()]
@@ -1019,7 +1081,8 @@ def plot_swed_swbd_distributions_split(swed_counts_df, swbd_counts_df, land_area
                                         zone_of_poly, area_of_poly, regions_shapefile,
                                         gwl_list, output_path, dpi=300,
                                         max_duration_days=12.0, min_events=5,
-                                        duration_split_day=DURATION_SPLIT_DAY_DEFAULT):
+                                        duration_split_day=DURATION_SPLIT_DAY_DEFAULT,
+                                        weights=None):
     """
     Broken-axis twin of plot_swed_swbd_distributions -- same data, same
     2-column x 6-row layout, locator maps, ratio definition, gap/isolated-
@@ -1050,7 +1113,7 @@ def plot_swed_swbd_distributions_split(swed_counts_df, swbd_counts_df, land_area
 
     panel_data, ratio_gwls = _gather_ratio_panel_data(
         swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
-        gwl_list, x_int, zone_order, min_events=min_events)
+        gwl_list, x_int, zone_order, min_events=min_events, weights=weights)
 
     if do_split:
         main_ylim, zoom_ylim = _shared_ratio_ylim_windows(panel_data, split_idx)
@@ -1180,7 +1243,8 @@ def plot_swed_swbd_share_split(swed_counts_df, swbd_counts_df, land_area_pct,
                                 zone_of_poly, area_of_poly, regions_shapefile,
                                 gwl_list, output_path, dpi=300,
                                 max_duration_days=swed_mod.FULL_FIGURE_MAX_DURATION_DAYS,
-                                min_events=5, duration_split_day=DURATION_SPLIT_DAY_DEFAULT):
+                                min_events=5, duration_split_day=DURATION_SPLIT_DAY_DEFAULT,
+                                weights=None):
     """
     Share-of-events twin of plot_swed_swbd_distributions_split -- same
     2-column (SWED | SWBD) x 6-row layout, locator maps and broken x-axis,
@@ -1202,7 +1266,7 @@ def plot_swed_swbd_share_split(swed_counts_df, swbd_counts_df, land_area_pct,
     split_idx = int(duration_split_day)  # x_int[:split_idx] == days 1..duration_split_day
     do_split = max_duration_days > duration_split_day
     share_fns = _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly,
-                            min_events=min_events)
+                            min_events=min_events, weights=weights)
     counts_by_col = {"SWED": swed_counts_df, "SWBD": swbd_counts_df}
 
     # Pass 1: every panel's curves (evaluated on the full duration record,
@@ -1423,6 +1487,9 @@ def main():
                               zone_of_poly, area_of_poly, plot_data_meta)
         print(f"\n  Saved full plot-data bundle -> {plot_data_path}")
 
+    # Weights are applied at pooling time, so the counts caches above stay valid.
+    weights = load_ensemble_weights(args)
+
     print("\n" + "=" * 60)
     print("STEP 5 - Plotting")
     print("=" * 60)
@@ -1432,7 +1499,7 @@ def main():
         swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
         args.regions_shapefile, args.gwl_list, out_path_split, dpi=args.dpi,
         max_duration_days=args.max_duration_days, min_events=args.min_events,
-        duration_split_day=args.duration_split_day,
+        duration_split_day=args.duration_split_day, weights=weights,
     )
     print(f"  Saved -> {out_path_split}")
 
@@ -1442,7 +1509,7 @@ def main():
         swed_counts_df, swbd_counts_df, land_area_pct, zone_of_poly, area_of_poly,
         args.regions_shapefile, args.gwl_list, out_path_share, dpi=args.dpi,
         max_duration_days=args.share_max_duration_days, min_events=args.min_events,
-        duration_split_day=args.duration_split_day,
+        duration_split_day=args.duration_split_day, weights=weights,
     )
     print(f"  Saved -> {out_path_share}")
 

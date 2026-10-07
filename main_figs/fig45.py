@@ -6,7 +6,9 @@ regions with their supply/demand decomposition (Fig. 5, dumbbell plot), in
 days of baseline demand.
 
 Reads the residual-load CSVs written by main_pipeline/make_rl_files.py (run it
-first). The map / data helpers below are shared with the Extended Data scripts
+first). Ensemble means weight each (GCM, run) by 1/n_gcm times the inverse of
+its normalized Wasserstein trend distance to ERA5 at that polygon (needs
+config.WASSERSTEIN_AGGREGATED_NC_PATH; see w2_weighted_mean). The map / data helpers below are shared with the Extended Data scripts
 supp_figs/suppfig8, 9, 11, 12 and 13 and aux_code/extra_figs_fig45.py.
 """
 import os
@@ -270,58 +272,163 @@ def _build_gdf(shapefile_path, df_data, hatch_df):
     return gdf
 
 
-def _mmm(df_gwl, effect_col, share_re, vmax, compute_fn):
+# =============================================================================
+# ENSEMBLE WEIGHTING -- inverse-Wasserstein-distance polygon weights
+#
+# Aggregated-domain (poly_idx) twin of fig3.py's per-pixel inverse-W2
+# weighting (_build_wasserstein_pixel_weight): instead of a flat multi-model
+# mean (equal weight per GCM, split evenly across its runs), a realization
+# whose bootstrap trend distribution is closer to ERA5's own at a given
+# polygon counts for more there. Source data is trend_sev_eval_wasserstein.py's
+# wasserstein_empirical_agg() output (config.WASSERSTEIN_AGGREGATED_NC_PATH):
+# dims (realization, poly_idx), variables w2_distance/w2_normalized,
+# per-realization GCM/run values.
+# =============================================================================
+
+W2_EPS = 1e-3
+_W2_TABLE_CACHE = {}
+
+
+def _load_wasserstein_agg(wasserstein_path=None):
+    """Open config.WASSERSTEIN_AGGREGATED_NC_PATH (or an override). Returns
+    None (with a warning) if the file is missing."""
+    path = wasserstein_path or config.WASSERSTEIN_AGGREGATED_NC_PATH
+    if not os.path.exists(path):
+        print(f"  [WARN] Wasserstein aggregated file not found: {path}")
+        return None
+    return xr.open_dataset(path)
+
+
+def _wasserstein_weight_table(ds_wasserstein, var="w2_normalized", eps=W2_EPS):
+    """
+    Long-format (GCM, run, poly_idx) -> weight table combining the usual
+    per-realization 1/n_gcm weight (de-duplicating multi-run GCMs, same
+    convention as fig3.py's add_severity_and_weights/
+    _build_wasserstein_pixel_weight) with the per-polygon inverse of that
+    realization's normalized empirical Wasserstein trend distance to ERA5
+    (ds_wasserstein's w2_normalized). eps floors w2_normalized so a
+    near-zero distance cannot make a single realization dominate a
+    polygon's weighted mean. Positional indexing (not a 'realization'
+    coordinate) matches fig3.py's own handling of this dataset.
+    """
+    gcms = np.asarray(ds_wasserstein["GCM"].values).astype(str)
+    runs = np.asarray(ds_wasserstein["run"].values).astype(str)
+    wcount = pd.Series(gcms).value_counts()
+    base_w = np.array([1.0 / wcount[g] / wcount.size for g in gcms])
+
+    w2     = ds_wasserstein[var].values                     # (realization, poly_idx)
+    inv_w2 = 1.0 / np.clip(w2, eps, None)
+    weight = np.nan_to_num(inv_w2 * base_w[:, None], nan=0.0)   # (realization, poly_idx)
+
+    poly_idx     = ds_wasserstein["poly_idx"].values
+    n_real, n_poly = weight.shape
+    return pd.DataFrame({
+        "GCM":       np.repeat(gcms, n_poly),
+        "run":       np.repeat(runs, n_poly),
+        "poly_idx":  np.tile(poly_idx, n_real),
+        "w2_weight": weight.ravel(),
+    })
+
+
+def _get_w2_table(wasserstein_path=None):
+    """Cached _wasserstein_weight_table for PATHS["wasserstein_aggregated_nc"]
+    (or an override). Missing file is a hard error: the figures never
+    silently fall back to the multi-model mean."""
+    path = wasserstein_path or PATHS["wasserstein_aggregated_nc"]
+    if path not in _W2_TABLE_CACHE:
+        ds = _load_wasserstein_agg(path)
+        if ds is None:
+            raise SystemExit(f"Wasserstein aggregated file not found: {path} -- run "
+                             "main_pipeline/trend_sev_eval_wasserstein.py first.")
+        _W2_TABLE_CACHE[path] = _wasserstein_weight_table(ds)
+        ds.close()
+    return _W2_TABLE_CACHE[path]
+
+
+def w2_weighted_mean(df, cols, by="poly_idx", w2_table=None):
+    """
+    Inverse-W2-weighted mean of each column in cols over the (GCM, run) rows
+    of df, grouped by `by` (default poly_idx; e.g. a region label). Each row
+    is weighted by its (GCM, run, poly_idx) w2_weight; rows with no matching
+    weight, and non-finite values (per column), are excluded.
+    """
+    w2_table = _get_w2_table() if w2_table is None else w2_table
+    d = df.copy()
+    d["GCM"] = d["GCM"].astype(str)
+    d["run"] = d["run"].astype(str)
+    d = d.merge(w2_table, on=["GCM", "run", "poly_idx"], how="inner")
+    d = d[d["w2_weight"] > 0]
+    out = {}
+    for c in cols:
+        v   = d[c].replace([np.inf, -np.inf], np.nan)
+        w   = d["w2_weight"].where(v.notna(), 0.0)
+        num = (v.fillna(0.0) * w).groupby(d[by]).sum()
+        den = w.groupby(d[by]).sum()
+        out[c] = num / den.replace(0.0, np.nan)
+    return pd.DataFrame(out).rename_axis(by).reset_index()
+
+
+def _mmm(df_gwl, effect_col, share_re, vmax, compute_fn, weighting="w2"):
+    """Per-polygon ensemble mean of effect_col: inverse-W2 weighted
+    (weighting="w2", default -- see w2_weighted_mean) or the flat multi-model
+    mean (weighting="mmm": runs averaged within each GCM, then GCMs)."""
     df = df_gwl[df_gwl["share_re"] == share_re].copy()
     compute_fn(df)
-    out = (df[["poly_idx", "GCM", effect_col]]
-           .groupby(["GCM", "poly_idx"])[effect_col].mean().reset_index()
-           .groupby("poly_idx")[effect_col].mean().reset_index())
+    if weighting == "w2":
+        out = w2_weighted_mean(df, [effect_col])
+    else:
+        out = (df[["poly_idx", "GCM", effect_col]]
+               .groupby(["GCM", "poly_idx"])[effect_col].mean().reset_index()
+               .groupby("poly_idx")[effect_col].mean().reset_index())
     if vmax is not None:
         out.loc[out[effect_col] > vmax, effect_col] = vmax
     return out
 
 
-def _mmm_combined(df_gwl, share_re="current", vmax=800):
+def _mmm_combined(df_gwl, share_re="current", vmax=800, weighting="w2"):
     def fn(df):
         df["Combined_Effect"] = (df["cum_rl_gwl"] - df["cum_rl_ref"]) / df["cum_rl_ref"] * 100
-    return _mmm(df_gwl, "Combined_Effect", share_re, vmax, fn)
+    return _mmm(df_gwl, "Combined_Effect", share_re, vmax, fn, weighting)
 
 
-def _mmm_re(df_gwl, share_re="current", vmax=100):
+def _mmm_re(df_gwl, share_re="current", vmax=100, weighting="w2"):
     def fn(df):
         df["RE_Effect"] = (df["cum_rl_ds_cf"] - df["cum_rl_ref"]) / df["cum_rl_ref"] * 100
-    return _mmm(df_gwl, "RE_Effect", share_re, vmax, fn)
+    return _mmm(df_gwl, "RE_Effect", share_re, vmax, fn, weighting)
 
 
-def _mmm_tas(df_gwl, share_re="current", vmax=200):
+def _mmm_tas(df_gwl, share_re="current", vmax=200, weighting="w2"):
     def fn(df):
         df["TAS_Effect"] = (df["cum_rl_tas"] - df["cum_rl_ref"]) / df["cum_rl_ref"] * 100
-    return _mmm(df_gwl, "TAS_Effect", share_re, vmax, fn)
+    return _mmm(df_gwl, "TAS_Effect", share_re, vmax, fn, weighting)
 
 
-def _mmm_absolute_days(df_gwl, share_re="current"):
+def _mmm_absolute_days(df_gwl, share_re="current", weighting="w2"):
     # Absolute change in cumulative residual load (GWL2 - GWL0.61), normalized
     # by each region's non-thermosensitive baseline demand (demand_bas from
     # _calculate_rl) -- units are "days of baseline demand" rather than percent.
     def fn(df):
         df["Absolute_Days"] = (df["cum_rl_gwl"] - df["cum_rl_ref"]) / df["demand_bas"]
-    return _mmm(df_gwl, "Absolute_Days", share_re, vmax=None, compute_fn=fn)
+    return _mmm(df_gwl, "Absolute_Days", share_re, vmax=None, compute_fn=fn,
+                weighting=weighting)
 
 
-def _mmm_supply_days(df_gwl, share_re="current"):
+def _mmm_supply_days(df_gwl, share_re="current", weighting="w2"):
     # Isolated RE-supply driver (cum_rl_ds_cf - cum_rl_ref), same
     # days-of-baseline-demand normalization as _mmm_absolute_days.
     def fn(df):
         df["Supply_Days"] = (df["cum_rl_ds_cf"] - df["cum_rl_ref"]) / df["demand_bas"]
-    return _mmm(df_gwl, "Supply_Days", share_re, vmax=None, compute_fn=fn)
+    return _mmm(df_gwl, "Supply_Days", share_re, vmax=None, compute_fn=fn,
+                weighting=weighting)
 
 
-def _mmm_demand_days(df_gwl, share_re="current"):
+def _mmm_demand_days(df_gwl, share_re="current", weighting="w2"):
     # Isolated TAS-demand driver (cum_rl_tas - cum_rl_ref), same
     # days-of-baseline-demand normalization as _mmm_absolute_days.
     def fn(df):
         df["Demand_Days"] = (df["cum_rl_tas"] - df["cum_rl_ref"]) / df["demand_bas"]
-    return _mmm(df_gwl, "Demand_Days", share_re, vmax=None, compute_fn=fn)
+    return _mmm(df_gwl, "Demand_Days", share_re, vmax=None, compute_fn=fn,
+                weighting=weighting)
 
 
 def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
@@ -440,8 +547,9 @@ def plot_main_dumbbell_absolute(df_gwl2, shapefile_path, dpi=300, share_re="curr
         df_db[eff] = (df_db[num] - df_db["cum_rl_ref"]) / df_db["demand_bas"]
     df_db["label"] = df_db["name"].map(DICT_LABELS)
     df_db = df_db[df_db["name"].isin(REGION_NAMES)].dropna(subset=["label"])
-    stats = (df_db[["label", "GCM", "Combined_Effect", "Temp_Effect", "RE_Effect"]]
-             .groupby(["label", "GCM"]).mean().groupby("label").mean())
+    # Inverse-W2-weighted mean effect per region (polygon weights)
+    stats = w2_weighted_mean(df_db, ["Combined_Effect", "Temp_Effect", "RE_Effect"],
+                             by="label").set_index("label")
     order = stats["Combined_Effect"].sort_values(ascending=False).index.tolist()
     stats = stats.loc[order] if order else stats
     df_long = (df_db[["label", "Temp_Effect", "RE_Effect"]]
@@ -519,7 +627,7 @@ def plot_main_dumbbell_absolute(df_gwl2, shapefile_path, dpi=300, share_re="curr
                color=re_color, label="Supply driver", markersize=5),
         Line2D([0], [0], marker="o", linestyle="None",
                color="black", label="Combined effect", markersize=5),
-    ], title="Multi-model mean effect",
+    ], title="Inverse-Wasserstein-weighted mean effect",
        title_fontproperties={"weight": "bold", "size": 6},
        loc="lower right", fontsize=5)
 

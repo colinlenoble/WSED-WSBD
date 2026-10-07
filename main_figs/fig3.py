@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Figure 3: projected changes in annual SWED severity at 1.5, 2 and 3 degC of
-global warming -- multi-model value-by-alpha maps plus regional violin
-panels -- and the global/per-bin change statistics quoted in the text.
+global warming -- value-by-alpha maps plus regional violin panels -- and
+the global/per-bin change statistics quoted in the text.
+
+The ensemble average weights each realization by 1/n_gcm times the inverse
+of its normalized Wasserstein trend distance to ERA5 (per pixel for maps and
+statistics, per region box for the violins' mean line); --weighting mmm
+restores the flat multi-model mean.
 
 prepare_inputs()/iter_gwl_decomp() and the CLI are reused by
 supp_figs/suppfig4_valuebyalpha_all_gwl.py and
@@ -101,8 +106,7 @@ def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
 def build_parser(description=(
         "Figure 3: projected changes in annual SWED severity (value-by-alpha maps "
         "and regional violins) at each global warming level.")):
-    """CLI shared by fig3.py and supp_figs/suppfig4_*/suppfig5_*, which add
-    their own options on top."""
+    """CLI shared by fig3.py and supp_figs/suppfig4_*/suppfig5_*."""
     parser = argparse.ArgumentParser(
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -177,6 +181,29 @@ def build_parser(description=(
             "out on every gridded map here, independent of the no-wind "
             "quantile mask and of any agreement hatching. If not found, "
             "this overlay is skipped."
+        ),
+    )
+
+    # --- Ensemble weighting ---
+    parser.add_argument(
+        "--weighting",
+        choices=["w2", "mmm"],
+        default="w2",
+        help=(
+            "Ensemble averaging: 'w2' (default) weights each realization by 1/n_gcm "
+            "times the inverse of its normalized Wasserstein trend distance to ERA5 "
+            "at each pixel (see _build_wasserstein_pixel_weight); 'mmm' is the flat "
+            "multi-model mean (1/n_gcm only)."
+        ),
+    )
+    parser.add_argument(
+        "--wasserstein_path",
+        default=config.WASSERSTEIN_NC_PATH,
+        help=(
+            "Path to a pre-computed per-(GCM, run), per-pixel empirical Wasserstein "
+            "trend-distance DataArray (.nc), built by trend_sev_eval_wasserstein.py's "
+            "wasserstein_empirical_grid() (variables w2_distance/w2_normalized, dims "
+            "realization/lat/lon, coords GCM/run). Required with --weighting w2."
         ),
     )
 
@@ -627,6 +654,138 @@ def from_ds_to_plot_decomp(ds_gwl, ds_ref):
 
 
 # =============================================================================
+# Inverse-Wasserstein-distance ensemble weighting
+# =============================================================================
+
+W2_VAR = "w2_normalized"
+W2_EPS = 1e-3
+
+
+def _w2_pair_index(da_proj_freq, ds_wasserstein):
+    """Positional (proj_idx, w2_idx) pairs matching da_proj_freq's realizations
+    to ds_wasserstein's by (GCM, run), plus the unmatched (GCM, run) pairs."""
+    w2_index = {(str(g), str(r)): i for i, (g, r) in
+                enumerate(zip(ds_wasserstein.GCM.values, ds_wasserstein.run.values))}
+    proj_idx, w2_idx, missing = [], [], []
+    for i, (g, r) in enumerate(zip(da_proj_freq.GCM.values, da_proj_freq.run.values)):
+        p = (str(g), str(r))
+        if p in w2_index:
+            proj_idx.append(i)
+            w2_idx.append(w2_index[p])
+        else:
+            missing.append(p)
+    return proj_idx, w2_idx, missing
+
+
+def _build_wasserstein_pixel_weight(da_proj_freq, ds_wasserstein, base_weight,
+                                     var=W2_VAR, eps=W2_EPS):
+    """
+    Combine the usual per-realization 1/n_gcm weight with a per-pixel weight
+    equal to the inverse of that realization's normalized empirical
+    Wasserstein trend distance to ERA5 at that pixel (ds_wasserstein's
+    w2_normalized, from trend_sev_eval_wasserstein.wasserstein_empirical_grid()):
+    a realization whose bootstrap trend distribution is closer to ERA5's at a
+    given location counts for more there, on top of (not instead of) the
+    existing 1/n_gcm de-duplication across multi-run GCMs.
+
+    Matching is by (GCM, run) pair, since ds_wasserstein's realization axis
+    (built from GWL1 files only) does not generally line up positionally with
+    da_proj_freq's own realization axis (built per-GWL in from_ds_to_plot_decomp).
+    Realizations in da_proj_freq with no Wasserstein match get weight 0
+    (excluded) everywhere; eps floors w2_normalized so a near-zero distance
+    cannot make a single realization dominate the pixel mean.
+
+    Returns
+    -------
+    (weight_pix, inv_w2): two xr.DataArrays with dims (realization, lat, lon),
+    positionally aligned with da_proj_freq's realization axis (no
+    'realization' coordinate, matching base_weight's own convention).
+    weight_pix = base_weight * inv_w2 is the ensemble-mean weight; inv_w2
+    alone is what the GCM bootstraps use, since resampling GCMs already
+    provides the 1/n_gcm part. (None, None) if no (GCM, run) pair matches.
+    """
+    proj_idx, w2_idx, missing = _w2_pair_index(da_proj_freq, ds_wasserstein)
+    if missing:
+        print(f"    [warn] no Wasserstein match for {len(missing)} realization(s), "
+              f"excluded from the weighted mean: {missing}")
+    if not proj_idx:
+        return None, None
+
+    w2_sel = ds_wasserstein[var].isel(realization=w2_idx)
+    w2_sel = w2_sel.interp(lat=da_proj_freq.lat, lon=da_proj_freq.lon, method="nearest")
+    inv_matched = np.nan_to_num(1.0 / w2_sel.clip(min=eps).values, nan=0.0)
+
+    shape = (da_proj_freq.sizes["realization"],) + inv_matched.shape[1:]
+    inv_full = np.zeros(shape, dtype=float)
+    inv_full[proj_idx] = inv_matched
+    weight_full = inv_full * np.asarray(base_weight.values)[:, None, None]
+
+    def _da(arr):
+        return xr.DataArray(arr, dims=("realization", "lat", "lon"),
+                            coords={"lat": da_proj_freq.lat, "lon": da_proj_freq.lon})
+    return _da(weight_full), _da(inv_full)
+
+
+def load_wasserstein(args):
+    """Open args.wasserstein_path when args.weighting == 'w2' (None for 'mmm').
+    Missing file is a hard error: the figures never silently fall back to
+    the multi-model mean."""
+    if args.weighting != "w2":
+        return None
+    if not os.path.exists(args.wasserstein_path):
+        raise SystemExit(f"Wasserstein file not found: {args.wasserstein_path} -- run "
+                         "main_pipeline/trend_sev_eval_wasserstein.py first, or pass "
+                         "--weighting mmm.")
+    print(f"Loading Wasserstein distance dataset from {args.wasserstein_path} ...")
+    return xr.open_dataset(args.wasserstein_path)
+
+
+def ensemble_weight(da_proj_freq, base_weight, inputs):
+    """
+    Ensemble weight for one GWL's aligned fields: (weight_pix, inv_w2) from
+    _build_wasserstein_pixel_weight under inverse-W2 weighting, or
+    (base_weight, None) for the flat multi-model mean (inputs.ds_wasserstein
+    is None).
+    """
+    if inputs.ds_wasserstein is None:
+        return base_weight, None
+    weight_pix, inv_w2 = _build_wasserstein_pixel_weight(
+        da_proj_freq, inputs.ds_wasserstein, base_weight)
+    if weight_pix is None:
+        raise ValueError("No (GCM, run) overlap between the projection ensemble "
+                         "and the Wasserstein dataset.")
+    return weight_pix, inv_w2
+
+
+def region_mean_w2(ds_wasserstein, region_mask, var=W2_VAR):
+    """
+    cos(latitude)-weighted mean of w2_normalized over the True pixels of
+    region_mask (a boolean (lat, lon) DataArray), per realization of
+    ds_wasserstein. Returns a pd.Series indexed by (GCM, run) -- the
+    region-level distance whose inverse (times 1/n_gcm) weights that
+    realization's region-mean value.
+    """
+    region_mask = region_mask.reset_coords(drop=True)   # keep only lat/lon
+    w2 = ds_wasserstein[var].interp(lat=region_mask.lat, lon=region_mask.lon,
+                                    method="nearest")
+    w2 = w2.where(region_mask)
+    lat_w = np.cos(np.deg2rad(w2.lat))
+    mean = w2.weighted(lat_w.fillna(0)).mean(dim=("lat", "lon"), skipna=True).values
+    idx = pd.MultiIndex.from_arrays(
+        [np.asarray(ds_wasserstein.GCM.values).astype(str),
+         np.asarray(ds_wasserstein.run.values).astype(str)], names=["GCM", "run"])
+    return pd.Series(mean, index=idx, name="w2_mean")
+
+
+def _weighted_nanmean(x, w):
+    """Mean of x over axis 0, weighted by w (same shape), ignoring NaNs in x."""
+    w = np.where(np.isfinite(x), w, 0.0)
+    wsum = w.sum(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(wsum > 0, np.nansum(x * w, axis=0) / wsum, np.nan)
+
+
+# =============================================================================
 # Regional DataFrame
 # =============================================================================
 
@@ -638,19 +797,22 @@ def _robust_slice(da, lat_lo, lat_hi, lon_lo, lon_hi):
     return da.sel(lat=lat_slice, lon=lon_slice)
 
 
+REGIONS_DF = [
+    {"name": "Western U.S.",    "lat": [35,  50],  "lon": [-125, -105]},
+    {"name": "Southern Europe", "lat": [35,  50],  "lon": [5,   25]},
+    {"name": "South Africa",    "lat": [-35, -22], "lon": [16,     33]},
+    {"name": "Kenya",           "lat": [-5,   5],  "lon": [33,     42]},
+    {"name": "India",           "lat": [10,  30],  "lon": [70,     90]},
+]
+
+
 def create_dataframe_regional(built_datasets, mask, regions=None):
     """
     For each already-built (in-memory) GWL dataset and each region, extract
     the spatial mean of frequency, intensity and duration per realization.
     """
     if regions is None:
-        regions = [
-            {"name": "Western U.S.",    "lat": [35,  50],  "lon": [-125, -105]},
-            {"name": "Southern Europe", "lat": [35,  50],  "lon": [5,   25]},
-            {"name": "South Africa",    "lat": [-35, -22], "lon": [16,     33]},
-            {"name": "Kenya",           "lat": [-5,   5],  "lon": [33,     42]},
-            {"name": "India",           "lat": [10,  30],  "lon": [70,     90]},
-        ]
+        regions = REGIONS_DF
 
     rows = []
     for gwl_label, base_ds in built_datasets.items():
@@ -658,7 +820,7 @@ def create_dataframe_regional(built_datasets, mask, regions=None):
 
         # Subsetting first gives us an independent Dataset, so masking below
         # does not mutate the shared dataset the main plotting loop reuses.
-        ds = base_ds[["frequency", "intensity", "duration", "GCM"]]
+        ds = base_ds[["frequency", "intensity", "duration", "GCM", "run"]]
         ds["frequency"] = ds["frequency"].where(mask == 1)
         ds["intensity"] = ds["intensity"].where(mask == 1)
         ds["duration"]  = ds["duration"].where(mask == 1)
@@ -666,6 +828,7 @@ def create_dataframe_regional(built_datasets, mask, regions=None):
             ds = ds.mean(dim="year")
 
         gcms = ds.GCM.values
+        runs = ds.run.values
 
         for reg in regions:
             lat_lo, lat_hi = reg["lat"]
@@ -685,6 +848,7 @@ def create_dataframe_regional(built_datasets, mask, regions=None):
                     "region":      reg["name"],
                     "realization": ridx,
                     "GCM":         gcms[ridx],
+                    "run":         runs[ridx],
                     "frequency":   float(freq_mean[ridx]),
                     "intensity":   float(int_mean[ridx]),
                     "duration":    float(dur_mean[ridx]),
@@ -693,8 +857,36 @@ def create_dataframe_regional(built_datasets, mask, regions=None):
     return pd.DataFrame(rows)
 
 
-def add_severity_and_weights(df):
-    """Add 'severity' column (frequency x intensity x duration) and inverse-frequency GCM 'weight' column."""
+def region_w2_table(ds_wasserstein, mask, regions=None):
+    """
+    Long (region, GCM, run, w2_mean) table: each region box's
+    cos(latitude)-weighted mean normalized Wasserstein distance over its
+    land pixels (region_mean_w2), per realization of ds_wasserstein.
+    """
+    if regions is None:
+        regions = REGIONS_DF
+    land = mask.astype(bool)
+    rows = []
+    for reg in regions:
+        lat_lo, lat_hi = reg["lat"]
+        lon_lo, lon_hi = reg["lon"]
+        in_box = ((land.lat >= lat_lo) & (land.lat <= lat_hi) &
+                  (land.lon >= lon_lo) & (land.lon <= lon_hi))
+        s = region_mean_w2(ds_wasserstein, land & in_box).reset_index()
+        s["region"] = reg["name"]
+        rows.append(s)
+    return pd.concat(rows, ignore_index=True)
+
+
+def add_severity_and_weights(df, region_w2=None, eps=W2_EPS):
+    """
+    Add 'severity' column (frequency x intensity x duration) and the
+    per-realization 'weight' column: the inverse-frequency GCM weight
+    (1/n_gcm, split across a GCM's runs), times -- when region_w2 (from
+    region_w2_table) is given -- the inverse of that realization's mean
+    normalized Wasserstein distance over the region. Realizations with no
+    Wasserstein match get a NaN weight (excluded from the weighted mean).
+    """
     df = df.copy()
     df["severity"] = df["frequency"] * df["intensity"] * df["duration"]
 
@@ -703,6 +895,12 @@ def add_severity_and_weights(df):
     wcount  = anchor["GCM"].value_counts()
     weight_dict = {gcm: 1.0 / wcount[gcm] / wcount.size for gcm in wcount.index}
     df["weight"] = df["GCM"].map(weight_dict)
+
+    if region_w2 is not None:
+        df["GCM"] = df["GCM"].astype(str)
+        df["run"] = df["run"].astype(str)
+        df = df.merge(region_w2, on=["region", "GCM", "run"], how="left")
+        df["weight"] = df["weight"] / df["w2_mean"].clip(lower=eps)
 
     return df
 
@@ -831,7 +1029,8 @@ def plot_gwl_valuebyalpha_discrete(
     grey_drawn = draw_wcf_zero_overlay(ax_map, wcf_zero_mask, land_shp, da_mask.lat, da_mask.lon,
                                        nan_data=da_mask.isnull().values)
     add_exclusion_legend(ax_map, show_discrepancy=hatchings is not None,
-                         show_wcf_zero=grey_drawn)
+                         show_wcf_zero=grey_drawn,
+                         wcf_zero_label="Excluded: no wind capacity")
 
     if map_title is None:
         map_title = f"Projected change in annual severity under {gwl_label} warming"
@@ -938,13 +1137,10 @@ def plot_gwl_valuebyalpha_discrete(
 
         # Weighted mean: solid red horizontal line
         for i, gwl_grp in enumerate(gwl_order):
-            sub = df_reg[df_reg["GWL"] == gwl_grp]["severity"].dropna().values
-            w   = df_reg[df_reg["GWL"] == gwl_grp]["weight"].dropna().values
-            if sub.size > 0:
-                try:
-                    wm = np.average(sub, weights=w)
-                except Exception:
-                    wm = np.nanmean(sub)
+            grp = df_reg[df_reg["GWL"] == gwl_grp][["severity", "weight"]].dropna()
+            grp = grp[grp["weight"] > 0]
+            if len(grp) > 0:
+                wm = np.average(grp["severity"].values, weights=grp["weight"].values)
                 ax_ts.plot(
                     [i + 1 - 0.18, i + 1 + 0.18], [wm, wm],
                     color="#c0392b", linewidth=1.2, solid_capstyle="round",
@@ -1084,6 +1280,7 @@ def compute_global_change_stats_gwl(
     lat_max=68,
     n_bootstrap=1000,
     block_size=10,
+    inv_w2=None,
 ):
     """
     Compute the global area-weighted mean relative change in the compound index
@@ -1094,7 +1291,13 @@ def compute_global_change_stats_gwl(
     da_ref_*  / da_proj_* : xr.DataArray
         Frequency, intensity, duration for baseline and projection (realization, lat, lon).
     weight : xr.DataArray
-        Per-realization GCM weights (dim realization).
+        Ensemble weights: per-realization GCM weights (dim realization), or
+        per-pixel inverse-W2 weights (realization, lat, lon) from
+        ensemble_weight().
+    inv_w2 : xr.DataArray or None
+        Per-pixel inverse-W2 weight alone (realization, lat, lon), used to
+        weight the realizations drawn in each GCM-bootstrap sample (GCM
+        resampling already supplies the 1/n_gcm part). None: plain mean.
     mask : array-like
         Land mask (1 = valid).
     lat_min / lat_max : float
@@ -1164,6 +1367,8 @@ def compute_global_change_stats_gwl(
     proj_per_real = _crop(da_proj_freq * da_proj_int * da_proj_dur).where(mask == 1)
     base_np  = base_per_real.values                # (n_real, nlat, nlon)
     proj_np  = proj_per_real.values
+    inv_np   = (_crop(inv_w2).values if inv_w2 is not None
+                else np.ones_like(base_np))
     lats_gcm = base_per_real.lat.values
     w2d_gcm  = np.outer(np.cos(np.deg2rad(lats_gcm)), np.ones(base_np.shape[2]))
 
@@ -1172,8 +1377,8 @@ def compute_global_change_stats_gwl(
     for _ in range(n_bootstrap):
         sel_gcms = rng_gcm.choice(unique_gcms, size=n_gcms, replace=True)
         idx      = np.array([rng_gcm.choice(gcm_to_idx[g]) for g in sel_gcms])
-        b_base   = np.nanmean(base_np[idx], axis=0)
-        b_proj   = np.nanmean(proj_np[idx], axis=0)
+        b_base   = _weighted_nanmean(base_np[idx], inv_np[idx])
+        b_proj   = _weighted_nanmean(proj_np[idx], inv_np[idx])
         early_b  = np.nansum(b_base * w2d_gcm) / np.nansum(np.where(np.isfinite(b_base), w2d_gcm, 0.0))
         late_b   = np.nansum(b_proj * w2d_gcm) / np.nansum(np.where(np.isfinite(b_proj), w2d_gcm, 0.0))
         gcm_boot_means.append(100.0 * (late_b - early_b) / early_b)
@@ -1196,6 +1401,7 @@ def compute_bin_change_stats_gwl(
     n_bootstrap=1000,
     block_size=10,
     reference_data=None,
+    inv_w2=None,
 ):
     """
     For each discrete colour bin of the value-by-alpha map, compute the
@@ -1207,6 +1413,8 @@ def compute_bin_change_stats_gwl(
 
     Parameters
     ----------
+    inv_w2 : xr.DataArray or None
+        See compute_global_change_stats_gwl.
     reference_data : 2-D numpy array or None
         If provided (e.g., GWL1.5 rel_change from _compute_ensemble_rel_change),
         bin *membership* is determined from this reference field while the
@@ -1258,6 +1466,8 @@ def compute_bin_change_stats_gwl(
     proj_per_real = _crop(da_proj_freq * da_proj_int * da_proj_dur).where(mask == 1)
     base_np   = base_per_real.values   # (n_real, nlat, nlon)
     proj_np   = proj_per_real.values
+    inv_np    = (_crop(inv_w2).values if inv_w2 is not None
+                 else np.ones_like(base_np))
     rng_gcm   = np.random.default_rng()
 
     n_bins = len(change_edges) - 1
@@ -1327,8 +1537,8 @@ def compute_bin_change_stats_gwl(
         for _ in range(n_bootstrap):
             sel_gcms = rng_gcm.choice(unique_gcms, size=n_gcms, replace=True)
             idx      = np.array([rng_gcm.choice(gcm_to_idx[g]) for g in sel_gcms])
-            b_base   = np.nanmean(base_np[idx], axis=0)   # (nlat, nlon)
-            b_proj   = np.nanmean(proj_np[idx], axis=0)
+            b_base   = _weighted_nanmean(base_np[idx], inv_np[idx])   # (nlat, nlon)
+            b_proj   = _weighted_nanmean(proj_np[idx], inv_np[idx])
             with np.errstate(divide="ignore", invalid="ignore"):
                 rc_b = 100.0 * (b_proj - b_base) / b_base
             pix_vals = rc_b[bin_pix]
@@ -1371,6 +1581,9 @@ def prepare_inputs(args, with_regions=True):
     for lv in args.gwl_levels:
         if lv not in LEVEL_TO_KEY:
             raise ValueError(f"Unknown GWL level '{lv}'. Valid: {list(LEVEL_TO_KEY.keys())}.")
+    # Checked first, so a missing Wasserstein file fails before the
+    # (long) dataset build rather than after it.
+    ds_wasserstein = load_wasserstein(args)
 
     # ------------------------------------------------------------------
     # STEP 0 - Build all aggregated gridded datasets, in memory
@@ -1428,14 +1641,21 @@ def prepare_inputs(args, with_regions=True):
         if os.path.exists(regional_csv_path):
             print(f"Found existing regional DataFrame at {regional_csv_path}, loading it.")
             df_regions = pd.read_csv(regional_csv_path)
-        else:
+            if "run" not in df_regions.columns:
+                # Older cache without the run column needed to match
+                # realizations to the Wasserstein file -- rebuild it.
+                print("  Cached regional DataFrame has no 'run' column, recomputing.")
+                df_regions = None
+        if df_regions is None:
             print(f"No regional DataFrame found at {regional_csv_path}, computing...")
             df_regions = create_dataframe_regional(built, mask)
             os.makedirs(os.path.dirname(regional_csv_path), exist_ok=True)
             df_regions.to_csv(regional_csv_path, index=False)
             print(f"  Saved -> {regional_csv_path}")
 
-        df_regions = add_severity_and_weights(df_regions)
+        region_w2 = (region_w2_table(ds_wasserstein, mask)
+                     if ds_wasserstein is not None else None)
+        df_regions = add_severity_and_weights(df_regions, region_w2=region_w2)
 
     # ------------------------------------------------------------------
     # STEP 3 - Optional agreement hatching
@@ -1451,7 +1671,7 @@ def prepare_inputs(args, with_regions=True):
 
     return SimpleNamespace(built=built, ds_baseline=ds_baseline, mask=mask,
                            wcf_zero_mask=wcf_zero_mask, df_regions=df_regions,
-                           hatchings=hatchings)
+                           hatchings=hatchings, ds_wasserstein=ds_wasserstein)
 
 
 def iter_gwl_decomp(args, inputs):
@@ -1482,7 +1702,9 @@ def main():
     gwl15_rel_change_data = None
     for level, gwl_key, gwl_label, fields in iter_gwl_decomp(args, inputs):
         (da_ref_freq, da_ref_int, da_ref_dur,
-         da_proj_freq, da_proj_int, da_proj_dur, weight) = fields
+         da_proj_freq, da_proj_int, da_proj_dur, base_weight) = fields
+        # Inverse-W2 pixel weights (or the flat 1/n_gcm with --weighting mmm)
+        weight, inv_w2 = ensemble_weight(da_proj_freq, base_weight, inputs)
 
         # Freeze colour-bin membership at GWL1.5 so higher GWLs report stats
         # for the same spatial zones that were red/orange/gray/etc. at 1.5°C.
@@ -1498,7 +1720,7 @@ def main():
             da_ref_freq, da_ref_int, da_ref_dur,
             da_proj_freq, da_proj_int, da_proj_dur,
             weight=weight, mask=mask,
-            lat_min=-60, lat_max=68,
+            lat_min=-60, lat_max=68, inv_w2=inv_w2,
         )
         print(
             f"  Global mean change under {gwl_label}: {global_chg:+.2f}% "
@@ -1511,7 +1733,7 @@ def main():
             da_proj_freq, da_proj_int, da_proj_dur,
             weight=weight, mask=mask,
             lat_min=-60, lat_max=68,
-            reference_data=gwl15_rel_change_data,
+            reference_data=gwl15_rel_change_data, inv_w2=inv_w2,
         )
         print(f"  Per-bin statistics under {gwl_label}:")
         for s in bin_stats:
@@ -1546,9 +1768,11 @@ def main():
         print(f"  Saved -> {out_path}")
 
         del fields, da_ref_freq, da_ref_int, da_ref_dur
-        del da_proj_freq, da_proj_int, da_proj_dur, weight, fig
+        del da_proj_freq, da_proj_int, da_proj_dur, weight, base_weight, inv_w2, fig
         gc.collect()
 
+    if inputs.ds_wasserstein is not None:
+        inputs.ds_wasserstein.close()
     print("\nDone.")
 
 

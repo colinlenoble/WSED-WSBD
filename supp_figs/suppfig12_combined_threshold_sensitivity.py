@@ -87,7 +87,7 @@ def rl_threshold_csv(rl_path, rl_thr):
 
 def _load_wsbd_gwl2(csv_path):
     """
-    GWL2 multi-model-mean SWBD change vs GWL0.61, in days of baseline demand
+    GWL2 inverse-W2-weighted mean SWBD change vs GWL0.61, in days of baseline demand
     -- delegates to main_figs/fig45.py's own loader (load_gwl_dfs, which also drops
     EXCLUDED_RUNS) and metric (_mmm_absolute_days) so these panels match
     fig45's Fig. 4 (fig4_main_gwl_maps_absolute_days) exactly. Returns poly_idx /

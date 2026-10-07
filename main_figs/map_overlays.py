@@ -185,14 +185,16 @@ def wcf_zero_legend_handle(label="Excluded: no wind capacity (wcf = 0)"):
 
 
 def add_exclusion_legend(ax, show_discrepancy=True, show_wcf_zero=True,
-                         discrepancy_style="dots", **kwargs):
+                         discrepancy_style="dots", wcf_zero_label=None, **kwargs):
     """
     Legend for the two exclusion layers, lower right of a map axes.
     discrepancy_style: "dots" (gridded maps) or "mask" (aggregated maps).
+    wcf_zero_label overrides wcf_zero_legend_handle's default label.
     """
     handles = []
     if show_wcf_zero:
-        handles.append(wcf_zero_legend_handle())
+        handles.append(wcf_zero_legend_handle() if wcf_zero_label is None
+                       else wcf_zero_legend_handle(wcf_zero_label))
     if show_discrepancy:
         handles.append(discrepancy_mask_legend_handle() if discrepancy_style == "mask"
                        else discrepancy_legend_handle())

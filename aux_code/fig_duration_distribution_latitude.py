@@ -757,7 +757,74 @@ def _group_percentile_full(counts_df, gwl, zone, pct):
     return _weighted_percentile(durations, weight_sum, pct)
 
 
-def _group_counts(counts_df, gwl, zone, x_int):
+def zone_inv_w2(ds_wasserstein, shapefile_path, var="w2_normalized", eps=1e-3):
+    """
+    {zone: {(GCM, run): 1 / max(mean_w2, eps)}}: per latitude zone, the
+    inverse of each realization's cos(latitude)-weighted mean normalized
+    Wasserstein trend distance to ERA5 (trend_sev_eval_wasserstein.py's
+    per-pixel w2_normalized) over the zone's land pixels (shapefile mask, as
+    in compute_land_area_share_per_zone). Passed as _group_counts's inv_w2
+    to replace equal-GCM weighting with inverse-Wasserstein weighting.
+    """
+    ds_wasserstein = ds_wasserstein.sortby("lat")   # build_land_mask_from_grid assumes ascending lat
+    lat = ds_wasserstein.lat.values
+    lon = ds_wasserstein.lon.values
+    land = build_land_mask_from_grid(lat, lon, shapefile_path)
+    in_band = (lat >= LAT_ZONE_EDGES[0]) & (lat <= LAT_ZONE_EDGES[-1])
+    zone_of_row = assign_lat_zone(lat)
+    w2 = ds_wasserstein[var].values                       # (realization, lat, lon)
+    gcms = np.asarray(ds_wasserstein.GCM.values).astype(str)
+    runs = np.asarray(ds_wasserstein.run.values).astype(str)
+
+    out = {}
+    for zlabel in LAT_ZONE_LABELS:
+        sel = land & (in_band & (zone_of_row == zlabel))[:, None]
+        area_w = np.where(sel, np.cos(np.deg2rad(lat))[:, None], 0.0)
+        out[zlabel] = {}
+        for i, key in enumerate(zip(gcms, runs)):
+            ok = np.isfinite(w2[i]) & (area_w > 0)
+            if not ok.any():
+                continue
+            mean_w2 = float((w2[i][ok] * area_w[ok]).sum() / area_w[ok].sum())
+            out[zlabel][key] = 1.0 / max(mean_w2, eps)
+    return out
+
+
+def _group_counts_weighted(sub, x_int, inv_w2):
+    """
+    Inverse-Wasserstein twin of _group_counts's pooling, on one (gwl, zone)
+    subset: each (GCM, run) realization's own normalized duration share,
+    averaged with weight 1/n_runs(GCM)/n_GCM (the usual de-duplication)
+    times inv_w2[(GCM, run)]. Realizations missing from inv_w2 are excluded.
+    Returns (arr_share, arr_count, mean_dur, weighted_total) or None.
+    """
+    reals = []
+    for (gcm, run), rsub in sub.groupby(["GCM", "run"]):
+        w = inv_w2.get((str(gcm), str(run)), 0.0)
+        s = rsub.groupby("duration")["count"].sum()
+        total_r = float(s.sum())
+        if w > 0 and total_r > 0:
+            reals.append((str(gcm), w, s, total_r))
+    if not reals:
+        return None
+    runs_per_gcm = pd.Series([g for g, *_ in reals]).value_counts()
+    n_gcm = runs_per_gcm.size
+
+    arr_share = np.zeros(len(x_int))
+    arr_count = np.zeros(len(x_int))
+    wsum = mean_dur = weighted_total = 0.0
+    for gcm, w_inv, s, total_r in reals:
+        w = w_inv / runs_per_gcm[gcm] / n_gcm
+        vals = np.array([s.get(d, 0.0) for d in x_int], dtype=float)
+        arr_share += w * vals / total_r
+        arr_count += w * vals
+        mean_dur += w * float((s.index.to_numpy() * s.to_numpy()).sum() / total_r)
+        weighted_total += w * total_r
+        wsum += w
+    return arr_share / wsum, arr_count / wsum, mean_dur / wsum, weighted_total / wsum
+
+
+def _group_counts(counts_df, gwl, zone, x_int, inv_w2=None):
     """
     Pooled (arr_share, arr_count, mean_duration, weighted_total, raw_total)
     for one (gwl, zone), with equal GCM weighting (1 / n_GCM each,
@@ -794,11 +861,19 @@ def _group_counts(counts_df, gwl, zone, x_int):
     per GCM" scale) covers every duration on record, not just those within
     x_int. `raw_total` is the true pooled event count, kept separately only
     to gate min_events on actual sample size rather than a reweighted scale.
+
+    inv_w2: optional {(GCM, run): weight} for this zone (see zone_inv_w2).
+    When given, the pooling is the inverse-Wasserstein-weighted mean of each
+    realization's own share instead (_group_counts_weighted).
     """
     sub = counts_df[(counts_df["gwl"] == gwl) & (counts_df["zone"] == zone)]
     if sub.empty:
         return None
     raw_total = float(sub["count"].sum())
+
+    if inv_w2 is not None:
+        pooled = _group_counts_weighted(sub, x_int, inv_w2)
+        return None if pooled is None else (*pooled, raw_total)
 
     gcm_series, gcm_totals, gcm_mean_durs = [], [], []
     for gcm, gsub in sub.groupby("GCM"):
