@@ -1,20 +1,40 @@
-"""Paths and run parameters for the Compound_ER pipeline (calculate_cf.py,
-make_grid_files.py, make_agg_files.py, fig1.py, fig2.py, fig3.py, fig45.py,
-fig_persistent.py).
+"""Paths and run parameters for the Compound_ER pipeline.
 
-Every other script in this folder imports this module and reads its values
-instead of hard-coding machine-specific paths -- edit the values below once
-and every script picks them up. Values below are the paths that used to be
-hard-coded separately in each script (JUICCE HPC cluster); update them if
-you move to a different machine.
+Code layout (every script imports this module, which lives at the repo root):
+    main_pipeline/  data production (calculate_cf.py, make_grid_files.py,
+                    make_agg_files.py, make_rl_files.py, trend_sev_eval*.py, ...)
+    main_figs/      main-text figures (fig1.py, fig2_*.ipynb, fig3.py, fig45.py)
+    supp_figs/      Extended Data figures/tables, named after their number in
+                    latex/dunkelflaute_review_annotated.tex (suppfigN_*, supptabN_*)
+    aux_code/       preprocessing helpers, exploratory figures and diagnostics
+
+Importing this module puts the repo root and those four folders on sys.path,
+so scripts keep importing each other by bare module name (``from fig45 import
+...``). A script run directly only needs, before its first local import::
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import config
+
+Every script reads its values here instead of hard-coding machine-specific
+paths -- edit the values below once and every script picks them up. Values
+below are the paths that used to be hard-coded separately in each script
+(JUICCE HPC cluster); update them if you move to a different machine.
 """
+import os as _os
+import sys as _sys
+
+CODE_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+CODE_DIRS = ("main_pipeline", "main_figs", "supp_figs", "aux_code")
+for _d in (CODE_ROOT,) + tuple(_os.path.join(CODE_ROOT, d) for d in CODE_DIRS):
+    if _d not in _sys.path:
+        _sys.path.insert(1, _d)
 
 # -------------------------
 # Environment variables (HPC-specific; read before heavy imports use them)
 # -------------------------
 # Two conda envs were used across scripts ("xenv" for calculate_cf.py,
 # fig1.py, fig45.py, make_agg_files.py, make_grid_files.py; "xclim" for
-# fig2.py and fig3.py), each with its own esmf.mk / cartopy cache.
+# fig3.py and its ED 4/5 scripts), each with its own esmf.mk / cartopy cache.
 ESMFMKFILE_XENV = "/gpfs/workdir/shared/juicce/envs/xenv/lib/esmf.mk"
 ESMFMKFILE_XCLIM = "/gpfs/workdir/shared/juicce/envs/xclim/lib/esmf.mk"
 CARTOPY_DATA_DIR_XENV = "/gpfs/workdir/shared/juicce/envs/xenv/cartopy_cache"
@@ -34,7 +54,7 @@ TEMP_FOLDER = "/gpfs/workdir/shared/juicce/RE_Colin/temp/"
 # outputs (see that module for the exact overlap test). AGREEMENT_NC_PATH is the
 # per-pixel (lat, lon) mask; AGREEMENT_AGGREGATED_NC_PATH is the polygon-native
 # twin built from wcf_agg_*/scf_agg_* (one value per poly_idx, same shapefile as
-# AGREEMENT_SUFFIX_SHP/fig45.py's RL pipeline) -- fig45.py prefers this one over
+# AGREEMENT_SUFFIX_SHP/make_rl_files.py's RL pipeline) -- fig45.py prefers this one over
 # re-aggregating the pixel mask onto polygons on the fly.
 AGREEMENT_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/trend_agreement_mask_ERA5.nc"
 AGREEMENT_AGGREGATED_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/trend_agreement_mask_aggregated_ERA5_v1.nc"
@@ -43,25 +63,30 @@ AGREEMENT_SUFFIX_SHP = "v1"  # shapefile-version suffix on wcf_agg_*/scf_agg_* f
 # Per-(GCM, run), per-pixel empirical Wasserstein trend-distance file, built by
 # trend_sev_eval_wasserstein.py's wasserstein_empirical_grid(). dims (realization,
 # lat, lon); variables w2_distance (raw) and w2_normalized (w2_distance / ERA5's own
-# native-grid bootstrap trend std); coords GCM, run. Used by fig3.py to build the
-# suppfig_projected_change_valuebyalpha_GWLxx_wasserstein figures.
+# native-grid bootstrap trend std); coords GCM, run. Used by fig3.py's helpers to build
+# Extended Data Fig. 5 (supp_figs/suppfig5_projected_change_wasserstein.py).
 WASSERSTEIN_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/agg_wasserstein_empirical_GCMs_all_year_ERA5.nc"
 # Aggregated-domain (per-polygon) twin of WASSERSTEIN_NC_PATH, built by
 # trend_sev_eval_wasserstein.py's wasserstein_empirical_agg() from wcf_agg_*/
 # scf_agg_* (one series per poly_idx, same AGREEMENT_SUFFIX_SHP shapefile as
-# AGREEMENT_AGGREGATED_NC_PATH/fig45.py's RL pipeline) instead of the full
+# AGREEMENT_AGGREGATED_NC_PATH/make_rl_files.py's RL pipeline) instead of the full
 # (lat, lon) grid. dims (realization, poly_idx); same w2_distance/w2_normalized
 # variables and GCM/run coords as WASSERSTEIN_NC_PATH.
 WASSERSTEIN_AGGREGATED_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/agg_wasserstein_empirical_GCMs_aggregated_ERA5_v1.nc"
 SHARE_RENEWABLE_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/share_renewable.csv"
 POP_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ppp_2020_1km_Aggregated.tif"
 # Observed generation used to validate the regional reanalysis capacity factors
-# (validation/validate_cf_observations.py): Renewables.ninja v1.1 national
+# (supp_figs/supptab4_cf_validation.py): Renewables.ninja v1.1 national
 # hourly capacity factors, and one ENTSO-E "Actual Generation per Production
 # Type" .xlsx export per country and year.
 NINJA_WIND_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ninja_europe_wind_v1.1/ninja_wind_europe_v1.1_current_national.csv"
 NINJA_PV_CSV = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ninja_europe_pv_v1.1/ninja_pv_europe_v1.1_merra2.csv"
 ENTSOE_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/socioeconomic_data/ENTSO-E/"
+# Residual-load (SWBD) CSVs written by main_pipeline/make_rl_files.py and read
+# by main_figs/fig45.py, main_figs/fig1.py and several supp_figs scripts.
+RL_OUT_DIR = PATH_PREPROCESSED + "agg_datasets/rl_out/"
+# Bias-adjustment skill scores appended by calculate_cf.py (Extended Data Table 1).
+VALIDATION_DIR = _os.path.join(CODE_ROOT, "validation")
 SUMMARY_FIGS_DIR ="/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures/"
 
 # Glob pattern for the reanalysis daily 10 m/100 m wind files (u10/v10/u100/v100,
@@ -72,14 +97,14 @@ SUMMARY_FIGS_DIR ="/gpfs/workdir/shared/juicce/RE_Colin/figures/summary_figures/
 ERA5_WIND_PATTERN = '/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_raw/ERA5/ERA5_daily_*.zarr'
 
 # Regridded ERA5 archive (W5E5 0.5 deg grid, Zarr format 2; u10/v10/u100/
-# v100/t2m/ssrd -- see regrid_era5_to_w5e5.py + convert_regrid_to_zarr2.py).
-# Used by compare_wind_methods.py to compare the three DS_CFConfig.wind_method
+# v100/t2m/ssrd -- see aux_code/regrid_era5_to_w5e5.py + aux_code/convert_regrid_to_zarr2.py).
+# Used by supp_figs/supptab3_wind_extrapolation_sensitivity.py to compare the three DS_CFConfig.wind_method
 # options (needs u100/v100 for the 'wind100' method).
 ERA5_REGRID_ZARR2_DIR = '/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_raw/ERA5/'
 
 # Folder holding one precomputed local shear exponent file per target GCM,
 # already regridded to that GCM's own native grid: shear_by_gcm/shear_exponent_{GCM}_{start}_{end}.nc
-# (see shear_by_gcm/compute_shear_by_gcm.py). Used by calculate_ds_cf_GCM and
+# (see main_pipeline/compute_shear_by_gcm.py). Used by calculate_ds_cf_GCM and
 # calculate_ds_cf_reanalysis_grid_GCM in place of get_local_shear_exponent +
 # regrid_alpha_to_grid, since alpha is already on the right grid for these 14
 # GCMs -- no interpolation needed. Windows path below is where these were
@@ -91,7 +116,7 @@ SHEAR_BY_GCM_DIR = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_ra
 # -------------------------
 SSP = 'ssp245'
 GWL_LIST = ['GWL0-61', 'GWL1', 'GWL1-5', 'GWL2', 'GWL3']
-GWL_LEVELS = ['1.5', '2.0', '3.0']  # projection-only subset (no GWL0-61/GWL1) used by fig2.py/fig3.py
+GWL_LEVELS = ['1.5', '2.0', '3.0']  # projection-only subset (no GWL0-61/GWL1) used by fig3.py and supp_figs/suppfig4/5
 REANALYSIS = 'ERA5'
 SHEAR_REF_PERIOD = ('1982-01-01', '2001-12-31')  # local wind shear exponent fit period
 EXCLUDE_GCM_RUN = ['EC-Earth3-Veg-LR:r3i1p1f1', 'NorESM2-MM:r2i1p1f1']  # GCM:run pairs excluded from ensemble figures

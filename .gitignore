@@ -1,5 +1,5 @@
 test_data/
 __pycache__/
 test.ipynb
-diagnostics/
+aux_code/diagnostics/
 latex/

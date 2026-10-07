@@ -1,0 +1,620 @@
+# -*- coding: utf-8 -*-
+"""
+Extended Data Fig. 7: model agreement on projected SWED severity changes
+(panels a-b) and variability decomposition of the projections (panels c-d).
+
+  a - agreement across simulations on significant severity changes at GWL 2°C
+  b - same at GWL 3°C
+  c - total projection spread of SWED severity under 2°C warming
+  d - fraction of that spread explained by internal variability
+
+Terminology: frequency (events/year), duration (days/event) and intensity
+(mean deficit on event days) are the three SWED components; severity is
+their product, frequency x duration x intensity. make_agg_files.py calls
+intensity "severity"; it is renamed on load.
+
+The yearly indicators come from make_agg_files.load_agg_data_compound(),
+which reads every per-GCM wcf_agg_*/scf_agg_* aggregate under
+--preprocessed_path. The result is cached in
+<preprocessed_path>/agg_datasets/compound_years_agg_freq_sev_dur.nc and
+reused on later runs (--rebuild forces a recompute). Significance of the severity change (each GWL vs GWL0-61,
+per GCM/run) is then computed on that rebuilt dataset with a paired
+permutation test + Benjamini-Hochberg FDR.
+
+Panels c-d (variance decomposition) are also rebuilt from scratch, from the
+same wcf_agg_*/scf_agg_* files resampled monthly instead of yearly
+(load_agg_data_compound(..., freq='month'), cached in
+agg_datasets/compound_monthly_agg_freq_sev_dur.nc) at --variability_gwl, then run
+through custom_regional_analysis() -- a port of cell 2 of
+como24_group5/code_final/3.2 Variability decomposition.ipynb (that cell is
+missing its two `for` loops as saved in the notebook; restored here).
+
+Both panel pairs are drawn on config.SHAPEFILE_PATH (shp_re): the _v1
+aggregates are built by calculate_cf.py on that shapefile, so their poly_idx
+is its row index.
+
+Port of cell 26 of como24_group5/code_final/3.1.3 disagreements.ipynb.
+"""
+import os
+import sys
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
+os.environ["ESMFMKFILE"] = config.ESMFMKFILE_XENV
+
+import argparse
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import geopandas as gpd
+import cartopy.crs as ccrs
+import inspect
+from scipy.stats import permutation_test
+
+# scipy renamed permutation_test's RNG-seed parameter from 'random_state' to
+# 'rng' in 1.15; detect once so this runs on either an older HPC scipy
+# (random_state) or a newer one (rng) without an explicit version check.
+_PERMUTATION_TEST_RNG_KW = (
+    "rng" if "rng" in inspect.signature(permutation_test).parameters else "random_state"
+)
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.colors import ListedColormap, BoundaryNorm, LogNorm
+
+from map_overlays import draw_discrepancy_mask_polygons, add_exclusion_legend
+from make_agg_files import load_agg_data_compound
+
+FIG_WIDTH_IN = 5.15
+MAP_EXTENT = [-180, 180, -58, 68]
+
+# Share of (GCM-weighted) simulations with a significant increase / decrease
+# that separates the three classes of each bivariate axis.
+AGREEMENT_CLASS_THRESHOLDS = [0.25, 0.5]
+# 3x3 bivariate palette, index = decrease_class * 3 + increase_class:
+# reds = increase agreement, blues = decrease agreement, yellow = disagreement.
+BIVARIATE_COLORS = [
+    "#e8e8e8", "#eeaeae", "#f47474",
+    "#aeaed9", "#ffd166", "#ffd166",
+    "#7474c9", "#ffd166", "#ffffff",
+]
+
+GWL_LABELS = {"GWL1-5": "1.5°C", "GWL2": "2°C", "GWL3": "3°C"}
+
+
+# =============================================================================
+# CLI arguments
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Model agreement on SWED severity changes and variability "
+                    "decomposition (supplementary figure 7).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--preprocessed_path", default=config.PATH_PREPROCESSED,
+                        help="Root of the per-GCM wcf_agg_*/scf_agg_* aggregates "
+                             "(make_agg_files.load_agg_data_compound()'s input). The yearly "
+                             "and monthly compound datasets built from them are cached under "
+                             "<preprocessed_path>/agg_datasets/.")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Recompute the yearly/monthly compound datasets from the "
+                             "wcf_agg_*/scf_agg_* aggregates and overwrite the cache.")
+    parser.add_argument("--save_significance_nc", default=None,
+                        help="Optional path to also save the recomputed severity trend "
+                             "significance to (e.g. for reuse by other figures). Not read "
+                             "back in -- the significance is always recomputed from the "
+                             "rebuilt indicators.")
+    parser.add_argument("--variability_gwl", default="GWL2",
+                        help="GWL at which the variance decomposition (panels c-d) is run.")
+    parser.add_argument("--alpha", type=float, default=0.10)
+    parser.add_argument("--n_resamples", type=int, default=10_000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ssp", default=config.SSP)
+    parser.add_argument("--reference_gwl", default="GWL0-61")
+    parser.add_argument("--gwls", nargs=2, default=["GWL2", "GWL3"],
+                        help="The two GWLs shown in panels a and b.")
+    parser.add_argument("--shapefile_disag", default=config.SHAPEFILE_PATH,
+                        help="Shapefile matching the poly_idx of the rebuilt indicators.")
+    parser.add_argument("--shapefile_var", default=config.SHAPEFILE_PATH,
+                        help="Shapefile matching the poly_idx of the rebuilt variance decomposition.")
+    parser.add_argument("--agreement_aggregated_nc", default=config.AGREEMENT_AGGREGATED_NC_PATH)
+    parser.add_argument("--agreement_threshold", type=float, default=config.AGREEMENT_THRESHOLD)
+    parser.add_argument("--output_dir", default=config.SUMMARY_FIGS_DIR)
+    parser.add_argument("--dpi", type=int, default=300)
+    return parser.parse_args()
+
+
+# =============================================================================
+# Trend significance (permutation test + FDR), inlined from
+# trend_significance_from_nc.py
+# =============================================================================
+
+def comparison_triplets(ds, ssp, reference_gwl):
+    """Return unique (GCM, run, comparison GWL) values in dataset order."""
+    triplets, seen = [], set()
+    for gcm, run, scenario, gwl in zip(
+        ds["GCM"].values, ds["run"].values, ds["ssp"].values, ds["gwl"].values,
+    ):
+        triplet = (str(gcm), str(run), str(gwl))
+        if str(scenario) == ssp and str(gwl) != reference_gwl and triplet not in seen:
+            seen.add(triplet)
+            triplets.append(triplet)
+    return triplets
+
+
+def fdr_mask(pvalues, fdr):
+    """Benjamini-Hochberg field-significance mask over poly_idx."""
+    stacked = pvalues.stack(location=("poly_idx",))
+    ranks = stacked.rank("location")
+    thresholds = ranks / ranks.max("location") * fdr
+    cutoff = stacked.where(stacked <= thresholds).max("location")
+    return (stacked <= cutoff).where(stacked.notnull()).unstack("location")
+
+
+def trend_for_metric(data_by_gwl, metric, comparison_gwl, reference_gwl,
+                     alpha, n_resamples, seed):
+    """Sign of the significant change of `metric` at `comparison_gwl` vs
+    `reference_gwl`: paired permutation test on yearly values + Benjamini-
+    Hochberg FDR at 2*alpha."""
+    reference = data_by_gwl[metric].sel(gwl=reference_gwl).transpose("year", "poly_idx")
+    comparison = data_by_gwl[metric].sel(gwl=comparison_gwl).transpose("year", "poly_idx")
+    reference_values = reference.values
+    comparison_values = comparison.values
+
+    def mean_difference(x, y, axis):
+        return np.mean(x - y, axis=axis)
+
+    test = permutation_test(
+        (comparison_values, reference_values),
+        mean_difference,
+        permutation_type="samples",
+        alternative="two-sided",
+        n_resamples=n_resamples,
+        vectorized=True,
+        axis=0,
+        **{_PERMUTATION_TEST_RNG_KW: np.random.default_rng(seed)},
+    )
+    coords = {"poly_idx": data_by_gwl.poly_idx.values}
+    pvalues = xr.DataArray(test.pvalue, coords=coords, dims="poly_idx")
+    difference = xr.DataArray(
+        np.mean(comparison_values - reference_values, axis=0), coords=coords, dims="poly_idx")
+    significant = fdr_mask(pvalues, fdr=2 * alpha)
+    return xr.where(significant, np.sign(difference), 0).astype(int)
+
+
+# =============================================================================
+# Data loading
+# =============================================================================
+
+def _squeeze_degenerate_dims(da, keep):
+    """
+    Drop any size-1 dimension of `da` besides `keep`. On the raw aggregated
+    file, intensity (severity) can carry a stray length-1 dim alongside its
+    real time axis -- a leftover from make_agg_files.py's coordinate
+    bookkeeping (e.g. an auxiliary year/month label promoted to its own
+    dimension), not a genuine second data axis.
+    """
+    degenerate = [d for d in da.dims if d not in keep and da.sizes[d] == 1]
+    return da.squeeze(degenerate, drop=True) if degenerate else da
+
+
+def _time_dim(da, var_name, keep):
+    """The one dim of `da` besides `keep` -- its time axis (year or month)."""
+    candidates = [d for d in da.dims if d not in keep]
+    if len(candidates) != 1:
+        sizes = {d: da.sizes[d] for d in candidates}
+        raise ValueError(
+            f"{var_name} has unexpected dims {da.dims} (sizes {sizes} besides "
+            f"{keep}): expected exactly one non-degenerate dimension for the "
+            f"time axis after squeezing size-1 dims")
+    return candidates[0]
+
+
+def _align_time_axis(ds, dim_name, variables=("frequency", "duration", "intensity")):
+    """
+    Normalise `variables` onto a single, positionally-indexed `dim_name`
+    dimension before combining them. On the raw aggregated file
+    (make_agg_files.py) frequency/duration come out of duration_xr()
+    already on a `dim_name` dim, while intensity (severity) keeps
+    resample(time=...)'s 'time' dim, renamed to `dim_name` with its labels
+    turned into ints that don't line up with frequency/duration's own
+    within-window position -- and it can also retain a stray degenerate axis
+    on top of the real one. Left as-is, combining the variables would
+    silently broadcast the mismatched axes into a spurious extra dimension
+    instead of erroring loudly.
+    """
+    keep = ("realization", "poly_idx")
+    for var in variables:
+        ds[var] = _squeeze_degenerate_dims(ds[var], keep)
+    dims = {var: _time_dim(ds[var], var, keep) for var in variables}
+    lengths = {var: ds[var].sizes[dims[var]] for var in variables}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"{variables} have mismatched {dim_name} axis "
+                         f"lengths: {lengths}")
+    for var in variables:
+        da = ds[var].drop_vars(dims[var], errors="ignore")
+        if dims[var] != dim_name:
+            da = da.rename({dims[var]: dim_name})
+        ds[var] = da
+    return ds.assign_coords(**{dim_name: np.arange(1, lengths[variables[0]] + 1)})
+
+
+def _rename_intensity_and_compute_severity(ds, dim_name):
+    """
+    Shared finishing step for the yearly (load_indicators) and monthly
+    (load_variability) aggregates: rename make_agg_files.py's legacy
+    'severity' (really intensity) to 'intensity', align frequency/duration/
+    intensity onto a single `dim_name` axis (see _align_time_axis), fillna,
+    then compute severity = frequency x duration x intensity.
+    """
+    if "intensity" not in ds:
+        if "severity" not in ds:
+            raise ValueError("load_agg_data_compound() returned neither "
+                             "'intensity' nor legacy 'severity'")
+        ds = ds.rename({"severity": "intensity"})
+    ds = _align_time_axis(ds, dim_name)
+    for var in ("frequency", "duration", "intensity"):
+        ds[var] = ds[var].fillna(0)
+    ds["severity"] = ds["frequency"] * ds["duration"] * ds["intensity"]
+    return ds
+
+
+CACHE_FILES = {
+    "year": "compound_years_agg_freq_sev_dur.nc",
+    "month": "compound_monthly_agg_freq_sev_dur.nc",
+}
+
+
+def load_compound_cached(preprocessed_path, freq, rebuild=False):
+    """
+    make_agg_files.load_agg_data_compound(preprocessed_path, freq), cached in
+    <preprocessed_path>/agg_datasets/ (raw output, legacy 'severity' naming
+    kept so the file matches make_agg_files.py's own).
+    """
+    cache_path = os.path.join(preprocessed_path, "agg_datasets", CACHE_FILES[freq])
+    if os.path.exists(cache_path) and not rebuild:
+        print(f"  Loading cached {cache_path}")
+        return xr.open_dataset(cache_path).load()
+    ds = load_agg_data_compound(preprocessed_path, freq=freq)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    ds.to_netcdf(cache_path)
+    print(f"  Saved {cache_path}")
+    return ds
+
+
+def load_indicators(preprocessed_path, rebuild=False):
+    """
+    Yearly indicators with the current terminology: frequency, duration,
+    intensity, and severity = frequency x duration x intensity, from
+    load_compound_cached(..., freq='year').
+    """
+    ds = load_compound_cached(preprocessed_path, "year", rebuild)
+    return _rename_intensity_and_compute_severity(ds, "year")
+
+
+def custom_regional_analysis(ds, var, gwl):
+    """
+    Split the spread of `ds[var]` (mean over 'month', at `gwl`) across
+    realizations into:
+      I - internal variability: average of the run-to-run variance for the
+          two models with more than one run (CanESM5, MPI-ESM2-1-LR)
+      M - model variability: variance across GCMs (first run of each)
+    both normalised by their sum (`total`). Scenario variability is ignored.
+
+    Port of cell 2 of como24_group5/code_final/3.2 Variability
+    decomposition.ipynb -- that cell is missing its two `for` loops (over
+    poly_idx, and over internal_models) as saved in the notebook; restored
+    here from the (correctly indented) loop bodies.
+    """
+    ds = ds.where(ds.gwl == gwl, drop=True)
+    x_temporal = ds[var].mean(dim="month")
+    poly_ids = x_temporal["poly_idx"].values
+    internal_models = ["CanESM5", "MPI-ESM2-1-LR"]
+
+    i_list, m_list, total_list = [], [], []
+    for p in poly_ids:
+        df = x_temporal.sel(poly_idx=p).to_dataframe(name="X")
+        df["GCM"] = ds["GCM"].values
+        df["run"] = ds["run"].values
+
+        # --- Internal variability: only for selected models -----------------
+        internal_vars = []
+        for model in internal_models:
+            subset = df[df["GCM"] == model]
+            if subset["run"].nunique() > 1:
+                internal_vars.append(subset.groupby("run")["X"].mean().var(ddof=1))
+        i_val = np.mean(internal_vars) if internal_vars else np.nan
+
+        # --- Model variability: only first run per GCM -----------------------
+        first_run_df = (
+            df.groupby(["GCM", "run"]).first().reset_index()
+            .sort_values("run").drop_duplicates(subset="GCM", keep="first")
+        )
+        m_val = first_run_df["X"].var(ddof=0)
+
+        # --- Normalise --------------------------------------------------------
+        total = i_val + m_val if not np.isnan(i_val) and not np.isnan(m_val) else np.nan
+        i_list.append(i_val / total if total and not np.isnan(total) else np.nan)
+        m_list.append(m_val / total if total and not np.isnan(total) else np.nan)
+        total_list.append(total)
+
+    return xr.Dataset(
+        {"I": ("poly_idx", i_list), "M": ("poly_idx", m_list), "total": ("poly_idx", total_list)},
+        coords={"poly_idx": poly_ids},
+    )
+
+
+def load_variability(preprocessed_path, gwl, rebuild=False):
+    """
+    Variance decomposition of SWED severity at `gwl` into internal (I) vs.
+    model (M) components, for panels c-d: the same wcf_agg_*/scf_agg_*
+    aggregates as load_indicators(), resampled monthly instead of yearly
+    (load_compound_cached(..., freq='month')), fed into
+    custom_regional_analysis().
+    """
+    ds = load_compound_cached(preprocessed_path, "month", rebuild)
+    ds = _rename_intensity_and_compute_severity(ds, "month")
+    return custom_regional_analysis(ds, "severity", gwl)
+
+
+def compute_severity_significance(ds, gwls, alpha, ssp, reference_gwl, n_resamples, seed):
+    """
+    Sign of the significant severity change of each GWL in `gwls` vs
+    `reference_gwl`, per (GCM, run): +1 / -1 / 0 per poly_idx. Paired
+    permutation test on yearly values, Benjamini-Hochberg FDR at 2*alpha,
+    restricted to severity, one alpha and the plotted GWLs.
+    """
+    triplets = [t for t in comparison_triplets(ds, ssp, reference_gwl) if t[2] in gwls]
+    if not triplets:
+        raise ValueError(f"No (GCM, run) found for ssp={ssp!r} and GWLs {gwls}")
+
+    results, metadata = [], []
+    for i, (gcm, run, gwl) in enumerate(triplets, start=1):
+        print(f"[{i}/{len(triplets)}] GCM={gcm}, run={run}, GWL={gwl}", flush=True)
+        selected = ds.where(
+            (ds["GCM"] == gcm) & (ds["run"] == run) & (ds["ssp"] == ssp),
+            drop=True,
+        ).groupby("gwl").mean(dim="realization")
+        if reference_gwl not in set(map(str, selected.gwl.values)):
+            raise ValueError(f"Missing {reference_gwl} for GCM={gcm}, run={run}")
+        results.append(trend_for_metric(
+            selected, "severity", gwl, reference_gwl, alpha, n_resamples, seed))
+        metadata.append((gcm, run, gwl))
+
+    gcms, runs, gwl_comp = map(np.asarray, zip(*metadata))
+    trend = xr.concat(results, dim="realization").assign_coords(
+        GCM=("realization", gcms),
+        run=("realization", runs),
+        GWL_comp=("realization", gwl_comp),
+        alpha=("realization", np.full(len(metadata), alpha)),
+    )
+    out = trend.to_dataset(name="severity_trend")
+    out["severity_trend"].attrs = {
+        "long_name": "Sign of significant change in SWED severity (frequency x duration x intensity)",
+        "reference_gwl": reference_gwl,
+        "test": f"two-sided paired permutation test, {n_resamples} resamples, "
+                f"Benjamini-Hochberg FDR at {2 * alpha}",
+    }
+    return out
+
+
+def agreement_fractions(sig, gwl):
+    """
+    GCM-weighted share of simulations with a significant increase and a
+    significant decrease in severity at `gwl` (each GCM weighs 1/n_GCM,
+    split evenly across its runs).
+    """
+    sub = sig.where(sig.GWL_comp == gwl, drop=True)
+    counts = pd.Series(sub.GCM.values).value_counts()
+    weights = xr.DataArray(
+        [1.0 / counts[g] / counts.size for g in sub.GCM.values], dims="realization")
+    trend = sub["severity_trend"]
+    incr = (trend > 0).weighted(weights).mean(dim="realization")
+    decr = (trend < 0).weighted(weights).mean(dim="realization")
+    return incr, decr
+
+
+def load_discrepancy_idx(agreement_aggregated_nc, agreement_threshold):
+    """
+    poly_idx where observed (ERA5) and projected trends disagree
+    (agreement_pct <= threshold), as in fig45.load_hatch_agg. Returns an
+    empty array (no mask) if the file is missing.
+    """
+    if agreement_aggregated_nc is None or not os.path.exists(agreement_aggregated_nc):
+        print(f"  Agreement file not found ({agreement_aggregated_nc}) -- no discrepancy mask")
+        return np.array([], dtype=int)
+    agreement_pct = xr.open_dataarray(agreement_aggregated_nc)
+    df = agreement_pct.to_dataframe(name="var").reset_index()
+    return df[df["var"] <= agreement_threshold]["poly_idx"].values
+
+
+# =============================================================================
+# Figure
+# =============================================================================
+
+def _panel_letter(ax, letter):
+    ax.text(0.01, 0.98, letter, transform=ax.transAxes,
+            ha="left", va="top", fontsize=8, fontweight="bold")
+
+
+def _align_to_shapefile(da, shp, what):
+    """
+    Reindex `da` (dim poly_idx) onto the shapefile's row index. poly_idx
+    values are shapefile row indices, but polygons with no valid grid cell
+    are absent from the aggregates; they come back as NaN (left unfilled).
+    """
+    unknown = np.setdiff1d(da["poly_idx"].values, shp.index.values)
+    if unknown.size:
+        raise ValueError(f"{what} has {unknown.size} poly_idx not in the shapefile "
+                         f"(e.g. {unknown[:5]}): wrong --shapefile?")
+    return da.reindex(poly_idx=shp.index.values)
+
+
+def _draw_bivariate(ax, shp, incr, decr, discrepancy_idx, letter, center_label):
+    incr = _align_to_shapefile(incr, shp, "significance data")
+    decr = _align_to_shapefile(decr, shp, "significance data")
+    class_incr = np.digitize(incr.values, AGREEMENT_CLASS_THRESHOLDS, right=True)
+    class_decr = np.digitize(decr.values, AGREEMENT_CLASS_THRESHOLDS, right=True)
+    shp = shp.copy()
+    shp["var"] = np.where(np.isnan(incr.values) | np.isnan(decr.values),
+                          np.nan, class_decr * 3 + class_incr)
+
+    ax.coastlines(resolution="50m", color="black", linewidth=0.4, zorder=1)
+    shp.boundary.plot(ax=ax, color="black", linewidth=0.15, transform=ccrs.PlateCarree())
+    shp.plot(ax=ax, column="var", cmap=ListedColormap(BIVARIATE_COLORS),
+             norm=BoundaryNorm(np.arange(-0.5, 9, 1), ncolors=9),
+             linewidth=0, transform=ccrs.PlateCarree(), legend=False)
+    draw_discrepancy_mask_polygons(
+        ax, list(shp.loc[shp["poly_idx"].isin(discrepancy_idx)].geometry))
+
+    ax.spines["geo"].set_visible(False)
+    ax.set_extent(MAP_EXTENT, crs=ccrs.PlateCarree())
+    _panel_letter(ax, letter)
+    ax.text(0.5, 1.03, center_label, transform=ax.transAxes,
+            ha="center", va="bottom", fontsize=7)
+
+
+def _draw_bivariate_legend(fig):
+    leg_ax = fig.add_axes([0.12, 0.6, 0.11, 0.11])
+    leg_ax.imshow(np.arange(9).reshape(3, 3), cmap=ListedColormap(BIVARIATE_COLORS),
+                  norm=BoundaryNorm(np.arange(-0.5, 9, 1), ncolors=9),
+                  origin="lower", extent=[-0.5, 2.5, -0.5, 2.5])
+    leg_ax.set_xticks([0.4, 1.6])
+    leg_ax.set_xticklabels(["25", "50"], fontsize=5)
+    leg_ax.set_yticks([0.5, 1.5])
+    leg_ax.set_yticklabels(["25", "50"], fontsize=5)
+    leg_ax.set_xlabel("Increasing\nsimulations (%)", fontsize=5, labelpad=3)
+    leg_ax.set_ylabel("Decreasing\nsimulations (%)", fontsize=5, labelpad=3)
+    leg_ax.tick_params(length=0, pad=2)
+    for spine in leg_ax.spines.values():
+        spine.set_visible(False)
+
+
+def _style_last_colorbar(fig, map_ax, labelsize):
+    # GeoPandas adds the colorbar as the most recent axes.
+    cbar_ax = fig.axes[-1]
+    if cbar_ax is not map_ax:
+        cbar_ax.tick_params(labelsize=labelsize, length=2, pad=1)
+        cbar_ax.xaxis.label.set_size(5)
+
+
+def plot_suppfig7(agreement_panels, shapefile_disag, discrepancy_idx,
+                  ds_var, shapefile_var):
+    """
+    agreement_panels: two (incr, decr, center_label) tuples for panels a, b.
+    ds_var: variance decomposition with 'total' (projection spread) and 'I'
+    (internal-variability fraction), one value per region of shapefile_var.
+    """
+    shp_disag = gpd.read_file(shapefile_disag)
+    shp_disag["poly_idx"] = shp_disag.index
+    n_poly = agreement_panels[0][0].sizes["poly_idx"]
+    if len(shp_disag) != n_poly:
+        print(f"  {shapefile_disag} has {len(shp_disag)} polygons, significance "
+              f"data has {n_poly}: {len(shp_disag) - n_poly} left blank (no data)")
+
+    fig = plt.figure(figsize=(FIG_WIDTH_IN, FIG_WIDTH_IN * 0.65), dpi=300)
+    gs = GridSpec(2, 2, hspace=0.0, wspace=0.0, figure=fig)
+    proj = ccrs.Robinson()
+    ax_a = fig.add_subplot(gs[0, 0], projection=proj)
+    ax_b = fig.add_subplot(gs[0, 1], projection=proj)
+    ax_c = fig.add_subplot(gs[1, 0], projection=proj)
+    ax_d = fig.add_subplot(gs[1, 1], projection=proj)
+
+    # -- a, b: agreement on significant severity changes ---------------------
+    for ax, letter, (incr, decr, label) in zip((ax_a, ax_b), "ab", agreement_panels):
+        _draw_bivariate(ax, shp_disag, incr, decr, discrepancy_idx, letter, label)
+    _draw_bivariate_legend(fig)
+    if len(discrepancy_idx):
+        add_exclusion_legend(ax_b, show_discrepancy=True, show_wcf_zero=False,
+                             discrepancy_style="mask")
+
+    # -- c: total projection spread ------------------------------------------
+    shp_var = gpd.read_file(shapefile_var)
+    shp_var["total"] = _align_to_shapefile(ds_var["total"], shp_var, "variance decomposition").values
+    shp_var["I"] = _align_to_shapefile(ds_var["I"], shp_var, "variance decomposition").values
+
+    total_positive = shp_var["total"].where(shp_var["total"] > 0).min()
+    ax_c.coastlines(linewidth=0.25)
+    shp_var.boundary.plot(ax=ax_c, color="black", linewidth=0.15, transform=ccrs.PlateCarree())
+    shp_var.plot(
+        column="total", ax=ax_c, legend=True, transform=ccrs.PlateCarree(), cmap="Reds",
+        norm=LogNorm(vmin=float(total_positive), vmax=float(shp_var["total"].max())),
+        legend_kwds={"label": "Total projection spread of SWED severity under 2°C warming",
+                     "orientation": "horizontal", "shrink": 0.6, "pad": 0.02},
+    )
+    ax_c.spines["geo"].set_visible(False)
+    _panel_letter(ax_c, "c")
+    _style_last_colorbar(fig, ax_c, labelsize=4)
+
+    # -- d: fraction of internal variability ---------------------------------
+    ax_d.coastlines(linewidth=0.25)
+    shp_var.boundary.plot(ax=ax_d, color="black", linewidth=0.15, transform=ccrs.PlateCarree())
+    shp_var.plot(
+        column="I", ax=ax_d, legend=True, transform=ccrs.PlateCarree(), cmap="PiYG",
+        vmin=0, vmax=1,
+        legend_kwds={"label": "Fraction of internal variability",
+                     "orientation": "horizontal", "shrink": 0.6, "pad": 0.02},
+    )
+    arrow_props = dict(facecolor="black", width=0.15, headwidth=6, headlength=4)
+    arrow_y = -0.10
+    for x_head, x_tail, x_text, text in ((0.08, 0.18, 0.07, "Model"),
+                                         (0.92, 0.82, 0.93, "Internal")):
+        ax_d.annotate("", xy=(x_head, arrow_y), xytext=(x_tail, arrow_y),
+                      xycoords="axes fraction", textcoords="axes fraction",
+                      arrowprops=arrow_props)
+        ax_d.text(x_text, arrow_y - 0.06, text, transform=ax_d.transAxes,
+                  ha="center", va="top", fontsize=5)
+    ax_d.spines["geo"].set_visible(False)
+    _panel_letter(ax_d, "d")
+    _style_last_colorbar(fig, ax_d, labelsize=5)
+
+    return fig
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    args = parse_args()
+
+    print(f"Rebuilding yearly SWED indicators from {args.preprocessed_path}")
+    ds = load_indicators(args.preprocessed_path, args.rebuild)
+    print("Computing severity trend significance")
+    sig = compute_severity_significance(
+        ds, gwls=args.gwls, alpha=args.alpha, ssp=args.ssp,
+        reference_gwl=args.reference_gwl, n_resamples=args.n_resamples, seed=args.seed,
+    )
+    if args.save_significance_nc:
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_significance_nc)), exist_ok=True)
+        sig.to_netcdf(args.save_significance_nc)
+        print(f"  Saved {args.save_significance_nc}")
+
+    agreement_panels = []
+    for gwl in args.gwls:
+        incr, decr = agreement_fractions(sig, gwl)
+        agreement_panels.append((incr, decr, GWL_LABELS.get(gwl, gwl)))
+
+    discrepancy_idx = load_discrepancy_idx(args.agreement_aggregated_nc, args.agreement_threshold)
+
+    print(f"Rebuilding monthly variance decomposition at {args.variability_gwl}")
+    ds_var = load_variability(args.preprocessed_path, args.variability_gwl, args.rebuild)
+
+    print("Plotting supplementary figure 7")
+    fig = plot_suppfig7(agreement_panels, args.shapefile_disag, discrepancy_idx,
+                        ds_var, args.shapefile_var)
+    os.makedirs(args.output_dir, exist_ok=True)
+    out_path = os.path.join(args.output_dir, "suppfig7_agreement_variability_combined.png")
+    fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out_path}")
+
+
+if __name__ == "__main__":
+    main()

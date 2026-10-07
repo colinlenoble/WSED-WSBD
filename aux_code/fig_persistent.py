@@ -1,0 +1,1095 @@
+# -*- coding: cp1252 -*-
+"""
+Long-lasting (persistent) compound wind-solar energy drought analysis.
+
+Unlike fig1.py -- which flags a compound event on any single day where the
+*daily* wcf and scf are simultaneously below their 10th-percentile reference
+threshold -- this script targets multi-day, long-lasting droughts:
+
+  1. wcf/scf are smoothed with a rolling weekly mean (`--roll_window`, default
+     7 days) before thresholding, so a single anomalous day cannot flip the
+     "low production" flag.
+  2. A "low week" is a day whose rolling-mean wcf (resp. scf) falls below the
+     `--threshold` quantile (default 0.01, i.e. the driest 1 % of the
+     reference period, positive values only).
+  3. The compound (wind AND solar) low-production mask is then built from the
+     two gap-bridged serie
+
+Two figures are produced, mirroring fig1.py's main outputs but for this
+persistent-event definition:
+
+  - a value-by-alpha map + regional time series of the change in persistent
+    compound WSE drought severity (recent vs historical period), and
+  - a reference-period multi-panel figure summarising persistent-drought
+    frequency/duration/severity and mean rolling wcf/scf.
+"""
+import os
+import sys
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
+os.environ["ESMFMKFILE"] = config.ESMFMKFILE_XENV
+
+import argparse
+import gc
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import xarray as xr
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Polygon
+import rasterio
+from rasterio.features import geometry_mask
+
+# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
+# (prefers a .zarr store when present, falls back to .nc).
+from io_utils import match_files, open_dataset_any
+
+# Generic event-duration-class decomposition, shared with fig1.py's classic
+# daily-coincidence pipeline (see duration_decomposition.py).
+from duration_decomposition import (
+    compute_event_table, compute_duration_decomposition,
+    DECOMPOSITION_DURATION_CLASSES, DECOMPOSITION_CLASS_LABELS,
+)
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.patheffects import withStroke
+from matplotlib import cm
+from string import ascii_lowercase
+
+import cmocean as cmo
+
+# =============================================================================
+# Figure size constants (LaTeX-compatible)
+# =============================================================================
+FIG_WIDTH_IN = 5.15   # single column width : pt fontsizes match LaTeX
+
+# Latitude band shown on EqualEarth maps in this module (matches the
+# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
+# and 58S were excluded due to artifacts in the duration metric"). Applied
+# by masking data/shapefiles to this band and calling ax.set_global() --
+# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
+# it clips to the bounding rectangle of the extent box's own corners, whose
+# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
+# themselves, sitting well short of it at other latitudes -- slicing
+# through real land (e.g. eastern Australia) even though it's nominally
+# within +/-180 deg longitude.
+MAP_LAT_SOUTH = -58
+MAP_LAT_NORTH = 68
+
+
+def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
+    """
+    White out everything poleward of [lat_south, lat_north] on a set_global()
+    EqualEarth map. Needed because cfeature.COASTLINE/ax.coastlines() draw
+    the *entire* globe's coastlines (Antarctica, remote Arctic islands)
+    regardless of how the data/shapefile were masked to this band, and
+    shp.cx[:, lat_south:lat_north] keeps whole country geometries (e.g.
+    Russia, Canada, Greenland) rather than clipping them at the band's edge
+    -- both leak real content poleward of the intended crop (see
+    MAP_LAT_SOUTH/NORTH above). Draws a white cap over each pole, in
+    PlateCarree and densely sampled in longitude so it follows the
+    projection's own curved boundary, on top of coastlines/boundaries but
+    below panel labels/region boxes (zorder 20+ elsewhere in this module).
+    """
+    lons = np.linspace(-180.0, 180.0, 361)
+    for lat_edge, lat_pole in ((lat_south, -90.0), (lat_north, 90.0)):
+        cap = Polygon(
+            list(zip(lons, np.full_like(lons, lat_edge))) +
+            list(zip(lons[::-1], np.full_like(lons, lat_pole)))
+        )
+        ax.add_geometries([cap], crs=ccrs.PlateCarree(),
+                          facecolor="white", edgecolor="none", zorder=zorder)
+
+
+# =============================================================================
+# CLI arguments
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compute persistent (long-lasting) compound WSE drought index and produce figures.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--data_path", default=None,
+                         help="Pre-computed ds_final .nc (skips rebuilding).")
+    parser.add_argument("--path_preprocessed", default=config.PATH_PREPROCESSED)
+    parser.add_argument("--reanalysis", default=config.REANALYSIS)
+    parser.add_argument("--threshold", type=float, default=0.01,
+                         help="Quantile of the rolling-mean reference distribution defining a "
+                              "'low week' (default: 0.01, i.e. below the driest 1%%).")
+    parser.add_argument("--roll_window", type=int, default=7,
+                         help="Rolling-mean window (days) applied to daily wcf/scf before "
+                              "thresholding (default: 7, i.e. weekly).")
+    parser.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
+    parser.add_argument("--ref_end", default=config.SHEAR_REF_PERIOD[1])
+    parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
+    parser.add_argument("--output_dir",
+                         default=os.path.join(config.SUMMARY_FIGS_DIR, "persistance"))
+    parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--n_boot", type=int, default=2000)
+    parser.add_argument("--save_nc", action="store_true", default=False)
+    return parser.parse_args()
+
+
+# =============================================================================
+# Gap-tolerant persistent-event detection
+# =============================================================================
+
+
+def events_stats_from_table(df, template_da, time_dim="time"):
+    """
+    From the long event table (see compute_event_table) return:
+
+      ds_dur, ds_freq : (year, lat, lon) Datasets with mean event 'duration'
+                         and event 'frequency', reindexed onto template_da's
+                         full lat/lon grid and full year range, 0-filled.
+    """
+    df_events = df.drop_duplicates(["event_id", "lat", "lon"])
+    full_years = np.unique(pd.DatetimeIndex(template_da[time_dim].values).year)
+
+    # groupby(...).to_xarray() only densifies over the *observed* year/lat/lon
+    # values, so (year, lat, lon) combos with no event there still come out
+    # NaN, not just the combos missing entirely from df_events. reindex's
+    # fill_value only backfills newly-added labels, so it won't catch those --
+    # fillna(0) after reindex is needed to turn "no event" into 0 everywhere.
+    ds_dur = (df_events.groupby(["year", "lat", "lon"])[["duration"]]
+              .mean().to_xarray())
+    ds_freq = (df_events.groupby(["year", "lat", "lon"])[["duration"]]
+               .count().rename(columns={"duration": "frequency"}).to_xarray())
+
+    ds_dur = ds_dur.reindex(year=full_years, lat=template_da.lat, lon=template_da.lon,
+                             fill_value=0).fillna(0)
+    ds_freq = ds_freq.reindex(year=full_years, lat=template_da.lat, lon=template_da.lon,
+                               fill_value=0).fillna(0)
+    return ds_dur, ds_freq
+
+
+def compute_freq_by_duration_thresholds(df, template_da, thresholds=(2, 3, 5, 7), time_dim="time"):
+    """
+    Annual per-pixel count of persistent compound-drought events whose total
+    duration exceeds each of `thresholds` (days). Reuses the long-format
+    event table from compute_event_table (one row per event day) --
+    de-duplicating to one row per event before filtering on 'duration' so
+    each qualifying event is counted once, not once per day it spans.
+    """
+    df_events = df.drop_duplicates(["event_id", "lat", "lon"])
+    full_years = np.unique(pd.DatetimeIndex(template_da[time_dim].values).year)
+
+    counts = []
+    for thr in thresholds:
+        sub = df_events[df_events["duration"] > thr]
+        da_count = (sub.groupby(["year", "lat", "lon"]).size()
+                    .rename("n_events").to_xarray())
+        da_count = da_count.reindex(year=full_years, lat=template_da.lat, lon=template_da.lon,
+                                     fill_value=0).fillna(0)
+        counts.append(da_count)
+    return xr.concat(counts, dim=pd.Index(list(thresholds), name="duration_threshold"))
+
+
+def compute_severity_persistent(scf_roll, wcf_roll, scf_threshold, wcf_threshold):
+    """
+    Expected shortfall on persistent compound-drought days: mean positive
+    rolling-mean deficit below threshold, aggregated yearly.
+    """
+    # roll first so the subtraction keeps (time, lat, lon) dim order --
+    # `threshold - roll` would put the (lat, lon)-only threshold first and
+    # leave the result transposed to (lat, lon, time).
+    deficit_scf = -(scf_roll - scf_threshold)
+    deficit_wcf = -(wcf_roll - wcf_threshold)
+    compound_mask = (deficit_scf > 0) & (deficit_wcf > 0)
+    daily_deficit = deficit_scf + deficit_wcf
+    masked = xr.where(compound_mask, daily_deficit, np.nan)
+    severity = masked.resample(time="YE").mean()
+    return severity
+
+
+# =============================================================================
+# Dataset computation
+# =============================================================================
+
+def build_persistent_pipeline(path_preprocessed, reanalysis, threshold, ref_start, ref_end,
+                               roll_window=7):
+    """
+    Shared first stage of the persistent-event pipeline: loads wcf/scf,
+    applies the roll_window-day rolling mean, defines low-week thresholds
+    from the reference period, and flags compound (wind AND solar)
+    low-production days. Returns (wcf, scf, wcf_roll, scf_roll, wcf_thr,
+    scf_thr, compound) -- everything downstream computations need.
+    """
+    print(f"  Loading wcf/scf for reanalysis={reanalysis}")
+    wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
+    scf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "scf_day_*"))
+    if not wcf_files:
+        raise FileNotFoundError(
+            f"No wcf_day_* file found under {os.path.join(path_preprocessed, reanalysis)}")
+    if not scf_files:
+        raise FileNotFoundError(
+            f"No scf_day_* file found under {os.path.join(path_preprocessed, reanalysis)}")
+    chunks = {"time": 1000, "lat": -1, "lon": -1}
+    wcf = open_dataset_any(wcf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
+    scf = open_dataset_any(scf_files[0], chunks=chunks).sel(lat=slice(-58, 68))
+    wcf = wcf.convert_calendar("standard")
+    scf = scf.convert_calendar("standard")
+
+    print(f"  {roll_window}-day rolling mean of wcf/scf")
+    wcf_roll = wcf.wcf.rolling(time=roll_window, center=True, min_periods=roll_window).mean()
+    scf_roll = scf.scf.rolling(time=roll_window, center=True, min_periods=roll_window).mean()
+
+    print(f"  Computing low-week thresholds (quantile={threshold}, ref={ref_start}:{ref_end})")
+    wcf_roll_ref = wcf_roll.sel(time=slice(ref_start, ref_end))
+    scf_roll_ref = scf_roll.sel(time=slice(ref_start, ref_end))
+    wcf_thr = wcf_roll_ref.where(wcf_roll_ref > 0).quantile(threshold, dim="time")
+    scf_thr = scf_roll_ref.where(scf_roll_ref > 0).quantile(threshold, dim="time")
+
+    print("  Flagging low-production weeks (rolling mean below threshold)")
+    low_wind = (wcf_roll <= wcf_thr)
+    low_solar = (scf_roll <= scf_thr)
+
+    print("  Combining into compound (wind AND solar) low-production days")
+    compound = (low_wind & low_solar).astype(int)
+
+    return wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound
+
+
+def build_ds_final_persistent(
+    path_preprocessed, reanalysis, threshold, ref_start, ref_end,
+    roll_window=7, duration_thresholds=(2, 3, 5, 7), return_events=False,
+):
+    wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound = build_persistent_pipeline(
+        path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window,
+    )
+
+    print("  Building event table of compound low-production spells")
+    df_events = compute_event_table(compound)
+    ds_dur, ds_freq = events_stats_from_table(
+        df_events, compound,
+    )
+    df_events_dedup = df_events.drop_duplicates(["event_id", "lat", "lon"])
+
+    print(f"  Computing event counts by duration threshold ({duration_thresholds})")
+    ds_freq_by_dur = compute_freq_by_duration_thresholds(
+        df_events, compound, thresholds=duration_thresholds,
+    )
+
+    print("  Computing severity of persistent compound events")
+    severity_ds = compute_severity_persistent(scf_roll, wcf_roll, scf_thr, wcf_thr)
+    severity_ds["time"] = severity_ds.time.dt.year
+    severity_ds = severity_ds.rename({"time": "year"}).fillna(0.0)
+
+    print("  Building resource/land validity mask (reference-period non-NaN wcf & scf)")
+    wcf_ref_mean = wcf.wcf.sel(time=slice(ref_start, ref_end)).mean("time")
+    scf_ref_mean = scf.scf.sel(time=slice(ref_start, ref_end)).mean("time")
+    resource_valid = wcf_ref_mean.notnull() & scf_ref_mean.notnull()
+    wcf_roll_ref_mean = wcf_roll.sel(time=slice(ref_start, ref_end)).mean("time")
+    scf_roll_ref_mean = scf_roll.sel(time=slice(ref_start, ref_end)).mean("time")
+
+    ds_final = ds_dur.copy()
+    ds_final["frequency"] = ds_freq.frequency
+    ds_final["n_events_gt_duration"] = ds_freq_by_dur
+    ds_final["severity"] = severity_ds
+    ds_final["resource_valid"] = resource_valid.astype("int8")
+    ds_final["wcf_ref_mean"] = wcf_roll_ref_mean
+    ds_final["scf_ref_mean"] = scf_roll_ref_mean
+
+    del wcf, scf, wcf_roll, scf_roll, compound
+    gc.collect()
+    ds_final = ds_final.load()
+    if return_events:
+        return ds_final, df_events_dedup
+    return ds_final
+
+
+def build_duration_decomposition_persistent(
+    path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window=7,
+    duration_classes=DECOMPOSITION_DURATION_CLASSES,
+):
+    """
+    Persistent (rolling-mean-smoothed) half of the value-by-alpha
+    duration-class decomposition: builds the low-week pipeline (see
+    build_persistent_pipeline) and hands it off to the generic
+    compute_duration_decomposition (see duration_decomposition.py), shared
+    with fig1.py's build_duration_decomposition_daily. Returns
+    ({label: annual_index_DataArray}, resource_valid, freq_all,
+    freq_by_class) -- see compute_duration_decomposition for details.
+    """
+    wcf, scf, wcf_roll, scf_roll, wcf_thr, scf_thr, compound = build_persistent_pipeline(
+        path_preprocessed, reanalysis, threshold, ref_start, ref_end, roll_window,
+    )
+    daily_deficit = -(scf_roll - scf_thr) + -(wcf_roll - wcf_thr)
+
+    indices, resource_valid, freq_all, freq_by_class = compute_duration_decomposition(
+        compound, daily_deficit, wcf.wcf, scf.scf, ref_start, ref_end, duration_classes,
+    )
+
+    del wcf, scf, wcf_roll, scf_roll, compound, daily_deficit
+    gc.collect()
+    return indices, resource_valid, freq_all, freq_by_class
+
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+def rasterize_shapefile(shapefile, shape, transform):
+    geometries = shapefile["geometry"]
+    mask = geometry_mask(geometries=geometries, all_touched=True,
+                          out_shape=shape, transform=transform, invert=True)
+    return mask
+
+
+def build_land_mask(ds_final, shapefile_path):
+    """Land pixels with valid reference-period wcf & scf data (see resource_valid)."""
+    shapefile = gpd.read_file(shapefile_path)
+    da = ds_final["resource_valid"]
+    transform = rasterio.transform.from_bounds(
+        da.lon.min().item(), da.lat.min().item(),
+        da.lon.max().item(), da.lat.max().item(),
+        len(da.lon), len(da.lat),
+    )
+    land = rasterize_shapefile(shapefile, da.shape, transform)
+    land = land[::-1, :]
+    return land & da.values.astype(bool)
+
+
+def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
+    y = np.asarray(y, dtype=np.float64)
+    if y.size < 2 or np.all(np.isnan(y)):
+        return np.nan, np.nan, np.nan, np.nan
+    n = y.size
+    valid = np.isfinite(y)
+    if valid.sum() < 2:
+        return np.nan, np.nan, np.nan, np.nan
+    p = 1.0 / float(block_size)
+    slopes = np.empty(n_boot)
+    intercepts = np.empty(n_boot)
+    for b in range(n_boot):
+        idx_parts, total = [], 0
+        while total < n:
+            L = np.random.geometric(p)
+            s = np.random.randint(0, n)
+            take = min(L, n - total)
+            idx_parts.append((s + np.arange(take)) % n)
+            total += take
+        idx = np.concatenate(idx_parts)
+        xb, yb = np.arange(n)[idx], y[idx]
+        dx = xb - xb.mean()
+        denom = np.dot(dx, dx)
+        slope = np.nan if denom == 0 else np.dot(dx, yb - yb.mean()) / denom
+        intercepts[b] = yb.mean() - slope * xb.mean() if np.isfinite(slope) else np.nan
+        slopes[b] = slope
+    years_arr = np.asarray(years, dtype=float)
+    fitted = slopes[:, None] * years_arr[None, :] + intercepts[:, None]
+    alpha = (100.0 - ci) / 2.0
+    low = np.nanpercentile(fitted, alpha, axis=0)
+    up = np.nanpercentile(fitted, 100.0 - alpha, axis=0)
+    return float(np.nanmean(slopes)), float(np.nanmean(intercepts)), low, up
+
+
+# =============================================================================
+# Value-by-alpha discrete classification (colour = relative change,
+# opacity = historical-period baseline magnitude)
+# =============================================================================
+
+def compute_valuebyalpha_rgba(da, period_hist, period_comp, n_bins_change=5, n_bins_sev=5):
+    """
+    From an already masked/lat-clipped (year, lat, lon) severity-like index,
+    build the value-by-alpha RGBA array: colour encodes relative change
+    between period_comp and period_hist, opacity encodes the period_hist
+    baseline magnitude. Returns (rgba_map, sev, dChange, color_levels,
+    alpha_levels) -- the last two are the legend key for rgba_map.
+    """
+    y0, y1 = period_hist
+    y2, y3 = period_comp
+    da_hist = da.sel(year=slice(y0, y1)).mean("year", skipna=True)
+    da_comp = da.sel(year=slice(y2, y3)).mean("year", skipna=True)
+    rel_change = 100.0 * (da_comp - da_hist) / da_hist
+    rel_change = rel_change.where(np.isfinite(rel_change))
+    sev = da_hist
+    dChange = rel_change
+
+    # --- Discrete colour bins ---
+    change_edges = [-100, -25, -10, 10, 25, 100]
+    change_bin = np.digitize(dChange.values, change_edges[1:-1])
+    base_cmap = cm.get_cmap("coolwarm")
+    color_levels = base_cmap(np.linspace(0, 1, n_bins_change))
+
+    # --- Discrete alpha bins ---
+    # Quantile-based edges (equal pixel count per bin) rather than a fixed
+    # power-law spacing: a fixed **2 spacing was tuned for severity's usual
+    # near-zero-heavy, long-tailed shape and gives poor separation for
+    # variables with a different shape (e.g. annual event frequency, which
+    # need not cluster near zero) -- quantiles adapt to whatever `sev`'s own
+    # distribution looks like.
+    if np.isfinite(sev.values).any():
+        sev_edges = np.nanquantile(sev.values, np.linspace(0, 1, n_bins_sev + 1))
+    else:
+        sev_edges = np.linspace(0, 1, n_bins_sev + 1)
+    sev_bin = np.digitize(sev.values, sev_edges[1:-1])
+    alpha_min, alpha_max = 0.4, 1.0
+    alpha_levels = np.linspace(alpha_min, alpha_max, n_bins_sev)
+
+    # --- RGBA assembly ---
+    nlat, nlon = dChange.shape
+    valid_mask = np.isfinite(dChange.values) & np.isfinite(sev.values)
+    rgba_map = np.zeros((nlat, nlon, 4), dtype=float)
+    cb = np.clip(change_bin, 0, n_bins_change - 1)
+    sb = np.clip(sev_bin, 0, n_bins_sev - 1)
+    rgba_map[valid_mask, :3] = color_levels[cb[valid_mask], :3]
+    rgba_map[valid_mask, 3] = alpha_levels[sb[valid_mask]]
+
+    return rgba_map, sev, dChange, color_levels, alpha_levels
+
+
+# =============================================================================
+# Figure: Value-by-alpha map + regional time series (persistent events)
+# =============================================================================
+
+def plot_valuebyalpha_persistent(
+    ds_final, mask, shapefile_path,
+    map_title="Change (color) weighted by annual persistent-drought severity (opacity)",
+    relchange_label="Relative change (2000-2019 vs 1980-1999) (%)",
+    sev_label="Annual persistent severity (1980-1999 mean)",
+    lat_min=-60, lat_max=72,
+    period_hist=(1980, 1999), period_comp=(2000, 2019),
+    regions=None, n_boot=2000, n_bins_change=5, n_bins_sev=5,
+):
+    # --- 1. Compound persistent-drought index ---
+    da = (ds_final.frequency.where(mask == 1)
+          * ds_final.severity.where(mask == 1)
+          * ds_final.duration.where(mask == 1))
+    da = da.sel(lat=slice(-60, 68))
+    da = da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
+
+    y0, y3 = period_hist[0], period_comp[1]
+    years_all = da.sel(year=slice(y0, y3)).year.values.astype(float)
+
+    rgba_map, sev, _, color_levels, alpha_levels = compute_valuebyalpha_rgba(
+        da, period_hist, period_comp, n_bins_change=n_bins_change, n_bins_sev=n_bins_sev,
+    )
+
+    # --- 5. Region definitions ---
+    if regions is None:
+        regions = [
+            {"name": "Western U.S.",    "lat": [35, 50],   "lon": [-125, -105]},
+            {"name": "Northern Amazon", "lat": [-10, 10],  "lon": [-70,  -50]},
+            {"name": "Egypt",           "lat": [15, 30],   "lon": [25,    40]},
+            {"name": "Kenya",           "lat": [-5,   5],  "lon": [33,    42]},
+            {"name": "India",           "lat": [10,  30],  "lon": [70,    90]},
+        ]
+    panellabels = [chr(98 + i) for i in range(len(regions))]
+
+    # --- 6. Figure layout ---
+    fig_width_in = FIG_WIDTH_IN
+    fig_height_in = fig_width_in * (12 / 20)
+    ncols_total = max(1, len(regions))
+    fig = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=300)
+    gs = GridSpec(2, ncols_total, height_ratios=[2.9, 1],
+                  hspace=0.30, wspace=0.45, figure=fig)
+    ax_map = fig.add_subplot(gs[0, :], projection=ccrs.EqualEarth())
+
+    # --- 7. Draw map ---
+    shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
+    ax_map.imshow(
+        rgba_map,
+        extent=[sev.lon.min().item(), sev.lon.max().item(),
+                sev.lat.min().item(), sev.lat.max().item()],
+        origin="lower", transform=ccrs.PlateCarree(),
+        interpolation="nearest", rasterized=True,
+    )
+
+    da_mask = ds_final.frequency.isel(year=0).sel(
+        lat=slice(MAP_LAT_SOUTH, MAP_LAT_NORTH))
+    mask_band = mask.sel(lat=da_mask.lat, lon=da_mask.lon)
+    t_mask = rasterio.transform.from_bounds(
+        da_mask.lon.min().item(), da_mask.lat.min().item(),
+        da_mask.lon.max().item(), da_mask.lat.max().item(),
+        len(da_mask.lon), len(da_mask.lat),
+    )
+    land_mask = rasterize_shapefile(shp_band, da_mask.shape, t_mask)
+    land_mask = land_mask[::-1, :]
+    ocean_mask = land_mask & (mask_band.values == 0)
+    ax_map.contourf(
+        da_mask.lon, da_mask.lat, ocean_mask.astype(float),
+        levels=[0.5, 1], colors=["gray"],
+        transform=ccrs.PlateCarree(), zorder=5,
+    )
+    shp_band.boundary.plot(ax=ax_map, color="black", linewidth=0.15,
+                           transform=ccrs.PlateCarree(), zorder=10)
+    ax_map.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
+    ax_map.annotate(
+        "$\\mathbf{a}$",
+        xy=(0.02, 1.02), xycoords="axes fraction",
+        ha="left", va="bottom", fontsize=8,
+        path_effects=[withStroke(linewidth=1.5, foreground="white")],
+    )
+    ax_map.set_title(map_title, fontsize=7, pad=6)
+
+    # --- 8. Legend block ---
+    legend_rgba = np.zeros((n_bins_change, n_bins_sev, 4))
+    for ic in range(n_bins_change):
+        legend_rgba[ic, :, :3] = color_levels[ic, :3]
+        legend_rgba[ic, :, 3] = alpha_levels
+
+    legend_ax = fig.add_axes([0.2, 0.45, 0.16, 0.16])
+    legend_ax.imshow(legend_rgba, origin="lower", aspect="equal")
+    legend_ax.set_xticks([0, n_bins_sev // 2, n_bins_sev - 1])
+    legend_ax.set_xticklabels(["low", "mid", "high"], fontsize=5, ha="center")
+    ytick_pos = [0.5, 1.5, 2.5, 3.5]
+    ytick_labs = ["-25%", "-10%", "10%", "25%"]
+    legend_ax.set_yticks(ytick_pos)
+    legend_ax.set_yticklabels(ytick_labs, fontsize=5, va="center")
+    legend_ax.set_xlabel(sev_label, fontsize=5, labelpad=4)
+    legend_ax.set_ylabel(relchange_label, fontsize=5, labelpad=4)
+    legend_ax.tick_params(axis="both", which="both", length=0)
+
+    # --- 9. Regional time series + map boxes ---
+    region_panels = []
+    for ridx, reg in enumerate(regions):
+        lat_lo, lat_hi = reg["lat"]
+        lon_lo, lon_hi = reg["lon"]
+        lat0 = lat_lo if da.lat[0] < da.lat[-1] else lat_hi
+        lat1 = lat_hi if da.lat[0] < da.lat[-1] else lat_lo
+        lon0 = lon_lo if da.lon[0] < da.lon[-1] else lon_hi
+        lon1 = lon_hi if da.lon[0] < da.lon[-1] else lon_lo
+
+        da_reg = da.sel(lat=slice(lat0, lat1), lon=slice(lon0, lon1),
+                         year=slice(y0, y3))
+        ts = da_reg.mean(("lat", "lon"), skipna=True).values
+        n_years_reg = len(years_all)
+        mean_slope, mean_intercept, low_vals, up_vals = stationary_bootstrap_ci_1d(
+            ts, np.arange(n_years_reg), n_boot=n_boot, block_size=3, ci=95,
+        )
+
+        ax_map.plot(
+            [lon_lo, lon_hi, lon_hi, lon_lo, lon_lo],
+            [lat_lo, lat_lo, lat_hi, lat_hi, lat_lo],
+            color="black", linewidth=1,
+            transform=ccrs.PlateCarree(),
+            path_effects=[withStroke(linewidth=2.5, foreground="white")],
+        )
+        ax_map.annotate(
+            panellabels[ridx],
+            xy=(lon_lo + 0.5, lat_hi - 0.5),
+            xycoords=ccrs.PlateCarree()._as_mpl_transform(ax_map),
+            fontsize=6, fontweight="bold",
+            path_effects=[withStroke(linewidth=2, foreground="white")],
+            zorder=20,
+        )
+        region_panels.append(dict(
+            label=panellabels[ridx], name=reg["name"],
+            years=years_all, ts=ts,
+            fit_line=mean_intercept + mean_slope * np.arange(n_years_reg),
+            low_line=low_vals, up_line=up_vals,
+        ))
+
+    # --- 10. Bottom row time series ---
+    y_min = min(np.nanmin(r["ts"]) for r in region_panels) * 0.95
+    y_max = max(np.nanmax(r["ts"]) for r in region_panels) * 1.05
+
+    for ridx, rinfo in enumerate(region_panels):
+        ax_ts = fig.add_subplot(gs[1, ridx])
+        ax_ts.scatter(rinfo["years"], rinfo["ts"],
+                      marker="x", s=6, linewidths=0.6, label="annual mean")
+        ax_ts.plot(rinfo["years"], rinfo["fit_line"],
+                   linestyle="-", color="red", linewidth=0.5)
+        ax_ts.fill_between(rinfo["years"], rinfo["low_line"], rinfo["up_line"],
+                           color="red", alpha=0.3, label="95% CI", linewidth=0.1)
+        ax_ts.grid(True, linestyle="--", alpha=0.4)
+        ax_ts.set_ylim(y_min, y_max)
+        for spine in ax_ts.spines.values():
+            spine.set_linewidth(0.4)
+        ax_ts.tick_params(axis="both", labelsize=5)
+        if ridx == 0:
+            ax_ts.set_ylabel("Annual persistent severity", fontsize=5)
+        ax_ts.set_xlabel("Year", fontsize=5)
+        ax_ts.annotate(
+            f"$\\mathbf{{{rinfo['label']}}}$",
+            xy=(0.02, 1.02), xycoords="axes fraction",
+            ha="left", va="bottom", fontsize=8,
+        )
+
+    ax_map.spines["geo"].set_visible(False)
+    ax_map.set_global()
+    mask_poles(ax_map)
+    plt.tight_layout()
+    return fig
+
+
+# =============================================================================
+# Figure: Value-by-alpha decomposition by event-duration class
+# =============================================================================
+
+def plot_valuebyalpha_decomposition(
+    indices, mask, shapefile_path,
+    period_hist=(1982, 2001), period_comp=(2002, 2021),
+    lat_min=-60, lat_max=72,
+    class_labels=DECOMPOSITION_CLASS_LABELS,
+    suptitle="Compound WSE drought decomposition by event duration (ERA5)",
+    n_bins_change=5, n_bins_sev=5, value_label="severity",
+):
+    """
+    2x2 grid of value-by-alpha maps (colour = relative change, opacity =
+    historical-period baseline value): panel (a) uses the unrestricted
+    drought index (all events); panels (b)-(d) use the same index restricted
+    to a single event-duration class. `indices` is an ordered mapping
+    {label: (year, lat, lon) DataArray} in the same order as `class_labels`
+    -- shared by both the persistent (rolling) decomposition
+    (build_duration_decomposition_persistent) and the classic daily
+    decomposition (fig1.py's build_duration_decomposition_daily). `indices`
+    need not be the freq*dur*severity index -- e.g. fig_red_decomposition.py
+    passes per-class annual frequency instead, since it fixes duration per
+    panel and wants to isolate the frequency change alone; `value_label`
+    names whatever quantity `indices` holds in the caption/legend.
+    """
+    shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, lat_min:lat_max]
+    panellabels = list(ascii_lowercase[:len(class_labels)])
+
+    if not isinstance(mask, xr.DataArray):
+        # build_land_mask() (fig1.py / fig_persistent.py) returns a plain
+        # ndarray on the same (lat, lon) grid as `indices` -- wrap it so
+        # mask.sel(...) below can subset it the same way as `da`.
+        first_da = next(iter(indices.values()))
+        mask = xr.DataArray(mask, coords={"lat": first_da.lat, "lon": first_da.lon},
+                             dims=["lat", "lon"])
+
+    fig_width_in = FIG_WIDTH_IN * 1.6
+    fig_height_in = fig_width_in * 0.95
+    fig, axes = plt.subplots(2, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
+                              subplot_kw={"projection": ccrs.EqualEarth()})
+    axes_flat = axes.flatten()
+
+    for i, (da_full, label) in enumerate(zip(indices.values(), class_labels)):
+        ax = axes_flat[i]
+        da = da_full.where(mask == 1)
+        da = da.sel(lat=slice(-60, 68))
+        da = da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
+
+        rgba_map, sev, _, color_levels, alpha_levels = compute_valuebyalpha_rgba(
+            da, period_hist, period_comp, n_bins_change=n_bins_change, n_bins_sev=n_bins_sev,
+        )
+
+        da_mask_ref = da.isel(year=0)
+        t_mask = rasterio.transform.from_bounds(
+            da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
+            da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
+            len(da_mask_ref.lon), len(da_mask_ref.lat),
+        )
+        land_mask = rasterize_shapefile(shp_band, da_mask_ref.shape, t_mask)[::-1, :]
+        mask_band = mask.sel(lat=da_mask_ref.lat, lon=da_mask_ref.lon)
+        ocean_mask = land_mask & (mask_band.values == 0)
+
+        ax.set_global()
+        mask_poles(ax, lat_min, lat_max)
+        ax.imshow(
+            rgba_map,
+            extent=[sev.lon.min().item(), sev.lon.max().item(),
+                    sev.lat.min().item(), sev.lat.max().item()],
+            origin="lower", transform=ccrs.PlateCarree(),
+            interpolation="nearest", rasterized=True,
+        )
+        ax.contourf(
+            da_mask_ref.lon, da_mask_ref.lat, ocean_mask.astype(float),
+            levels=[0.5, 1], colors=["gray"],
+            transform=ccrs.PlateCarree(), zorder=5,
+        )
+        shp_band.boundary.plot(ax=ax, color="black", linewidth=0.15,
+                               transform=ccrs.PlateCarree(), zorder=10)
+        ax.add_feature(cfeature.COASTLINE.with_scale("110m"), linewidth=0.15)
+        ax.annotate(
+            f"$\\mathbf{{{panellabels[i]}}}$",
+            xy=(0.02, 1.02), xycoords="axes fraction",
+            ha="left", va="bottom", fontsize=8,
+            path_effects=[withStroke(linewidth=1.5, foreground="white")],
+        )
+        ax.set_title(label, fontsize=7, pad=6)
+        ax.spines["geo"].set_visible(False)
+
+        legend_rgba = np.zeros((n_bins_change, n_bins_sev, 4))
+        for ic in range(n_bins_change):
+            legend_rgba[ic, :, :3] = color_levels[ic, :3]
+            legend_rgba[ic, :, 3] = alpha_levels
+        legend_ax = ax.inset_axes([0.02, 0.02, 0.22, 0.22])
+        legend_ax.imshow(legend_rgba, origin="lower", aspect="equal")
+        legend_ax.set_xticks([0, n_bins_sev // 2, n_bins_sev - 1])
+        legend_ax.set_xticklabels(["low", "mid", "high"], fontsize=4, ha="center")
+        legend_ax.set_yticks([0.5, 1.5, 2.5, 3.5])
+        legend_ax.set_yticklabels(["-25%", "-10%", "10%", "25%"], fontsize=4, va="center")
+        legend_ax.tick_params(axis="both", which="both", length=0)
+
+    fig.suptitle(
+        f"{suptitle}\n"
+        f"Colour: relative change ({period_comp[0]}-{period_comp[1]} vs "
+        f"{period_hist[0]}-{period_hist[1]}); opacity: historical baseline {value_label}",
+        fontsize=7,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    return fig
+
+
+# =============================================================================
+# Figure: Change in event count by duration threshold (persistent events)
+# =============================================================================
+
+def plot_freq_by_duration_change_persistent(
+    ds_final, mask, shapefile_path,
+    thresholds=(2, 3, 5, 7),
+    period_hist=(1980, 1999), period_comp=(2000, 2019),
+    lat_min=-60, lat_max=72,
+    cmap="RdBu_r",
+):
+    """
+    2x2 panel figure: absolute change (recent-period mean minus
+    historical-period mean) in the annual number of persistent compound
+    WSE-drought events lasting more than `thresholds[i]` days, for each of
+    the 4 thresholds.
+    """
+    shp = gpd.read_file(shapefile_path)
+    shp_band = shp.cx[:, lat_min:lat_max]
+    y0, y1 = period_hist
+    y2, y3 = period_comp
+
+    da_full = ds_final["n_events_gt_duration"].where(mask == 1)
+    da_full = da_full.sel(lat=slice(-60, 68))
+    da_full = da_full.where(da_full.lat > lat_min, drop=True).where(da_full.lat < lat_max, drop=True)
+
+    da_mask_ref = ds_final.frequency.isel(year=0).sel(lat=da_full.lat, lon=da_full.lon)
+    t_mask = rasterio.transform.from_bounds(
+        da_mask_ref.lon.min().item(), da_mask_ref.lat.min().item(),
+        da_mask_ref.lon.max().item(), da_mask_ref.lat.max().item(),
+        len(da_mask_ref.lon), len(da_mask_ref.lat),
+    )
+    land_mask = rasterize_shapefile(shp_band, da_mask_ref.shape, t_mask)[::-1, :]
+    mask_band = mask.sel(lat=da_full.lat, lon=da_full.lon)
+    ocean_mask = land_mask & (mask_band.values == 0)
+
+    lon_vals = da_full.lon.values
+    lat_vals = da_full.lat.values
+
+    results = []
+    for thr in thresholds:
+        da_thr = da_full.sel(duration_threshold=thr)
+        hist_vals = da_thr.sel(year=slice(y0, y1)).values
+        comp_vals = da_thr.sel(year=slice(y2, y3)).values
+        diff = np.nanmean(comp_vals, axis=0) - np.nanmean(hist_vals, axis=0)
+        results.append(diff)
+
+    vabs = max(np.nanmax(np.abs(d)) for d in results if np.isfinite(d).any())
+    vabs = vabs if np.isfinite(vabs) and vabs > 0 else 1.0
+
+    fig_width_in = FIG_WIDTH_IN * 1.6
+    fig_height_in = fig_width_in * 0.62
+    fig, axes = plt.subplots(2, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
+                              subplot_kw={"projection": ccrs.EqualEarth()})
+    axes_flat = axes.flatten()
+    panellabels = list(ascii_lowercase[:len(thresholds)])
+
+    for i, (thr, ax) in enumerate(zip(thresholds, axes_flat)):
+        diff = results[i]
+        ax.set_global()
+        mask_poles(ax, lat_min, lat_max)
+        ax.coastlines(resolution="50m", linewidth=0.15, color="black")
+        ax.contourf(
+            da_mask_ref.lon, da_mask_ref.lat, ocean_mask.astype(float),
+            levels=[0.5, 1], colors=["gray"],
+            transform=ccrs.PlateCarree(), zorder=5,
+        )
+        mesh = ax.pcolormesh(
+            lon_vals, lat_vals, diff,
+            transform=ccrs.PlateCarree(), cmap=cmap,
+            vmin=-vabs, vmax=vabs, rasterized=True, zorder=3,
+        )
+        shp_band.boundary.plot(ax=ax, color="black", linewidth=0.1,
+                               transform=ccrs.PlateCarree(), zorder=6)
+        cbar = fig.colorbar(mesh, ax=ax, orientation="horizontal", shrink=0.7, pad=0.05)
+        cbar.set_label(f"$\\Delta$ events/yr lasting > {thr} d", fontsize=5)
+        cbar.ax.tick_params(labelsize=5)
+        ax.annotate(
+            f"$\\mathbf{{{panellabels[i]}}}$",
+            xy=(0.02, 1.02), xycoords="axes fraction",
+            ha="left", va="bottom", fontsize=8,
+            path_effects=[withStroke(linewidth=1.5, foreground="white")],
+        )
+        ax.set_title(f"> {thr} days", fontsize=6)
+        ax.spines["geo"].set_visible(False)
+
+    fig.suptitle(
+        f"Change in annual number of persistent compound WSE-drought events\n"
+        f"({period_comp[0]}-{period_comp[1]} minus {period_hist[0]}-{period_hist[1]} mean)",
+        fontsize=6,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    return fig
+
+
+# =============================================================================
+# Figure: Reference-period persistent-drought summary
+# =============================================================================
+
+def plot_reference_persistent_drought(
+    ds_final, mask, shapefile_path,
+    ref_start_year, ref_end_year,
+    roll_window=7,
+):
+    """
+    6-panel reference figure: frequency / duration / intensity / annual
+    severity of compound (wind AND solar rolling-mean below threshold)
+    WSE drought events during the reference period, plus the mean
+    reference-period rolling wind and solar capacity factor.
+    """
+    lat_south, lat_north = -60, 68
+    shapefile = gpd.read_file(shapefile_path)
+    shapefile_band = shapefile.cx[:, lat_south:lat_north]
+
+    freq_mean = ds_final.frequency.where(mask == 1).sel(
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
+    dur_mean = ds_final.duration.where(mask == 1).sel(
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
+    int_mean = ds_final.severity.where(mask == 1).sel(
+        year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
+    ann_sev_mean = (ds_final.frequency * ds_final.severity * ds_final.duration).where(
+        mask == 1).sel(year=slice(ref_start_year, ref_end_year)).mean("year").sel(
+        lat=slice(lat_south, lat_north))
+    wcf_mean = ds_final["wcf_ref_mean"].where(mask == 1).sel(
+        lat=slice(lat_south, lat_north))
+    scf_mean = ds_final["scf_ref_mean"].where(mask == 1).sel(
+        lat=slice(lat_south, lat_north))
+
+    da_comp = ds_final.frequency.isel(year=0).sel(lat=slice(lat_south, lat_north))
+    t_comp = rasterio.transform.from_bounds(
+        da_comp.lon.min().item(), da_comp.lat.min().item(),
+        da_comp.lon.max().item(), da_comp.lat.max().item(),
+        len(da_comp.lon), len(da_comp.lat),
+    )
+    land_mask_comp = rasterize_shapefile(shapefile_band, da_comp.shape, t_comp)[::-1, :]
+    mask_comp = mask.sel(lat=da_comp.lat, lon=da_comp.lon)
+    ocean_mask_comp = land_mask_comp & (mask_comp.values == 0)
+
+    datasets = [freq_mean, dur_mean, int_mean, ann_sev_mean, wcf_mean, scf_mean]
+    title_list = [
+        "Frequency", "Duration", "Intensity", "Annual persistent\nWSE drought severity",
+        "Wind capacity factor\n(7-day rolling mean)", "Solar capacity factor\n(7-day rolling mean)",
+    ]
+    legend_list = [
+        "Events/yr", "Days/event",
+        "Intensity/day of event", "Annual persistent severity",
+        "Wind CF", "Solar CF",
+    ]
+    cmap_list = [
+        cmo.cm.solar.reversed(), cmo.cm.matter, cmo.cm.dense,
+        cmo.cm.balance, cmo.cm.speed, cmo.cm.thermal,
+    ]
+    vmin_list = [0, 0, 0, 0, 0, 0]
+    vmax_list = [3, roll_window + 8, 0.05, 0.3, 0.5, 0.5]
+    panellabels = list(ascii_lowercase[:6])
+
+    # 2-column layout (3 rows), same width; height scales proportionally
+    # so each map panel is bigger than the previous 3-column layout
+    fig_width_in = FIG_WIDTH_IN
+    fig_height_in = fig_width_in * 1.2375
+    fig, axes = plt.subplots(3, 2, figsize=(fig_width_in, fig_height_in), dpi=300,
+                              subplot_kw={"projection": ccrs.EqualEarth()})
+    axes_flat = axes.flatten()
+
+    for idx, ax in enumerate(axes_flat):
+        ds = datasets[idx]
+        if hasattr(ds, "load"):
+            ds = ds.load()
+        ax.set_global()
+        mask_poles(ax, lat_south, lat_north)
+        ax.coastlines(resolution="50m", linewidth=0.15, color="black")
+        ax.contourf(
+            da_comp.lon, da_comp.lat,
+            ocean_mask_comp.astype(float),
+            levels=[0.5, 1], colors=["gray"],
+            transform=ccrs.PlateCarree(), zorder=5,
+        )
+        ds.plot.pcolormesh(
+            ax=ax, transform=ccrs.PlateCarree(),
+            cmap=cmap_list[idx], vmin=vmin_list[idx], vmax=vmax_list[idx],
+            add_colorbar=True, add_labels=False,
+            cbar_kwargs={"orientation": "horizontal", "shrink": 0.7,
+                         "pad": 0.05, "label": legend_list[idx]},
+            rasterized=True, linewidth=0,
+        )
+        shapefile_band.boundary.plot(ax=ax, color="black", linewidth=0.1,
+                                     transform=ccrs.PlateCarree())
+        ax.annotate(
+            f"$\\mathbf{{{panellabels[idx]}}}$",
+            xy=(0.02, 1.02), xycoords="axes fraction",
+            ha="left", va="bottom", fontsize=8,
+            path_effects=[withStroke(linewidth=1.5, foreground="white")],
+        )
+        cbar_ax = fig.axes[-1]
+        cbar_ax.set_xlabel(legend_list[idx], fontsize=5)
+        cbar_ax.tick_params(labelsize=5)
+        ax.spines["geo"].set_visible(False)
+
+    fig.suptitle(
+        f"Persistent compound WSE drought, reference period {ref_start_year}-{ref_end_year}\n"
+        f"(low week <= {ds_final.attrs.get('low_week_quantile', '?')} quantile of "
+        f"{roll_window}-day rolling mean; wind AND solar simultaneously below threshold)",
+        fontsize=6,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.90])
+    return fig
+
+
+# =============================================================================
+# Global mean change + bootstrap CI (by duration threshold)
+# =============================================================================
+
+def compute_global_duration_change_stats(ds_final, mask, thresholds=(2, 3, 5, 7),
+                                          period_hist=(1980, 1999), period_comp=(2000, 2019),
+                                          n_bootstrap=1000, block_size=10):
+    """
+    Global area-weighted mean absolute change (recent-period mean minus
+    historical-period mean) in annual persistent-drought event count, for
+    each duration threshold, with a spatial block-bootstrap 95% CI (blocks
+    of `block_size` degrees resampled with replacement over lat/lon).
+    Returns {threshold: (abs_change, ci_lower, ci_upper)}.
+    """
+    ds = ds_final["n_events_gt_duration"].where(mask == 1)
+    weights = np.cos(np.deg2rad(ds.lat))
+    weights.name = "weights"
+
+    results = {}
+    for thr in thresholds:
+        da_thr = ds.sel(duration_threshold=thr)
+        early = da_thr.sel(year=slice(*period_hist)).mean(dim="year")
+        late = da_thr.sel(year=slice(*period_comp)).mean(dim="year")
+        global_early = early.weighted(weights).mean(dim=["lat", "lon"]).values
+        global_late = late.weighted(weights).mean(dim=["lat", "lon"]).values
+        global_abs_change = global_late - global_early
+
+        data = (late - early).values
+        lats = early.lat.values
+        lons = early.lon.values
+        weight_array = weights.values
+        lat_blocks = np.arange(lats.min(), lats.max(), block_size)
+        lon_blocks = np.arange(lons.min(), lons.max(), block_size)
+
+        bootstrap_means = []
+        for _ in range(n_bootstrap):
+            s_lat = np.random.choice(lat_blocks, size=len(lat_blocks), replace=True)
+            s_lon = np.random.choice(lon_blocks, size=len(lon_blocks), replace=True)
+            sample, sw = [], []
+            for lb in s_lat:
+                for lo in s_lon:
+                    li_mask = (lats >= lb) & (lats < lb + block_size)
+                    lo_mask = (lons >= lo) & (lons < lo + block_size)
+                    if np.any(li_mask) and np.any(lo_mask):
+                        for li in np.where(li_mask)[0]:
+                            for loi in np.where(lo_mask)[0]:
+                                if not np.isnan(data[li, loi]):
+                                    sample.append(data[li, loi])
+                                    sw.append(weight_array[li])
+            if sample:
+                sample, sw = np.array(sample), np.array(sw)
+                bootstrap_means.append(np.sum(sample * sw) / np.sum(sw))
+
+        ci_lower = np.percentile(bootstrap_means, 2.5)
+        ci_upper = np.percentile(bootstrap_means, 97.5)
+        results[thr] = (float(global_abs_change), float(ci_lower), float(ci_upper))
+    return results
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    thr_str = str(args.threshold).replace(".", "")
+
+    if args.data_path is not None:
+        print(f"Loading pre-computed dataset from {args.data_path}")
+        ds_final = xr.open_dataset(args.data_path)
+    else:
+        print("No --data_path provided -- computing ds_final on-the-fly")
+        ds_final = build_ds_final_persistent(
+            path_preprocessed=args.path_preprocessed,
+            reanalysis=args.reanalysis,
+            threshold=args.threshold,
+            ref_start=args.ref_start,
+            ref_end=args.ref_end,
+            roll_window=args.roll_window,
+        )
+        ds_final.attrs.update(dict(
+            roll_window_days=args.roll_window,
+            low_week_quantile=args.threshold,
+            reference_period=f"{args.ref_start}:{args.ref_end}",
+        ))
+        if args.save_nc:
+            out_nc = os.path.join(
+                args.path_preprocessed, "agg_datasets",
+                f"ds_final_persistent_{thr_str}_roll{args.roll_window}"
+                f"_{args.reanalysis}.nc",
+            )
+            os.makedirs(os.path.dirname(out_nc), exist_ok=True)
+            print(f"  Saving dataset to {out_nc}")
+            ds_final.to_netcdf(out_nc)
+            print(f"  Saved: {out_nc}")
+
+    print("Building land/resource mask")
+    mask = build_land_mask(ds_final, args.shapefile)
+
+    print("Plotting persistent-drought duration-threshold change figure")
+    fig_dur = plot_freq_by_duration_change_persistent(
+        ds_final=ds_final, mask=mask, shapefile_path=args.shapefile,
+        thresholds=(2, 3, 5, 7),
+        period_hist=(1980, 1999), period_comp=(2000, 2019),
+        lat_min=-60, lat_max=75,
+    )
+    out_dur = os.path.join(
+        args.output_dir, "main",
+        f"fig_persistent_durationchange_{thr_str}_roll{args.roll_window}.png",
+    )
+    os.makedirs(os.path.dirname(out_dur), exist_ok=True)
+    fig_dur.savefig(out_dur, dpi=args.dpi, bbox_inches="tight")
+    plt.close(fig_dur)
+    print(f"Saved {out_dur}")
+
+    print("Plotting reference persistent-drought figure")
+    ref_start_year = pd.Timestamp(args.ref_start).year
+    ref_end_year = pd.Timestamp(args.ref_end).year
+    fig_ref = plot_reference_persistent_drought(
+        ds_final=ds_final, mask=mask, shapefile_path=args.shapefile,
+        ref_start_year=ref_start_year, ref_end_year=ref_end_year,
+        roll_window=args.roll_window,
+    )
+    out_ref = os.path.join(
+        args.output_dir, "supp",
+        f"suppfig_persistent_reference_{thr_str}_roll{args.roll_window}.png",
+    )
+    os.makedirs(os.path.dirname(out_ref), exist_ok=True)
+    fig_ref.savefig(out_ref, dpi=args.dpi, bbox_inches="tight")
+    plt.close(fig_ref)
+    print(f"Saved {out_ref}")
+
+    print("Computing global duration-threshold change statistics")
+    duration_change_stats = compute_global_duration_change_stats(
+        ds_final, mask, thresholds=(2, 3, 5, 7),
+        period_hist=(1980, 1999), period_comp=(2000, 2019), n_bootstrap=1000)
+    print("\nResults:")
+    for thr, (abs_change, ci_lower, ci_upper) in duration_change_stats.items():
+        print(f"  Events/yr lasting > {thr} d -- global change: {abs_change:+.3f}")
+        print(f"    95% CI: [{ci_lower:+.3f}, {ci_upper:+.3f}]")
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
