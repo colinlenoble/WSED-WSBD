@@ -121,7 +121,7 @@ SWBD_MAIN_MIX    = "current"
 # GWL every ratio panel divides by -- this project's reference/baseline
 # period (see fig_duration_distribution_latitude.py's own GWL0-61 handling).
 BASELINE_GWL  = "GWL0-61"
-RATIO_YLABEL  = "relative change in\nnumber of drought events"
+RATIO_YLABEL  = "Relative change in\nnumber of drought\nevents"
 
 # Day at which plot_swed_swbd_distributions_split breaks each panel into a
 # wide "short term" sub-panel (duration <= DURATION_SPLIT_DAY, own y-range
