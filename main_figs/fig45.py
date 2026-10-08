@@ -627,7 +627,9 @@ def plot_main_dumbbell_absolute(df_gwl2, shapefile_path, dpi=300, share_re="curr
                color=re_color, label="Supply driver", markersize=5),
         Line2D([0], [0], marker="o", linestyle="None",
                color="black", label="Combined effect", markersize=5),
-    ], loc="lower right", fontsize=5)
+    ], title="Projected 2°C warming effect",
+       title_fontproperties={"weight": "bold", "size": 6},
+       loc="lower right", fontsize=5)
 
     _save_fig(fig, os.path.join(output_dir, "main", "fig5_main_dumbbell_absolute_days.png"), dpi)
 
