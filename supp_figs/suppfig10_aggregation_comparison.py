@@ -133,7 +133,7 @@ def _draw_diff_map(fig, ax, gdf, col, label, letter):
     scale capped at the DIFF_PERCENTILE of |diff| (larger values saturate)."""
     vabs = float(np.nanpercentile(np.abs(gdf[col]), DIFF_PERCENTILE))
     levels = MaxNLocator(nbins=N_DIFF_LEVELS, symmetric=True).tick_values(-vabs, vabs)
-    cmap = plt.get_cmap("RdBu_r")
+    cmap = plt.get_cmap("PuOr_r")
     norm = BoundaryNorm(levels, ncolors=cmap.N, extend="both")
 
     band = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]

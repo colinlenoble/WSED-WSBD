@@ -34,7 +34,6 @@ from map_overlays import (draw_wcf_zero_overlay, draw_discrepancy_dots,
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patheffects import withStroke
-import cmocean as cmo
 
 from fig3 import (EQUAL_EARTH_ASPECT, FIG_WIDTH_IN, MAP_LAT_NORTH,
                   MAP_LAT_SOUTH, _compute_ensemble_rel_change,
@@ -116,7 +115,7 @@ def plot_gwl_wasserstein_vs_mmm(
     cmap_ab   = plt.get_cmap("coolwarm")
     vmax_c    = _sym_vmax(rel_diff)
     norm_c    = mcolors.Normalize(vmin=-vmax_c, vmax=vmax_c)
-    cmap_c    = cmo.cm.balance
+    cmap_c    = plt.get_cmap("PuOr_r")  # non-red/blue so c is not read as a/b
 
     grey_drawn = False
     for ax, field, cmap, norm, letter, title, tfs in [

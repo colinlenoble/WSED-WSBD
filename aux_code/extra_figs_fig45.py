@@ -33,7 +33,6 @@ from matplotlib.patches import Patch
 from matplotlib.patheffects import withStroke
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import cmocean as cmo
 from map_overlays import draw_discrepancy_mask_polygons, discrepancy_mask_legend_handle
 
 from make_rl_files import DEMAND_CONFIGS
@@ -169,7 +168,7 @@ def plot_gwl2_wasserstein_vs_mmm(df_gwl2, shapefile_path, hatch_df, w2_table,
          distance to ERA5 at that polygon (_mmm_combined_wasserstein),
       b) the flat multi-model mean (_mmm_combined(..., weighting="mmm")),
          side by side with a on one shared continuous colour scale,
-      c) a - b in percentage points, full width, diverging (cmo.cm.balance)
+      c) a - b in percentage points, full width, diverging (PuOr_r)
          on its own scale. Agreement masking is shown in a/b but omitted in
          c, since it describes trend agreement, not this reweighting.
     """
@@ -192,7 +191,7 @@ def plot_gwl2_wasserstein_vs_mmm(df_gwl2, shapefile_path, hatch_df, w2_table,
 
     finite = diff["Diff_Effect"].replace([np.inf, -np.inf], np.nan).dropna()
     diff_vmax = max(1.0, float(np.nanpercentile(np.abs(finite), 98))) if len(finite) else 1.0
-    diff_cmap = cmo.cm.balance
+    diff_cmap = plt.get_cmap("PuOr_r")
     diff_norm = mcolors.TwoSlopeNorm(vmin=-diff_vmax, vcenter=0, vmax=diff_vmax)
 
     hatch_df_none = hatch_df.copy()
@@ -691,8 +690,7 @@ def plot_supp_demand_sensitivity(shapefile_path, hatch_df, output_dir,
     ncols = 3
     nrows = int(np.ceil(len(names) / ncols))
     cmap_ref, norm_ref = _make_cmap(vmin=-100, vmax=800)
-    diff_colors = ["#08519c", "#f7f7f7", "#d94801"]
-    cmap_diff = LinearSegmentedColormap.from_list("diff_cmap", diff_colors, N=300)
+    cmap_diff = plt.get_cmap("PuOr_r")
 
     # First pass: load each demand config's Combined_Effect, then take the
     # difference against "default" so non-reference panels show how much the

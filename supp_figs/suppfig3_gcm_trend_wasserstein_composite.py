@@ -7,7 +7,9 @@ distribution).
 Script version of the classify_gcm_trend_agreement.ipynb cells that built this
 figure (Section 11: load the empirical W2 grids, drop pixels with a near-zero
 ERA5 bootstrap-trend std, build the per-realization table, draw the
-normalized-W2 composite). All the logic lives in
+normalized-W2 composite). Panel a maps the per-pixel GCM-ensemble discrete
+median of w2_normalized (one realization's actual value, 1/n_runs(GCM)
+weights), not the ensemble mean. All the logic lives in
 aux_code/diagnostics/classify_gcm_trend_agreement.py; inputs are the
 trend_sev_eval_wasserstein.py outputs it points to (test_data/ by default).
 """

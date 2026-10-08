@@ -20,7 +20,6 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.patches import Patch
 import cartopy.crs as ccrs
 from map_overlays import discrepancy_mask_legend_handle
@@ -60,8 +59,7 @@ def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
     nrows = int(np.ceil(len(names) / ncols))
 
     cmap_ref = plt.get_cmap("RdYlGn_r")
-    diff_colors = ["#08519c", "#f7f7f7", "#d94801"]
-    cmap_diff = LinearSegmentedColormap.from_list("diff_cmap_days", diff_colors, N=300)
+    cmap_diff = plt.get_cmap("PuOr_r")
 
     effect_by_name = {}
     for demand_name in names:

@@ -659,6 +659,7 @@ def from_ds_to_plot_decomp(ds_gwl, ds_ref):
 
 W2_VAR = "w2_normalized"
 W2_EPS = 1e-3
+W2_SIGMA_REF_MIN = 1e-6   # same as trend_sev_eval_wasserstein.SIGMA_REF_MIN
 
 
 def _w2_pair_index(da_proj_freq, ds_wasserstein):
@@ -737,7 +738,24 @@ def load_wasserstein(args):
                          "main_pipeline/trend_sev_eval_wasserstein.py first, or pass "
                          "--weighting mmm.")
     print(f"Loading Wasserstein distance dataset from {args.wasserstein_path} ...")
-    return xr.open_dataset(args.wasserstein_path)
+    return drop_near_zero_reference_std(xr.open_dataset(args.wasserstein_path))
+
+
+def drop_near_zero_reference_std(ds_w2, sigma_ref_min=W2_SIGMA_REF_MIN):
+    """NaN out w2_normalized wherever ERA5's own bootstrap-trend std (recovered
+    as w2_distance / w2_normalized) is below sigma_ref_min. Files written before
+    trend_sev_eval_wasserstein.py's SIGMA_REF_MIN fix divided by a ~1e-12 floor
+    there instead, giving w2_normalized ~1e8-1e9 that swamp every region mean:
+    the 1-2 realizations without such pixels then take ~all of the inverse-W2
+    weight. A no-op on files built after the fix (those pixels are already NaN)."""
+    wd, wn = ds_w2.w2_distance, ds_w2.w2_normalized
+    keep = (wd == 0) | ((wd / wn) > sigma_ref_min)
+    n_total = int(np.isfinite(wn.values).sum())
+    n_dropped = int((np.isfinite(wn.values) & ~keep.values).sum())
+    if n_dropped:
+        print(f"  Dropping {n_dropped}/{n_total} pixel-realizations ({n_dropped / n_total:.1%}) "
+              f"with a near-zero ERA5 bootstrap-trend std (< {sigma_ref_min:g}).")
+    return ds_w2.assign(w2_normalized=wn.where(keep))
 
 
 def ensemble_weight(da_proj_freq, base_weight, inputs):
