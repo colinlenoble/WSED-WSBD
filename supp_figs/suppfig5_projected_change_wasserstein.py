@@ -59,7 +59,7 @@ def plot_gwl_wasserstein_vs_mmm(
     agreement_threshold=config.AGREEMENT_THRESHOLD,
     wcf_zero_mask=None,
     change_label="Relative change in annual severity\ncompared to 0.61°C (%)",
-    diff_label="Difference, inverse-W2 weighted\nminus multi-model mean (pp)",
+    diff_label="Difference, historical-agreement-weighted\nminus multi-model mean (pp)",
 ):
     """
     Three-panel figure for one GWL level: a (inverse-W2 weighted) and b
@@ -121,7 +121,7 @@ def plot_gwl_wasserstein_vs_mmm(
     for ax, field, cmap, norm, letter, title, tfs in [
         (ax_a, rel_w2,   cmap_ab, norm_ab, "a", "Historical-agreement-weighted mean", 6),
         (ax_b, rel_mmm,  cmap_ab, norm_ab, "b", "Multi-model mean", 6),
-        (ax_c, rel_diff, cmap_c,  norm_c,  "c", "Difference (a $-$ b)", 7),
+        (ax_c, rel_diff, cmap_c,  norm_c,  "c", "Difference (a - b)", 7),
     ]:
         ax.imshow(field, extent=extent, origin="lower", transform=ccrs.PlateCarree(),
                   interpolation="nearest", cmap=cmap, norm=norm, rasterized=True)
