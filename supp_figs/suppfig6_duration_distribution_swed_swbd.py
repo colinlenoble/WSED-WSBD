@@ -91,6 +91,7 @@ import geopandas as gpd
 from shapely.geometry import box
 import xarray as xr
 import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
 import matplotlib
 matplotlib.use("Agg")
@@ -850,6 +851,10 @@ def _add_map_row(fig, gs, zone_order, regions_shapefile, zone_of_poly, letters):
     """Row-0 locator maps (SWED latitude bands | SWBD region attribution),
     each with its title and panel letter -- shared by every figure here."""
     ax_map_swed, _ = swed_mod._add_locator_map(fig, gs[0, 0], zone_order)
+    # Mask the ocean part of the full-width zone bands (zorder between the
+    # bands at 1 and the zone-edge lines at 2), so only land is shaded.
+    ax_map_swed.add_feature(cfeature.OCEAN.with_scale("110m"), facecolor="white",
+                            edgecolor="none", zorder=1.5)
     ax_map_swbd = _add_region_zone_map(fig, gs[0, 1], regions_shapefile, zone_of_poly)
     for ax_map, label, letter in ((ax_map_swed, "SWED", letters[0]),
                                    (ax_map_swbd, "SWBD (region attribution)", letters[1])):
