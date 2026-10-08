@@ -119,7 +119,7 @@ def plot_gwl_wasserstein_vs_mmm(
 
     grey_drawn = False
     for ax, field, cmap, norm, letter, title, tfs in [
-        (ax_a, rel_w2,   cmap_ab, norm_ab, "a", "Inverse-Wasserstein weighted", 6),
+        (ax_a, rel_w2,   cmap_ab, norm_ab, "a", "Historical-agreement-weighted mean", 6),
         (ax_b, rel_mmm,  cmap_ab, norm_ab, "b", "Multi-model mean", 6),
         (ax_c, rel_diff, cmap_c,  norm_c,  "c", "Difference (a $-$ b)", 7),
     ]:

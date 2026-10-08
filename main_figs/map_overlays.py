@@ -180,7 +180,7 @@ def discrepancy_mask_legend_handle(label="Obs.-projection trend discrepancy"):
     return Patch(facecolor=DISCREPANCY_MASK_COLOR, edgecolor="none", label=label)
 
 
-def wcf_zero_legend_handle(label="Excluded: no wind capacity (wcf = 0)"):
+def wcf_zero_legend_handle(label="Excluded: no wind capacity"):
     return Patch(facecolor=WCF_ZERO_COLOR, edgecolor="none", label=label)
 
 
