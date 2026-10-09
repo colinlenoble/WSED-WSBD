@@ -463,6 +463,23 @@ def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
           f"regions (out of {n_joint})")
 
 
+def _print_swbd_region_counts(gwl_dfs, share_re="current"):
+    """Diagnostic: number of regions experiencing a SWBD (inverse-W2-weighted
+    mean cumulative residual load > 0) at the 0.61 degC baseline and at each
+    GWL in gwl_dfs ({gwl_label: df_gwl})."""
+    for i, (gwl_label, df_gwl) in enumerate(gwl_dfs.items()):
+        df = df_gwl[df_gwl["share_re"] == share_re]
+        cum = (w2_weighted_mean(df, ["cum_rl_ref", "cum_rl_gwl"])
+               .replace([np.inf, -np.inf], np.nan))
+        if i == 0:
+            ref = cum["cum_rl_ref"].dropna()
+            print(f"  [INFO] 0.61°C: SWBD (weighted-mean cum. RL > 0) in "
+                  f"{int((ref > 0).sum())} regions (out of {len(ref)})")
+        gwl = cum["cum_rl_gwl"].dropna()
+        print(f"  [INFO] {gwl_label}: SWBD (weighted-mean cum. RL > 0) in "
+              f"{int((gwl > 0).sum())} regions (out of {len(gwl)})")
+
+
 def _save_fig(fig, path, dpi):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
@@ -516,6 +533,8 @@ def plot_main_gwl_maps_absolute(df_gwl15, df_gwl2, df_gwl3,
         if len(eff):
             abs_vals.append(np.abs(eff.values))
         _print_supply_demand_stats(df_gwl, gwl_label, share_re)
+    _print_swbd_region_counts({"1.5°C": df_gwl15, "2°C": df_gwl2, "3°C": df_gwl3},
+                              share_re)
     vmax_days = (max(1.0, np.ceil(np.nanpercentile(np.concatenate(abs_vals), 95)))
                  if abs_vals else 1.0)
     cmap = plt.get_cmap("RdYlGn_r")
