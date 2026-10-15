@@ -1,22 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Solar capacity factor via the PVGIS PV performance model -- a
-relative-efficiency polynomial (k1-k7) driven by normalized irradiance and
-module temperature, plus the Faiman module-temperature model (u0, u1) --
-instead of the NOCT/Huld cell-temperature model (c_1..c_4) used in
-`2.1 calculate_epp_GCM_clean.py`. Source:
+Solar capacity factor from the PVGIS PV performance model: a relative-
+efficiency polynomial (k1-k7) of normalized irradiance and module
+temperature, with the Faiman module-temperature model (u0, u1). Source:
 https://joint-research-centre.ec.europa.eu/photovoltaic-geographical-information-system-pvgis/general-information/data-sources-calculation-methods_en
 
-The published PVGIS power equation is
-    P = (G/1000) * A * eff_nom * eff_rel(G', T'm)
-`A` (module area) and `eff_nom` (nominal STC efficiency) are module-scale
-constants unrelated to weather variability, so they are dropped here -- the
-capacity factor (P / P_stc) is just (G/1000) * eff_rel(G', T'm).
-
-Trimmed down from the sibling como24_group5/code_review project's
-calculate_wind_solar_cf.py to just the solar piece calculate_cf.py uses --
-that file's wind (WindConfig/compute_wind_cf) and raw-ERA5-loading drivers
-belong to a separate validation pipeline and aren't needed here.
+PVGIS gives P = (G/1000) * A * eff_nom * eff_rel(G', T'm); module area A and
+nominal efficiency eff_nom are constants, so the capacity factor is
+(G/1000) * eff_rel(G', T'm).
 """
 from dataclasses import dataclass
 
@@ -37,20 +28,13 @@ class PVGISCoefficients:
         eff_rel(G', T'm) = 1 + k1*ln(G') + k2*ln(G')**2 + k3*T'm
                               + k4*T'm*ln(G') + k5*T'm*ln(G')**2 + k6*T'm**2
 
-    Only k1-k6 are used by the coefficient sets currently published by
-    PVGIS. k7 is exposed (as an optional ln(G')**3 term, see
-    compute_solar_cf) purely so a user-supplied 7-parameter coefficient set
-    can be plugged in; it defaults to 0, which reduces to the standard
-    PVGIS formula above.
+    k7 (optional ln(G')**3 term, default 0) only allows 7-parameter sets;
+    published PVGIS sets use k1-k6.
 
-    eff_rel is a polynomial fit over PVGIS's normal operating range of G'
-    (roughly 0.03-1.2); it is not valid as G' -> 0. The ln(G')**2 / T'*ln(G')**2
-    terms diverge there, and since k1/k2/k5 vary a lot by technology (e.g.
-    cdte's |k1|,|k2| are ~3x csi's), that divergence shows up as large,
-    technology-dependent spurious capacity factors -- worst at high
-    latitude, where many days have a tiny but nonzero daily-mean irradiance
-    (long dawn/dusk, near-polar-night) instead of a clean zero. g_min_wm2
-    floors this the same way wind speeds below cut-in are floored to 0.
+    The polynomial is fitted for G' ~ 0.03-1.2 and diverges as G' -> 0
+    (spurious CFs at high latitude, where daily-mean irradiance is often tiny
+    but nonzero), so irradiance below g_min_wm2 gives CF = 0, like wind
+    below cut-in.
     """
     k1: float = 0.0
     k2: float = 0.0
@@ -90,15 +74,9 @@ PVGIS_U_PRESETS = {
 
 
 def make_pvgis_coefficients(k_preset="csi_current", u_preset="csi_free", **overrides):
-    """
-    Build a PVGISCoefficients instance from a named k_preset (efficiency
-    polynomial) and u_preset (Faiman module-temperature model). The two are
-    independent -- mix and match technology/mounting freely -- and any field,
-    including k7, can be overridden, e.g.:
-
-        make_pvgis_coefficients("cdte", "cdte_roof")
-        make_pvgis_coefficients("csi_current", "csi_free", k7=1.2e-4)
-    """
+    """PVGISCoefficients from a k_preset (efficiency) and an independent u_preset
+    (module temperature); any field can be overridden, e.g.
+    make_pvgis_coefficients("cdte", "cdte_roof")."""
     if k_preset not in PVGIS_K_PRESETS:
         raise ValueError(f"Unknown k_preset {k_preset!r}. Options: {list(PVGIS_K_PRESETS)}")
     if u_preset not in PVGIS_U_PRESETS:
@@ -113,21 +91,9 @@ DEFAULT_PVGIS_COEFFICIENTS = make_pvgis_coefficients()
 
 def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_COEFFICIENTS,
                       valid_mask=None):
-    """
-    Solar (PV) capacity factor (dimensionless, ~0-1) using the PVGIS
-    relative-efficiency + Faiman module-temperature model.
-
-    tas     : air temperature (degC)
-    rsds    : surface irradiance (W/m2)
-    sfcwind : wind speed at module height (m/s)
-    valid_mask : optional boolean DataArray/array, broadcastable against the
-        output. Pixels where it is False are forced to NaN in the output
-        regardless of tas/rsds/sfcwind -- use build_valid_mask to derive one
-        from the bias-correction reference's own coverage (e.g. ERA5-Land
-        ssrd is ocean-masked and can be too sparse near some coastlines --
-        see ERA5_REF_ISSUE.md) so those pixels are excluded here rather than
-        silently bias-corrected against inadequate reference data.
-    """
+    """Solar capacity factor (~0-1) from tas (degC), rsds (W/m2) and sfcwind
+    (m/s). Pixels where the optional valid_mask is False are set to NaN (see
+    build_valid_mask)."""
     finite_inputs = np.isfinite(tas) & np.isfinite(rsds) & np.isfinite(sfcwind)
     above_floor = finite_inputs & (rsds > cfg.g_min_wm2)
     G = xr.where(above_floor, rsds, 0.0)
@@ -147,42 +113,22 @@ def compute_solar_cf(tas, rsds, sfcwind, cfg: PVGISCoefficients = DEFAULT_PVGIS_
               + cfg.k6 * T_prime**2
               + cfg.k7 * ln_G**3)
 
-    # Below g_min_wm2, eff_rel is extrapolating the log-polynomial outside
-    # its fitted range and can diverge (see PVGISCoefficients docstring) --
-    # treat those steps as producing 0, same as a below-cut-in wind day.
-    cf = xr.where(above_floor, G_prime * eff_rel, 0.0)
-    # A NaN input (e.g. a bias-adjusted pixel with no usable reference) must
-    # not fall through the above_floor=False branch and get silently zeroed
-    # -- that would fabricate a "0 capacity factor" reading instead of
-    # flagging the pixel as missing.
-    cf = xr.where(finite_inputs, cf, np.nan)
+    cf = xr.where(above_floor, G_prime * eff_rel, 0.0)  # 0 below g_min_wm2
+    # NaN inputs stay NaN rather than becoming 0.
+    cf =xr.where(finite_inputs, cf, np.nan)
     if valid_mask is not None:
         cf = xr.where(valid_mask, cf, np.nan)
     return cf
 
 
 def build_valid_mask(reference, buffer_cells=1):
-    """
-    Boolean validity mask (True = usable), derived from a reference
-    DataArray with lat/lon dims by treating non-finite cells as unusable and
-    then eroding by `buffer_cells` so pixels *adjacent* to a bad reference
-    cell are excluded too, not just the bad cell itself -- guards against
-    borderline pixels whose reference neighborhood is only partially
-    supported (see the lat=68.37N ERA5-Land coastal/offshore gap this was
-    written for).
-
-    reference     : DataArray with 'lat'/'lon' dims (e.g. the regridded
-                    ERA5 ssrd used as the bias-correction reference).
-    buffer_cells  : erosion radius in grid cells; 0 disables the buffer and
-                    just masks non-finite cells directly.
-    """
+    """True where `reference` (lat, lon) is finite, eroded by `buffer_cells` so
+    neighbours of invalid cells (e.g. coastal ERA5-Land gaps) are excluded
+    too."""
     valid = np.isfinite(reference)
     if buffer_cells > 0:
         window = 2 * buffer_cells + 1
-        # .construct() gives an explicit (lat, lon, lat_win, lon_win) view,
-        # NaN-padded at the domain edges; .min() over the window dims is
-        # then False (0) if the window is incomplete (edge) or contains any
-        # False cell, and NaN never survives thanks to fillna(0) below.
+        # Window minimum: False if any cell is invalid or at the domain edge.
         windowed = valid.rolling(lat=window, lon=window, center=True).construct(
             lat="lat_win", lon="lon_win")
         valid = windowed.min(dim=("lat_win", "lon_win")).fillna(0).astype(bool)

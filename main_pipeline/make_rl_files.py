@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Residual-load (SWBD) CSVs for the country/region-aggregated pipeline
-(previously STEP 1 of main_figs/fig45.py).
+Residual-load (SWBD) CSVs per region.
 
 For every GCM/run with aggregated wcf/scf/tas_pop files (calculate_cf.py's
 aggregate_ds_cf), computes the cumulative residual load above its reference
@@ -19,7 +18,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 
 import argparse
 import glob
@@ -81,9 +80,10 @@ DEMAND_CONFIGS = {
 # CORE RL COMPUTATION  (unchanged)
 # =============================================================================
 
-def _calculate_rl(tas, ds_cf, ds_cf_mean, thr, period, tot_re,
-                  threshold=None, demand_bas=None,
-                  demand_cfg: DemandConfig = None, return_daily=False):
+def _daily_rl(tas, ds_cf, ds_cf_mean, period, tot_re,
+              demand_bas=None, demand_cfg: DemandConfig = None):
+    """Daily residual load (demand - tot_re * ds_cf) over `period`'s months.
+    Returns (rl, demand_bas); demand_bas is derived from ds_cf_mean if None."""
     if demand_cfg is None:
         demand_cfg = DEFAULT_DEMAND
     demand_temp = xr.where(
@@ -100,15 +100,20 @@ def _calculate_rl(tas, ds_cf, ds_cf_mean, thr, period, tot_re,
     months = {"Annual": range(1, 13), "JJA": [6, 7, 8], "DJF": [12, 1, 2]}[period]
     rl = (demand - tot_re * ds_cf).sel(
         time=(demand - tot_re * ds_cf)["time.month"].isin(months))
+    return rl, demand_bas
+
+
+def _calculate_rl(tas, ds_cf, ds_cf_mean, thr, period, tot_re,
+                  threshold=None, demand_bas=None,
+                  demand_cfg: DemandConfig = None, return_daily=False):
+    rl, demand_bas = _daily_rl(tas, ds_cf, ds_cf_mean, period, tot_re,
+                               demand_bas=demand_bas, demand_cfg=demand_cfg)
     if threshold is None:
         threshold = rl.quantile(thr, dim="time")
     exceeds = rl > threshold
     cum_rl = xr.where(exceeds, rl - threshold, 0.0).sum(dim="time")
     if return_daily:
-        # Day-level SWBD exceedance field, kept only for callers that need
-        # individual-event duration (e.g. suppfig6_duration_distribution_swed_swbd.py)
-        # -- cum_rl above already discards this by summing over time, which
-        # is all every other caller in this module has ever needed.
+        # Daily exceedance field, for event durations (ED Fig. 6).
         return cum_rl, threshold, demand_bas, exceeds.astype(int)
     return cum_rl, threshold, demand_bas
 

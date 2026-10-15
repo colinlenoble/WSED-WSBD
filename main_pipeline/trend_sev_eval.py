@@ -1,10 +1,17 @@
 # -*- coding: cp1252 -*-
+"""GCM vs ERA5 trend evaluation of annual SWED severity (Fig. 2, agreement masks).
+
+Trend mean/CI come from a stationary block bootstrap (Politis & Romano) of
+the OLS slope: mean = mean of the bootstrap slopes, CI = 2.5/97.5th
+percentiles. GCM fields are regridded (nearest neighbour) onto the
+reanalysis grid only to line cells up; no downscaling is done here.
+"""
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 
 import glob
@@ -17,42 +24,7 @@ from rasterio.features import geometry_mask
 import geopandas as gpd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py /
-# make_grid_files.py (prefers a .zarr store when present, falls back to
-# .nc) -- calculate_cf.py's calculate_ds_cf_GCM writes wcf_day_*/scf_day_*
-# as Zarr, so a plain glob('*.nc') + xr.open_dataset never finds them.
 from io_utils import match_files, glob_any, open_dataset_any
-
-
-# ---------------------------------------------------------------------------
-# Note: how "mean" and "confidence interval" are computed, and whether GCMs
-# are downscaled/upscaled
-#
-# Every trend mean/CI in this file (low_trend/up_trend/mean_trend,
-# slope_ci_low/up/mean) comes from a stationary bootstrap (Politis & Romano)
-# of the OLS slope of the annual severity series, not from an analytical
-# formula:
-#   1. The ~40-year annual series is resampled n_boot times (1000-2000
-#      reps) using randomly-sized blocks (mean length = block_size years,
-#      default 5) instead of single years, so year-to-year autocorrelation
-#      is preserved in the resampled series.
-#   2. An OLS slope is fit on each resampled replicate.
-#   3. mean_trend = plain mean of the n_boot bootstrap slopes; low/up_trend
-#      = the 2.5th/97.5th percentiles of that same distribution (a
-#      percentile-bootstrap 95% CI, not mean +/- k*std).
-# See _stationary_bootstrap_slopes / stationary_bootstrap_ci_grid.
-#
-# GCM data is NOT downscaled here -- there is no bias correction and no
-# statistical/dynamical downscaling anywhere in this file. Every
-# GCM/realization is regridded with plain nearest-neighbor interpolation
-# (xesmf, method='nearest_s2d') onto the reanalysis's own grid (ERA5
-# regridded to the W5E5 0.5 deg grid -- see config.REANALYSIS and
-# _target_grid()). Most CMIP6 GCMs are natively coarser than 0.5 deg, so in
-# practice this step mostly *upscales* (nearest-neighbor-interpolates onto
-# a finer grid) rather than downscales GCM fields -- it only relocates
-# values onto the shared grid so GCM and reanalysis cells line up for
-# comparison/averaging; it adds no genuine sub-grid information.
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +43,7 @@ def rasterize_shapefile(shapefile, shape, transform):
 
 
 def _land_mask(grid_coords, shapefile_path):
-    """(lat, lon) boolean land mask on `grid_coords` (True = land), rasterized from
-    the country/admin shapefile -- same rasterization preprocess_ref_boot() uses."""
+    """(lat, lon) boolean land mask on `grid_coords` from the shapefile."""
     shapefile = gpd.read_file(shapefile_path)
     transform = rasterio.transform.from_bounds(
         grid_coords.lon.min().item(), grid_coords.lat.min().item(),
@@ -87,14 +58,7 @@ def _land_mask(grid_coords, shapefile_path):
 
 
 def _parse_exclude_gcm_run(exclude_gcm_run):
-    """
-    'GCM:run' strings -> a {(GCM, run), ...} set, same convention as
-    fig3.py's --exclude_gcm_run. None defaults to config.EXCLUDE_GCM_RUN
-    (e.g. 'EC-Earth3-Veg-LR:r3i1p1f1', whose rsds file under
-    preprocessed_gwl1_aligned/ is truncated to 365 days instead of the
-    expected 7305 -- a data bug, not a borderline trend, confirmed by
-    inspecting that run's raw GWL1 input files directly).
-    """
+    """'GCM:run' strings -> {(GCM, run)} set; None means config.EXCLUDE_GCM_RUN."""
     if exclude_gcm_run is None:
         exclude_gcm_run = config.EXCLUDE_GCM_RUN
     return set(tuple(x.split(':')) for x in exclude_gcm_run)
@@ -108,12 +72,7 @@ def _pos_quantile(da, q):
 
 
 def _target_grid(preprocessed_path, reanalysis):
-    """
-    Common regrid target: the reanalysis's own daily wcf record
-    (wcf_day_{reanalysis}_historical_reanalysis_..., written by
-    calculate_cf.calculate_ds_cf_reanalysis), same target grid
-    make_grid_files.py regrids every GCM/realization onto.
-    """
+    """Common regrid target: the reanalysis wcf_day_* grid (as in make_grid_files.py)."""
     files, _ = match_files(os.path.join(preprocessed_path, reanalysis, 'wcf_day*'))
     if not files:
         raise FileNotFoundError(
@@ -123,11 +82,8 @@ def _target_grid(preprocessed_path, reanalysis):
 
 
 # ---------------------------------------------------------------------------
-# Severity (sev) components: sev = intensity * duration * frequency
-# (mirrors calculate_cf.py's _compound_indices / make_grid_files.py's
-# compute_severity+duration_xr exactly: <= threshold comparison, so a day
-# exactly at the threshold is treated the same way here as by the
-# compound-day flag itself and by every other script in the pipeline).
+# Severity: sev = intensity * duration * frequency (same <= threshold
+# convention as make_grid_files.py)
 # ---------------------------------------------------------------------------
 
 def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
@@ -140,11 +96,7 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
 
 
 def duration_xr(da):
-    """
-    Compute mean event duration and event frequency per (year, lat, lon).
-
-    Returns ds (mean duration), ds_freq (event count).
-    """
+    """Mean event duration and number of events per (year, lat, lon)."""
     da = da.convert_calendar('standard')
     da = da.sortby('lat').sortby('lon')
     da['lat'] = da['lat'].astype(float)
@@ -205,15 +157,7 @@ def duration_xr(da):
 
 
 def duration_xr_by_poly(da):
-    """
-    Same event-duration/frequency algorithm as duration_xr(), but for data
-    aggregated onto administrative polygons (a single 'poly_idx' spatial dim,
-    as produced by calculate_cf.py's wcf_agg_*/scf_agg_* files) instead of a
-    (lat, lon) grid -- used by the aggregated trend-evaluation pipeline below
-    (preprocess_single_sev_agg/_build_ref_severity_agg), which redoes the
-    trend from each polygon's own aggregated wcf/scf series rather than from
-    a per-pixel grid.
-    """
+    """duration_xr() for region-aggregated data (single 'poly_idx' dim)."""
     da = da.convert_calendar('standard')
 
     first_time = pd.Timestamp(da.time[0].values)
@@ -268,28 +212,14 @@ def duration_xr_by_poly(da):
 
 
 # ---------------------------------------------------------------------------
-# Reference period (reanalysis-based): one sev series per GCM's own grid +
-# GWL0-61 threshold (same per-model threshold every other GWL is scored
-# against), regridded onto the common reanalysis target grid -- mirrors
-# make_grid_files.py's load_gridded_data_compound reference branch.
-#
-# grid_ic_ref.nc (built by make_grid_ref_trend_ci below) holds the
-# observed-side analog of uncertainty_range()'s per-GCM
-# agg_ic_ann_sev_GCMs_all_year_*.nc: the ERA5 severity trend's bootstrap CI
-# (low_trend/up_trend/mean_trend) at *every grid cell*, used to check
-# whether a GCM's projected per-cell trend CI overlaps the observed one
-# (the fig2 map panel). This is distinct from preprocess_ref_boot()'s
-# slopes_ic_ref_region_*.nc, which is the same ERA5 reference trend but
-# bootstrapped from *regional-mean* series for the joyplot panels.
+# Reference (ERA5) severity: ERA5 on each GCM's grid, with that GCM's GWL0-61
+# thresholds, regridded to the common grid. grid_ic_ref.nc holds its
+# per-cell bootstrap trend CI, compared with each GCM's CI (Fig. 2 map).
 # ---------------------------------------------------------------------------
 
 def _build_ref_severity_grid(preprocessed_path, GCM, run, reanalysis, grid_coords):
-    """
-    One GCM-threshold's ERA5-based reference-period severity, regridded onto
-    `grid_coords`. Shared by both reference pipelines below (per-cell grid
-    and per-region series) so the recipe -- per-model GWL0-61 threshold,
-    compound flag, severity, regrid -- is defined once.
-    """
+    """ERA5 reference-period severity with one GCM's GWL0-61 thresholds,
+    regridded onto `grid_coords`."""
     wcf_gwl061_files, _ = match_files(
         os.path.join(preprocessed_path, GCM, f'wcf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
     scf_gwl061_files, _ = match_files(
@@ -322,12 +252,7 @@ def _build_ref_severity_grid(preprocessed_path, GCM, run, reanalysis, grid_coord
     intensity_ref = intensity_ref.rename({'time': 'year'})
 
     ds_dur, ds_freq = duration_xr(compound_ref.start_cooc)
-    # duration_xr's groupby-based output only carries (year, lat, lon)
-    # combinations that had at least one compound-event day, so a year
-    # with zero events anywhere is entirely absent from its 'year'
-    # coordinate -- reindex onto intensity_ref's full (always-complete,
-    # one row per calendar year from resample) year/lat/lon grid and
-    # fill those zero-event years with 0 rather than leaving them NaN.
+    # Years without any event are missing from duration_xr's output: fill with 0.
     ds_dur  = ds_dur.reindex_like(intensity_ref, fill_value=0)
     ds_freq = ds_freq.reindex_like(intensity_ref, fill_value=0)
 
@@ -343,29 +268,12 @@ def _ref_realization_grid(args):
 
 
 def make_grid_ref_trend_ci(preprocessed_path, out_dir, reanalysis=None, max_workers=4, boot_batch=100):
-    """
-    Per-grid-cell bootstrap trend CI of the ERA5 reference severity
-    (-> grid_ic_ref.nc: low_trend/up_trend/mean_trend at every lat/lon).
+    """Per-cell bootstrap trend CI of the ERA5 reference severity, averaged
+    over the GCM-threshold realizations -> grid_ic_ref.nc.
 
-    Streams each GCM-threshold realization's full grid into a running
-    per-cell sum/count instead of building a (realization, year, lat, lon)
-    stack of every realization and writing *that* to disk first (the old
-    make_annual_freq_ref -> grid_ref_annual_sev_*.nc -> preprocess_ref
-    path) -- holding every realization's full grid in memory at once was
-    the actual OOM cause. Here at most a couple of full grids (the running
-    sum/count plus whichever realization just finished) are ever alive
-    regardless of how many realizations there are. A running sum/count
-    (rather than a running mean) keeps the accumulation nan-safe: a cell
-    that's NaN in one realization (e.g. a differing land/no-data edge) but
-    finite in others still gets averaged over only the realizations where
-    it's finite, exactly like a plain nanmean over 'realization' would.
-
-    Each realization's regrid is independent of the others, so the work is
-    distributed across `max_workers` processes. `boot_batch` bounds the
-    per-cell bootstrap's memory the same way it does in
-    stationary_bootstrap_ci_grid (see its docstring) -- lower it if this
-    step itself runs out of memory on the composite grid.
-    """
+    Realizations are accumulated as a running NaN-safe sum/count (holding
+    them all in memory caused OOM) and computed over `max_workers`
+    processes. Lower `boot_batch` if the bootstrap runs out of memory."""
     reanalysis = reanalysis or config.REANALYSIS
     grid = _target_grid(preprocessed_path, reanalysis)
     grid_coords = xr.Dataset(coords={'lat': grid.lat.values, 'lon': grid.lon.values})
@@ -404,17 +312,9 @@ def make_grid_ref_trend_ci(preprocessed_path, out_dir, reanalysis=None, max_work
 
 
 def _severity_from_cf(wcf_gwl061, scf_gwl061, wcf_gwl1, scf_gwl1, duration_fn=duration_xr):
-    """
-    Shared severity-trend-input builder: per-model GWL0-61 threshold ->
-    compound flag -> severity -> 40-year concatenated series. Factored out of
-    preprocess_single_sev() so the exact same recipe can be reused on
-    spatially pre-aggregated wcf/scf (preprocess_single_sev_agg(), which
-    redoes this from wcf_agg_*/scf_agg_* polygon-mean series instead of the
-    full grid) -- `duration_fn` is the only piece that differs between the two
-    (duration_xr's (lat, lon) grid vs. duration_xr_by_poly's single poly_idx
-    dim), everything else (threshold, compound flag, severity, 40-year
-    concatenation) is identical code either way.
-    """
+    """GWL0-61 thresholds -> compound days -> annual severity, GWL0-61 and GWL1
+    concatenated into a 40-year series. duration_fn handles gridded
+    (duration_xr) or region-aggregated (duration_xr_by_poly) data."""
     wcf_thr = _pos_quantile(wcf_gwl061.wcf, 0.1)
     scf_thr = _pos_quantile(scf_gwl061.scf, 0.1)
 
@@ -447,12 +347,7 @@ def _severity_from_cf(wcf_gwl061, scf_gwl061, wcf_gwl1, scf_gwl1, duration_fn=du
     dur_gwl061, freq_gwl061 = duration_fn(compound_gwl061.compound)
     dur_gwl1,   freq_gwl1   = duration_fn(compound_gwl1.compound)
 
-    # duration_fn's groupby-based output only carries (year, ...) combinations
-    # that had at least one compound-event day, so a year with zero events
-    # anywhere is entirely absent from its 'year' coordinate -- reindex onto
-    # intensity's full (always-complete, one row per calendar year from
-    # resample) year/spatial grid and fill those zero-event years with 0
-    # rather than leaving them NaN.
+    # Years without any event are missing from duration_fn's output: fill with 0.
     dur_gwl061  = dur_gwl061.reindex_like(intensity_gwl061, fill_value=0)
     dur_gwl1    = dur_gwl1.reindex_like(intensity_gwl1, fill_value=0)
     freq_gwl061 = freq_gwl061.reindex_like(intensity_gwl061, fill_value=0)
@@ -470,11 +365,8 @@ def _severity_from_cf(wcf_gwl061, scf_gwl061, wcf_gwl1, scf_gwl1, duration_fn=du
 
 
 def preprocess_single_sev(preprocessed_path, GCM, run, reanalysis=None):
-    """
-    Concatenate GWL0-61 and GWL1 sev into a single 40-year series for trend
-    estimation (the "40-year window whose first 20 years were centered on
-    GWL0.61" described in the trend-evaluation Methods).
-    """
+    """40-year gridded severity series (GWL0-61 then GWL1) of one realization,
+    for trend estimation (see Methods)."""
     reanalysis = reanalysis or config.REANALYSIS
 
     def _load(var, gwl):
@@ -494,43 +386,15 @@ def preprocess_single_sev(preprocessed_path, GCM, run, reanalysis=None):
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap trend estimation -- vectorized.
-#
-# The original implementation ran, per grid cell, a Python `for b in
-# range(n_boot)` loop that itself built each stationary-bootstrap index
-# sequence with a `while total < n` loop of np.random.geometric/randint
-# calls -- i.e. O(n_cells * n_boot) sequential Python-level steps (via
-# xr.apply_ufunc(..., vectorize=True), which is still a per-cell Python
-# loop under the hood).
-#
-# Below, index generation is vectorized across bootstrap replicates: the
-# stationary-bootstrap block structure only depends on n (number of years,
-# ~40 here) and block_size, not on the data, so one array of shape
-# (n_boot, n) is built with a loop over the n time steps (vectorized across
-# n_boot) instead of a loop over n_boot. The same index array is then used
-# to gather + fit *every* grid cell/series at once via array ops. This
-# turns the per-cell cost from O(n_boot) sequential Python iterations into
-# a handful of vectorized numpy calls shared across all cells, and drops
-# the total step count from O(n_cells * n_boot) to O(n_boot) (batched).
-#
-# Sharing bootstrap index sequences across grid cells does not bias any
-# single cell's CI (each cell is still resampled from its own values --
-# only the *pattern* of which years get picked together is shared instead
-# of independently redrawn per cell), it just avoids paying for
-# independent block draws at every one of possibly 10^5+ cells.
+# Bootstrap trend estimation (vectorized). The resampling indices depend only
+# on the series length, so one (n_boot, n_years) index array is shared by
+# all grid cells; each cell is still resampled from its own values.
 # ---------------------------------------------------------------------------
 
 def _stationary_bootstrap_indices(n, n_boot, block_size, rng):
-    """
-    Vectorized stationary-bootstrap (Politis & Romano) index sequences.
-
-    At each of the n time steps, every replicate either continues its
-    current block (previous position + 1, wrapped) or -- w.p. 1/block_size
-    -- starts a new block at a uniform random position. Loops over n (the
-    number of years) instead of n_boot, vectorized across all replicates.
-
-    Returns idx, shape (n_boot, n), int64.
-    """
+    """Stationary-bootstrap index sequences, shape (n_boot, n): each step
+    continues the current block or, with probability 1/block_size, starts a
+    new one at a random position."""
     p = 1.0 / float(block_size)
     idx = np.empty((n_boot, n), dtype=np.int64)
     idx[:, 0] = rng.integers(0, n, size=n_boot)
@@ -544,21 +408,9 @@ def _stationary_bootstrap_indices(n, n_boot, block_size, rng):
 
 
 def _slopes_from_indices(y, idx):
-    """
-    OLS slope of y[idx[b]] vs. idx[b] itself, for every bootstrap replicate
-    b at once -- matches the original implementation's `xb, yb =
-    np.arange(n)[idx], y[idx]` exactly: the regressor is the *actual*
-    resampled position of each point (so a duplicated/omitted block keeps
-    its true year label), not a fixed re-numbering of the resampled series.
-    Since the regressor depends on idx (not on which series/cell is being
-    fit), dx/denom are computed once per replicate and shared across every
-    cell for that replicate.
-
-    y   : (n,) or (n, n_series) array of values.
-    idx : (n_boot, n) index matrix from _stationary_bootstrap_indices.
-
-    Returns slopes, shape (n_boot,) if y is 1-D else (n_boot, n_series).
-    """
+    """OLS slope of y[idx[b]] against idx[b] (each point keeps its true year)
+    for every replicate b. y: (n,) or (n, n_series).
+    Returns (n_boot,) or (n_boot, n_series)."""
     xb = idx.astype(np.float64)                          # (n_boot, n)
     dx = xb - xb.mean(axis=1, keepdims=True)              # (n_boot, n)
     denom = np.sum(dx * dx, axis=1)                       # (n_boot,)
@@ -577,10 +429,7 @@ def _slopes_from_indices(y, idx):
 
 
 def _stationary_bootstrap_slopes(y, n_boot=1000, block_size=5, ci=95, rng=None):
-    """
-    Stationary bootstrap distribution of the OLS slope of a single 1-D
-    series y. Returns (low_ci, up_ci, mean, slopes_array).
-    """
+    """Bootstrap OLS slope of a 1-D series: (low_ci, up_ci, mean, slopes)."""
     y = np.asarray(y, dtype=np.float64)
     nan_result = np.nan, np.nan, np.nan, np.full(n_boot, np.nan)
 
@@ -600,18 +449,8 @@ def _stationary_bootstrap_slopes(y, n_boot=1000, block_size=5, ci=95, rng=None):
 
 def stationary_bootstrap_ci_grid(da, n_boot=1000, block_size=5, ci=95,
                                  boot_batch=200, rng=None):
-    """
-    Stationary-bootstrap trend CI at every point of `da` (must have a
-    'year' dim, plus any number of other dims, e.g. lat/lon).
-
-    boot_batch caps how many bootstrap replicates are gathered at once
-    (the gathered array is boot_batch * n_years * n_cells floats) to bound
-    memory; batching only changes how the RNG stream is drawn from (not
-    the resulting CI's statistical properties), so results are equivalent
-    to -- not bit-identical to -- a single boot_batch=n_boot pass. Replaces
-    the old per-pixel xr.apply_ufunc(..., vectorize=True) + Python double
-    loop.
-    """
+    """Bootstrap trend CI (low, up, mean) at every point of `da` (needs a 'year'
+    dim). boot_batch replicates are processed at a time to bound memory."""
     if "year" not in da.dims:
         raise ValueError("Input DataArray must have a 'year' dimension.")
     rng = rng if rng is not None else np.random.default_rng()
@@ -705,10 +544,7 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None, 
                 .sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
                 .mean(dim=['lat', 'lon'])
             )
-            # Only the summary (low/up/mean) is kept -- the full 2000-sample
-            # bootstrap distribution is computed (needed for the percentile
-            # CI) but not written to disk, to keep this file small across
-            # 32 realizations x 4 regions.
+            # Only the CI summary is saved, not the 2000 bootstrap slopes.
             low, up, mean, _ = _stationary_bootstrap_slopes(
                 sev_region.values, n_boot=2000, block_size=5, ci=95
             )
@@ -731,15 +567,8 @@ def slopes_samples(preprocessed_path, out_dir, shapefile_path, reanalysis=None, 
 
 
 def _ref_realization_regional_series(args):
-    """
-    Worker: build one GCM-threshold's ERA5-based reference severity grid via
-    _build_ref_severity_grid, then immediately reduce it to a masked
-    per-region annual time series and discard the (year, lat, lon) grid --
-    only a handful of small 1-D arrays per GCM/region ever have to leave
-    this worker process.
-
-    Returns (GCM, run, years, {region_name: values}).
-    """
+    """Worker: one GCM-threshold's reference severity reduced to land-masked
+    regional annual series. Returns (GCM, run, years, {region: values})."""
     preprocessed_path, GCM, run, reanalysis, grid_coords, mask, regions = args
 
     sev_ref = _build_ref_severity_grid(preprocessed_path, GCM, run, reanalysis, grid_coords)
@@ -757,31 +586,10 @@ def _ref_realization_regional_series(args):
 
 
 def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=None, max_workers=4):
-    """
-    Bootstrap trend CI of the ERA5 reference severity, per region.
-
-    Streams straight from each GCM-threshold's own reference-period severity
-    grid to a masked regional-mean annual series, rather than ever building
-    a (realization, year, lat, lon) grid for every GCM at once (the way
-    make_grid_ref_trend_ci's per-cell CI needs to, and the way this used to
-    -- via a since-removed grid_ref_annual_sev_*.nc intermediate -- before
-    being rewritten to run out of memory less). Each realization's grid is
-    reduced to a handful of per-region 1-D series and discarded immediately.
-
-    make_grid_ref_trend_ci() averages across GCM-threshold realizations
-    *before* its per-cell trend fit; here that order is flipped (regional
-    mean first, then averaged across realizations below), which gives the
-    same composite regional series since both steps are plain means over
-    disjoint axes (grid cells vs. realizations) and so commute -- but
-    flipping the order is exactly what lets each realization be reduced to
-    a few numbers immediately instead of needing every realization's full
-    grid in memory at once.
-
-    Each realization's grid+regrid work is independent of every other's, so
-    it is embarrassingly parallel across GCMs -- distributed across
-    `max_workers` processes (keep this modest; each worker still holds one
-    GCM's full grid transiently during regridding).
-    """
+    """Bootstrap trend CI of the ERA5 reference severity per region (Fig. 2
+    joyplots): regional means per realization, averaged across realizations
+    (same as averaging grids first, since the means commute), in parallel
+    over `max_workers` processes."""
     reanalysis = reanalysis or config.REANALYSIS
     grid = _target_grid(preprocessed_path, reanalysis)
     grid_coords = xr.Dataset(coords={'lat': grid.lat.values, 'lon': grid.lon.values})
@@ -817,9 +625,6 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
 
     ds_final = []
     for r in regions:
-        # Average across GCM-threshold realizations (see docstring) --
-        # equivalent to averaging the full grid across realizations first,
-        # but computed from the already-tiny per-region series.
         composite = np.nanmean(np.stack(region_series[r["name"]], axis=0), axis=0)
         low, up, mean, _ = _stationary_bootstrap_slopes(
             composite, n_boot=2000, block_size=5, ci=95
@@ -839,29 +644,13 @@ def preprocess_ref_boot(preprocessed_path, out_dir, shapefile_path, reanalysis=N
 
 
 # ---------------------------------------------------------------------------
-# Aggregated-domain trend evaluation: "redo the trend" starting from wcf/scf
-# already spatially aggregated onto administrative polygons (wcf_agg_*/
-# scf_agg_*, one value per poly_idx -- produced by calculate_cf.py and
-# consumed elsewhere by make_rl_files.py's RL pipeline), instead of the full (lat,
-# lon) grid every function above works on. The compound flag/threshold/
-# severity are computed straight from each polygon's own aggregated
-# capacity-factor series, not by spatially re-averaging an already-computed
-# per-pixel severity (that's what slopes_samples()/preprocess_ref_boot()
-# above already do, at the coarser 4-box REGIONS scale) -- so this is a
-# genuinely different number, closer to what fig45.py's polygon choropleths
-# actually plot. No xesmf regrid step is needed anywhere here: every
-# realization already shares the same poly_idx index (the one shapefile used
-# to build the _agg_ files, config.AGREEMENT_SUFFIX_SHP).
+# Region-aggregated trend evaluation: the same recipe computed from each
+# region's aggregated wcf/scf series (wcf_agg_*/scf_agg_*, dim poly_idx), as
+# used by fig45.py's regional maps. No regridding needed.
 # ---------------------------------------------------------------------------
 
 def _iter_gcm_runs_agg(preprocessed_path, ssp, reanalysis, suffix_shp, gwl):
-    """
-    Yield (GCM, run) for every wcf_agg_*_{gwl}_{reanalysis}_{suffix_shp}.nc
-    file under preprocessed_path. Parses filenames by locating `ssp` in the
-    underscore-split name (same approach as make_rl_files.py's _iter_gcm_runs) rather
-    than fixed negative indices, since GCM names may themselves contain
-    underscores.
-    """
+    """Yield (GCM, run) for every wcf_agg_*_{gwl}_{reanalysis}_{suffix_shp}.nc."""
     pattern = os.path.join(preprocessed_path, '*',
                            f'wcf_agg_*{gwl}_{reanalysis}_{suffix_shp}.nc')
     for fpath in sorted(glob.glob(pattern)):
@@ -876,12 +665,7 @@ def _iter_gcm_runs_agg(preprocessed_path, ssp, reanalysis, suffix_shp, gwl):
 
 
 def preprocess_single_sev_agg(preprocessed_path, GCM, run, reanalysis=None, suffix_shp=None):
-    """
-    Aggregated-domain twin of preprocess_single_sev(): identical severity/
-    duration/frequency/40-year-concatenation recipe (via _severity_from_cf()),
-    but starting from wcf_agg_*/scf_agg_* (poly_idx dim) instead of
-    wcf_day_*/scf_day_* (lat, lon).
-    """
+    """preprocess_single_sev() from region-aggregated wcf_agg_*/scf_agg_*."""
     reanalysis = reanalysis or config.REANALYSIS
     suffix_shp = suffix_shp or config.AGREEMENT_SUFFIX_SHP
 
@@ -903,13 +687,7 @@ def preprocess_single_sev_agg(preprocessed_path, GCM, run, reanalysis=None, suff
 
 
 def _build_ref_severity_agg(preprocessed_path, GCM, run, reanalysis, suffix_shp):
-    """
-    Aggregated-domain twin of _build_ref_severity_grid(): same recipe
-    (per-model GWL0-61 threshold applied to the ERA5-based reference period,
-    compound flag, severity) but on wcf_agg_ref_*/scf_agg_ref_* (poly_idx)
-    instead of wcf_ref_*/scf_ref_* (lat, lon) -- no regrid step, since every
-    realization already shares the same poly_idx index.
-    """
+    """_build_ref_severity_grid() from region-aggregated wcf/scf_agg_ref_*."""
     def _load(name):
         path = os.path.join(preprocessed_path, GCM, name)
         if not os.path.exists(path):
@@ -946,14 +724,8 @@ def _build_ref_severity_agg(preprocessed_path, GCM, run, reanalysis, suffix_shp)
 
 
 def make_ref_trend_ci_aggregated(preprocessed_path, out_dir, reanalysis=None, suffix_shp=None):
-    """
-    Aggregated-domain (per-polygon) twin of make_grid_ref_trend_ci(): the same
-    running-sum/count composite across GCM-threshold reference realizations,
-    then a bootstrap trend CI -- but over 'poly_idx' instead of the full
-    (lat, lon) grid, and with no per-realization regrid step.
-
-    -> grid_ic_ref_aggregated_{reanalysis}_{suffix_shp}.nc
-    """
+    """make_grid_ref_trend_ci() per region (poly_idx)
+    -> grid_ic_ref_aggregated_{reanalysis}_{suffix_shp}.nc"""
     reanalysis = reanalysis or config.REANALYSIS
     suffix_shp = suffix_shp or config.AGREEMENT_SUFFIX_SHP
 
@@ -983,14 +755,8 @@ def make_ref_trend_ci_aggregated(preprocessed_path, out_dir, reanalysis=None, su
 
 
 def uncertainty_range_aggregated(preprocessed_path, out_dir, reanalysis=None, exclude_gcm_run=None, suffix_shp=None):
-    """
-    Aggregated-domain twin of uncertainty_range(): per-GCM bootstrap trend CI
-    over administrative polygons (poly_idx), built from wcf_agg_*/scf_agg_*
-    instead of uncertainty_range()'s full-grid preprocess_single_sev(). No
-    regrid step: every realization already shares the same poly_idx index.
-
-    -> agg_ic_ann_sev_GCMs_aggregated_{reanalysis}_{suffix_shp}.nc
-    """
+    """uncertainty_range() per region (poly_idx)
+    -> agg_ic_ann_sev_GCMs_aggregated_{reanalysis}_{suffix_shp}.nc"""
     reanalysis = reanalysis or config.REANALYSIS
     suffix_shp = suffix_shp or config.AGREEMENT_SUFFIX_SHP
     exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
@@ -1016,33 +782,13 @@ def uncertainty_range_aggregated(preprocessed_path, out_dir, reanalysis=None, ex
 
 
 # ---------------------------------------------------------------------------
-# Model-agreement-with-ERA5 mask: for every grid cell / polygon, the % of GCM
-# realizations whose bootstrap trend CI [low_trend, up_trend] overlaps the
-# ERA5 reference's own CI -- the same overlap test as classify_gcm_trend_
-# agreement.py's pixel_agreement_pct()/the original trend_validation
-# notebook's `within` cell, formalized here as a percentage (not a raw
-# realization count) and saved directly, so fig3.py/fig45.py's existing
-# `<= config.AGREEMENT_THRESHOLD` hatching logic can consume it unchanged.
-# Dimension-agnostic: works for the per-pixel (lat, lon) files
-# (grid_ic_ref.nc / agg_ic_ann_sev_GCMs_all_year_*.nc) and for the aggregated
-# per-polygon files (grid_ic_ref_aggregated_*.nc /
-# agg_ic_ann_sev_GCMs_aggregated_*.nc) alike.
+# Model-agreement mask (per pixel or per region)
 # ---------------------------------------------------------------------------
 
 def build_agreement_mask(ref_path, gcm_path, out_path, exclude_gcm_run=None, shapefile_path=None):
-    """
-    Save agreement_pct = 100 * (fraction of GCM realizations at `gcm_path`
-    whose trend CI overlaps the ERA5 reference CI at `ref_path`), as a single
-    DataArray at `out_path` -- a cell/polygon "fails" validation (is hatched)
-    where fig3.py/fig45.py find agreement_pct < config.AGREEMENT_THRESHOLD
-    (50%, i.e. fewer than half the ensemble agrees with ERA5).
-
-    `shapefile_path` (per-pixel (lat, lon) files only): cells outside the
-    shapefile's land polygons are set to NaN. GCM and ERA5 severity fields are
-    both defined over the ocean, so without this the per-pixel mask also
-    covers the seas. The aggregated (poly_idx) mask needs no such step: it is
-    land-only by construction.
-    """
+    """Save agreement_pct: % of GCM realizations whose trend CI overlaps the ERA5
+    CI. Cells below config.AGREEMENT_THRESHOLD are flagged on the maps.
+    shapefile_path (gridded files only) sets ocean cells to NaN."""
     exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
     ds_ref = xr.open_dataset(ref_path)
     ds_gcm = xr.open_dataset(gcm_path)
@@ -1083,39 +829,31 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--era5-ref-only', action='store_true',
-        help="Only compute the ERA5 reference outputs (make_grid_ref_trend_ci -> grid_ic_ref.nc, "
-             "preprocess_ref_boot -> slopes_ic_ref_region_*.nc); skip the per-GCM "
-             "uncertainty_range/slopes_samples passes.",
+        help="Only compute the ERA5 reference outputs.",
     )
     parser.add_argument(
         '--max-workers', type=int, default=4,
-        help="Worker processes for the ERA5 reference steps' per-GCM regridding (default: 4).",
+        help="Worker processes for the ERA5 reference steps.",
     )
     parser.add_argument(
         '--exclude_gcm_run', nargs='+', default=config.EXCLUDE_GCM_RUN,
-        help="GCM:run pairs to exclude from uncertainty_range/slopes_samples, same convention "
-             "as fig3.py's flag of the same name (default: config.EXCLUDE_GCM_RUN).",
+        help="GCM:run pairs to exclude.",
     )
     parser.add_argument(
         '--aggregated', action='store_true',
-        help="Also run the aggregated-domain pipeline (uncertainty_range_aggregated + "
-             "make_ref_trend_ci_aggregated, on wcf_agg_*/scf_agg_* polygons) and build its "
-             "own agreement mask, in addition to the per-pixel one.",
+        help="Also run the region-aggregated pipeline and its agreement mask.",
     )
     parser.add_argument(
         '--suffix-shp', default=config.AGREEMENT_SUFFIX_SHP,
-        help="Shapefile-version suffix on wcf_agg_*/scf_agg_* files for --aggregated "
-             f"(default: {config.AGREEMENT_SUFFIX_SHP!r}).",
+        help="Shapefile-version suffix of the wcf_agg_*/scf_agg_* files.",
     )
     parser.add_argument(
         '--skip-mask', action='store_true',
-        help="Skip build_agreement_mask() (only compute the CI grids, not the derived mask).",
+        help="Skip building the agreement mask(s).",
     )
     parser.add_argument(
         '--mask-only', action='store_true',
-        help="Only rebuild the agreement mask(s) from the existing grid_ic_ref.nc / "
-             "agg_ic_ann_sev_GCMs_*.nc files in trend_evaluation/ (no CI recomputation). "
-             "Combine with --aggregated to also rebuild the per-polygon mask.",
+        help="Only rebuild the agreement mask(s) from existing CI files.",
     )
     args = parser.parse_args()
 

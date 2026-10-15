@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Extended Data Fig. 2: reference-period (ERA5) mean of the meteorological
-inputs, capacity factors and SWED indicators, six map panels (previously
-produced by fig1.py).
+inputs, capacity factors and SWED indicators, six map panels.
 
 Shares its data loading (ds_final, land mask, wcf-zero mask) and CLI with
 main_figs/fig1.py.
@@ -12,7 +11,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 
@@ -109,8 +108,7 @@ def plot_mean_variables_6panel(
     vmax_list = [36, 3,  0.05, 1, 0.5, 0.5, 0.25]
     panellabels = list(ascii_lowercase[:7])
 
-    # 2-column layout (4 rows), same width; height scales proportionally
-    # so each map panel is bigger than the previous 3-column layout
+    # 2-column layout
     fig_width_in  = FIG_WIDTH_IN
     fig_height_in = fig_width_in * 1.2
     fig, axes = plt.subplots(4, 2, figsize=(fig_width_in, fig_height_in), dpi=300,

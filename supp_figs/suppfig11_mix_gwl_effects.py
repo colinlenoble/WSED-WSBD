@@ -11,26 +11,18 @@ Extended Data Fig. 11: effect of the future renewable mix vs. effect of
 
 Two versions are written to <output_dir>/supp/:
   suppfig_mix_gwl_effects.png                 relative change (%)
-  suppfig_mix_gwl_effects_absolute_days.png   change normalized by each
-                                              region's baseline demand
-                                              (days of baseline demand),
-                                              same convention as fig45.py's
-                                              _mmm_absolute_days
+  suppfig_mix_gwl_effects_absolute_days.png   in days of baseline demand
 
-Inputs are the RL CSVs written by main_pipeline/make_rl_files.py (current
-mix: STEP 1a, future mix: STEP 1b), the
-renewable share CSV (current_ratio/future_ratio), the shapefile, and the
-aggregated model-agreement mask.
-
-Port of cell 11 of como24_group5/code_final/3.5 calculate_residual_load.ipynb
-(previously fig45.py's plot_supp_mix_effect).
+Inputs: the current- and future-mix RL CSVs written by
+main_pipeline/make_rl_files.py, the renewable share CSV, the shapefile and the
+regional model-agreement mask.
 """
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ["ESMFMKFILE"]       = config.ESMFMKFILE_XENV
 os.environ["MPLBACKEND"]       = "Agg"
@@ -119,13 +111,8 @@ def _mix_df_percent(df_gwl2_curr, df_gwl2_fut):
 
 
 def _mix_df_days(df_gwl2_curr, df_gwl2_fut):
-    """Change in days of baseline demand: each (GCM, run, poly_idx) row is
-    normalized by its own demand_bas first, then averaged over (GCM, run)
-    rows with the inverse-W2 polygon weights (same convention as fig45.py's
-    _mmm_absolute_days).
-    demand_bas is identical in the current and future CSVs (fig45's
-    _load_data always builds ds_cf_mean from the current share), so the
-    current one is used."""
+    """Mix and warming effects in days of baseline demand: each row divided by
+    its demand_bas (the same in both CSVs), then inverse-W2-weighted."""
     keys = ["poly_idx", "GCM", "run"]
     df_c = df_gwl2_curr[df_gwl2_curr["share_re"] == "current"][
         keys + ["cum_rl_ref", "cum_rl_gwl", "demand_bas"]]

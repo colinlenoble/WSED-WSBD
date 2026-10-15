@@ -3,7 +3,7 @@
 Extended Data Fig. 9: effect of the renewable share on SWBD changes.
 
 SWBD changes at each warming level for a 25/50/75 % renewable share, in days
-of baseline demand (previously fig45.py STEP 9). Reads the residual-load CSVs
+of baseline demand. Reads the residual-load CSVs
 written by main_pipeline/make_rl_files.py; map helpers come from
 main_figs/fig45.py.
 """
@@ -12,7 +12,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ["ESMFMKFILE"]       = config.ESMFMKFILE_XENV
 os.environ["MPLBACKEND"]       = "Agg"
@@ -37,11 +37,8 @@ from fig45 import (FIG_WIDTH_IN, PATHS, _draw_map, _mmm_absolute_days,
 
 def plot_re_share_effect_absolute(gwl_dfs_by_share, shapefile_path, hatch_df,
                                   output_dir, tag, dpi=300):
-    """Same 3x3 grid layout as plot_re_share_effect, but each panel plots the
-    absolute change in cumulative residual load (GWL - GWL0.61) normalized by
-    each region's non-thermosensitive baseline demand (_mmm_absolute_days),
-    so the anomaly reads in "days of baseline demand" instead of percent --
-    see plot_main_gwl_maps_absolute for the analogous main-figure twin."""
+    """3x3 maps (renewable share x GWL) of the SWBD change vs 0.61 degC, in days
+    of baseline demand."""
     TOT_RE_VALS   = [0.25, 0.5, 0.75]
     GWL_TITLES    = ["1.5°C", "2.0°C", "3.0°C"]
     PANEL_LETTERS = list("abcdefghi")

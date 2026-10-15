@@ -7,16 +7,16 @@ days of baseline demand.
 
 Reads the residual-load CSVs written by main_pipeline/make_rl_files.py (run it
 first). Ensemble means weight each (GCM, run) by 1/n_gcm times the inverse of
-its normalized Wasserstein trend distance to ERA5 at that polygon (needs
-config.WASSERSTEIN_AGGREGATED_NC_PATH; see w2_weighted_mean). The map / data helpers below are shared with the Extended Data scripts
-supp_figs/suppfig8, 9, 11, 12 and 13 and aux_code/extra_figs_fig45.py.
+its normalized Wasserstein trend distance to ERA5 in that region
+(config.WASSERSTEIN_AGGREGATED_NC_PATH). The map and data helpers are shared
+with supp_figs/suppfig8, 9, 11, 12 and 13.
 """
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ["ESMFMKFILE"]       = config.ESMFMKFILE_XENV
 os.environ["MPLBACKEND"]       = "Agg"
@@ -41,11 +41,7 @@ from matplotlib.patheffects import withStroke
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-# Black mask for low model agreement (obs.-projection trend discrepancy),
-# drawn in solid black on the aggregated polygon maps (see map_overlays.py).
 from map_overlays import draw_discrepancy_mask_polygons
-
-# Main-scenario constants and the run exclusions live with the RL computation.
 from make_rl_files import MAIN_THR, MAIN_TOT_RE, MAIN_MIX, EXCLUDED_RUNS
 
 
@@ -54,34 +50,16 @@ from make_rl_files import MAIN_THR, MAIN_TOT_RE, MAIN_MIX, EXCLUDED_RUNS
 # =============================================================================
 FIG_WIDTH_IN = 5.15   # single column width -- pt fontsizes match LaTeX
 
-# Latitude band shown on EqualEarth maps in this module (matches the
-# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
-# and 58S were excluded due to artifacts in the duration metric"). Applied
-# by masking data/shapefiles to this band and calling ax.set_global() --
-# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
-# it clips to the bounding rectangle of the extent box's own corners, whose
-# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
-# themselves, sitting well short of it at other latitudes -- slicing
-# through real land (e.g. eastern Australia) even though it's nominally
-# within +/-180 deg longitude.
+# Latitude band shown on maps (regions poleward of 68N/58S are excluded, see
+# Methods). Applied by masking + ax.set_global(): ax.set_extent() clips real
+# land on EqualEarth's curved meridians.
 MAP_LAT_SOUTH = -58
 MAP_LAT_NORTH = 68
 
 
 def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
-    """
-    White out everything poleward of [lat_south, lat_north] on a set_global()
-    EqualEarth map. Needed because cfeature.COASTLINE/ax.coastlines() draw
-    the *entire* globe's coastlines (Antarctica, remote Arctic islands)
-    regardless of how the data/shapefile were masked to this band, and
-    shp.cx[:, lat_south:lat_north] keeps whole country geometries (e.g.
-    Russia, Canada, Greenland) rather than clipping them at the band's edge
-    -- both leak real content poleward of the intended crop (see
-    MAP_LAT_SOUTH/NORTH above). Draws a white cap over each pole, in
-    PlateCarree and densely sampled in longitude so it follows the
-    projection's own curved boundary, on top of coastlines/boundaries but
-    below panel labels/region boxes (zorder 20+ elsewhere in this module).
-    """
+    """White caps poleward of [lat_south, lat_north], hiding coastlines and whole
+    country shapes drawn beyond the band (below labels, zorder 20+)."""
     lons = np.linspace(-180.0, 180.0, 361)
     for lat_edge, lat_pole in ((lat_south, -90.0), (lat_north, 90.0)):
         cap = Polygon(
@@ -122,7 +100,7 @@ DICT_LABELS = dict(zip(REGION_NAMES, REGION_LABELS))
 
 
 # =============================================================================
-# DATA WRANGLING  (unchanged)
+# DATA WRANGLING
 # =============================================================================
 
 def build_gwl_df(df_source, gwl_label):
@@ -158,21 +136,10 @@ def load_gwl_dfs(csv_path):
 
 
 def load_hatch_agg(agreement_nc, shapefile_path, agreement_threshold=None, agreement_aggregated_nc=None):
-    """
-    hatch_df/idxs_hatch: which shapefile polygons get hatched for low model
-    agreement with ERA5's observed trend (agreement_pct < agreement_threshold,
-    default config.AGREEMENT_THRESHOLD -- 50%% of models with an overlapping
-    trend CI, see trend_sev_eval.py's build_agreement_mask()).
-
-    `agreement_aggregated_nc` (recommended -- config.AGREEMENT_AGGREGATED_NC_PATH)
-    is a poly_idx-native agreement_pct DataArray built by trend_sev_eval.py's
-    aggregated pipeline (uncertainty_range_aggregated/make_ref_trend_ci_aggregated/
-    build_agreement_mask) straight from each polygon's own aggregated wcf/scf
-    trend, one value per polygon already -- pass it (once generated) to use
-    that directly instead of the `agreement_nc` fallback below, which
-    approximates a polygon score by area-weighting the *pixel*-level mask
-    onto the shapefile via xagg.
-    """
+    """(hatch_df, idxs_hatch): regional agreement_pct and the poly_idx at or
+    below agreement_threshold. Uses the per-region mask
+    (agreement_aggregated_nc) if present, else area-averages the per-pixel
+    mask onto the regions."""
     agreement_threshold = config.AGREEMENT_THRESHOLD if agreement_threshold is None else agreement_threshold
 
     if agreement_aggregated_nc is not None and os.path.exists(agreement_aggregated_nc):
@@ -206,12 +173,7 @@ def _make_cmap(vmin=-100, vmax=800):
 
 def _draw_map(ax, gdf, value_col, cmap, norm, hatch_df,
               title, panel_letter, density=7, title_fontsize=8):
-    # Restrict to the analysis's latitude band here (rather than trusting
-    # every caller to have already done so) -- this is the single chokepoint
-    # all _draw_map() callers go through, and set_extent() below has been
-    # replaced with set_global(), so nothing but this filter keeps
-    # Antarctica (which has no data, so would draw as a hatched/white "no
-    # data" polygon) out of the figure. See MAP_LAT_SOUTH/NORTH above.
+    # Keep only the analysis band (keeps Antarctica off the set_global() map).
     gdf2 = gdf.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH].copy()
     if "var" not in gdf2.columns:
         gdf2 = gdf2.merge(hatch_df[["poly_idx", "var"]], on="poly_idx", how="left")
@@ -273,16 +235,8 @@ def _build_gdf(shapefile_path, df_data, hatch_df):
 
 
 # =============================================================================
-# ENSEMBLE WEIGHTING -- inverse-Wasserstein-distance polygon weights
-#
-# Aggregated-domain (poly_idx) twin of fig3.py's per-pixel inverse-W2
-# weighting (_build_wasserstein_pixel_weight): instead of a flat multi-model
-# mean (equal weight per GCM, split evenly across its runs), a realization
-# whose bootstrap trend distribution is closer to ERA5's own at a given
-# polygon counts for more there. Source data is trend_sev_eval_wasserstein.py's
-# wasserstein_empirical_agg() output (config.WASSERSTEIN_AGGREGATED_NC_PATH):
-# dims (realization, poly_idx), variables w2_distance/w2_normalized,
-# per-realization GCM/run values.
+# ENSEMBLE WEIGHTING: inverse Wasserstein distance per region (as fig3.py
+# does per pixel), from config.WASSERSTEIN_AGGREGATED_NC_PATH
 # =============================================================================
 
 W2_EPS = 1e-3
@@ -300,17 +254,8 @@ def _load_wasserstein_agg(wasserstein_path=None):
 
 
 def _wasserstein_weight_table(ds_wasserstein, var="w2_normalized", eps=W2_EPS):
-    """
-    Long-format (GCM, run, poly_idx) -> weight table combining the usual
-    per-realization 1/n_gcm weight (de-duplicating multi-run GCMs, same
-    convention as fig3.py's add_severity_and_weights/
-    _build_wasserstein_pixel_weight) with the per-polygon inverse of that
-    realization's normalized empirical Wasserstein trend distance to ERA5
-    (ds_wasserstein's w2_normalized). eps floors w2_normalized so a
-    near-zero distance cannot make a single realization dominate a
-    polygon's weighted mean. Positional indexing (not a 'realization'
-    coordinate) matches fig3.py's own handling of this dataset.
-    """
+    """(GCM, run, poly_idx, w2_weight) table: 1/n_gcm (split across runs) times
+    1 / max(w2_normalized, eps)."""
     gcms = np.asarray(ds_wasserstein["GCM"].values).astype(str)
     runs = np.asarray(ds_wasserstein["run"].values).astype(str)
     wcount = pd.Series(gcms).value_counts()
@@ -331,9 +276,8 @@ def _wasserstein_weight_table(ds_wasserstein, var="w2_normalized", eps=W2_EPS):
 
 
 def _get_w2_table(wasserstein_path=None):
-    """Cached _wasserstein_weight_table for PATHS["wasserstein_aggregated_nc"]
-    (or an override). Missing file is a hard error: the figures never
-    silently fall back to the multi-model mean."""
+    """Cached _wasserstein_weight_table. A missing file is an error, not a
+    silent fallback to the multi-model mean."""
     path = wasserstein_path or PATHS["wasserstein_aggregated_nc"]
     if path not in _W2_TABLE_CACHE:
         ds = _load_wasserstein_agg(path)
@@ -346,12 +290,8 @@ def _get_w2_table(wasserstein_path=None):
 
 
 def w2_weighted_mean(df, cols, by="poly_idx", w2_table=None):
-    """
-    Inverse-W2-weighted mean of each column in cols over the (GCM, run) rows
-    of df, grouped by `by` (default poly_idx; e.g. a region label). Each row
-    is weighted by its (GCM, run, poly_idx) w2_weight; rows with no matching
-    weight, and non-finite values (per column), are excluded.
-    """
+    """Inverse-W2-weighted mean of `cols` over (GCM, run), grouped by `by`.
+    Rows without a weight and non-finite values are excluded."""
     w2_table = _get_w2_table() if w2_table is None else w2_table
     d = df.copy()
     d["GCM"] = d["GCM"].astype(str)
@@ -369,9 +309,8 @@ def w2_weighted_mean(df, cols, by="poly_idx", w2_table=None):
 
 
 def _mmm(df_gwl, effect_col, share_re, vmax, compute_fn, weighting="w2"):
-    """Per-polygon ensemble mean of effect_col: inverse-W2 weighted
-    (weighting="w2", default -- see w2_weighted_mean) or the flat multi-model
-    mean (weighting="mmm": runs averaged within each GCM, then GCMs)."""
+    """Per-region ensemble mean of effect_col: inverse-W2 weighted ("w2") or
+    flat multi-model mean ("mmm": runs, then GCMs)."""
     df = df_gwl[df_gwl["share_re"] == share_re].copy()
     compute_fn(df)
     if weighting == "w2":
@@ -404,9 +343,7 @@ def _mmm_tas(df_gwl, share_re="current", vmax=200, weighting="w2"):
 
 
 def _mmm_absolute_days(df_gwl, share_re="current", weighting="w2"):
-    # Absolute change in cumulative residual load (GWL2 - GWL0.61), normalized
-    # by each region's non-thermosensitive baseline demand (demand_bas from
-    # _calculate_rl) -- units are "days of baseline demand" rather than percent.
+    # Change in cumulative residual load in days of baseline (non-thermosensitive) demand.
     def fn(df):
         df["Absolute_Days"] = (df["cum_rl_gwl"] - df["cum_rl_ref"]) / df["demand_bas"]
     return _mmm(df_gwl, "Absolute_Days", share_re, vmax=None, compute_fn=fn,
@@ -414,8 +351,7 @@ def _mmm_absolute_days(df_gwl, share_re="current", weighting="w2"):
 
 
 def _mmm_supply_days(df_gwl, share_re="current", weighting="w2"):
-    # Isolated RE-supply driver (cum_rl_ds_cf - cum_rl_ref), same
-    # days-of-baseline-demand normalization as _mmm_absolute_days.
+    # Supply driver alone, in days of baseline demand.
     def fn(df):
         df["Supply_Days"] = (df["cum_rl_ds_cf"] - df["cum_rl_ref"]) / df["demand_bas"]
     return _mmm(df_gwl, "Supply_Days", share_re, vmax=None, compute_fn=fn,
@@ -423,8 +359,7 @@ def _mmm_supply_days(df_gwl, share_re="current", weighting="w2"):
 
 
 def _mmm_demand_days(df_gwl, share_re="current", weighting="w2"):
-    # Isolated TAS-demand driver (cum_rl_tas - cum_rl_ref), same
-    # days-of-baseline-demand normalization as _mmm_absolute_days.
+    # Demand driver alone, in days of baseline demand.
     def fn(df):
         df["Demand_Days"] = (df["cum_rl_tas"] - df["cum_rl_ref"]) / df["demand_bas"]
     return _mmm(df_gwl, "Demand_Days", share_re, vmax=None, compute_fn=fn,
@@ -432,10 +367,8 @@ def _mmm_demand_days(df_gwl, share_re="current", weighting="w2"):
 
 
 def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
-    """Diagnostic across all polygons at a given GWL: how many regions have a
-    positive vs. negative isolated RE-supply driver, and how the average
-    magnitude of the supply driver compares to the average magnitude of the
-    demand driver, both in days of baseline demand."""
+    """Print sign counts of the supply and demand drivers across regions and
+    the ratio of their mean magnitudes."""
     supply = (_mmm_supply_days(df_gwl, share_re)["Supply_Days"]
               .replace([np.inf, -np.inf], np.nan).dropna())
     demand = (_mmm_demand_days(df_gwl, share_re)["Demand_Days"]
@@ -476,7 +409,7 @@ def _three_panel_map(df_gwl15, df_gwl2, df_gwl3,
                      title_gwl2, title_gwl15, title_gwl3,
                      cbar_label, dpi):
     proj = ccrs.EqualEarth()
-    # 1 large top + 2 smaller bottom -> width = 2x FIG_WIDTH_IN, height proportional
+    # One large map on top, two smaller ones below.
     fig_w = FIG_WIDTH_IN
     fig_h = fig_w * (8 / 14)
     fig   = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
@@ -505,10 +438,8 @@ def _three_panel_map(df_gwl15, df_gwl2, df_gwl3,
 def plot_main_gwl_maps_absolute(df_gwl15, df_gwl2, df_gwl3,
                                 shapefile_path, hatch_df, output_dir,
                                 dpi=300, share_re="current"):
-    """Same 3-panel layout as plot_main_gwl_maps, but each panel plots the
-    absolute change in cumulative residual load (GWL - GWL0.61) normalized
-    by the region's non-thermosensitive baseline demand, so the anomaly
-    reads in units of "days of baseline demand" instead of percent."""
+    """Fig. 4: SWBD change vs 0.61 degC at 2 (a), 1.5 (b) and 3 degC (c), in days
+    of baseline demand."""
     abs_vals = []
     for df_gwl, gwl_label in ((df_gwl15, "1.5°C"), (df_gwl2, "2°C"), (df_gwl3, "3°C")):
         eff = (_mmm_absolute_days(df_gwl, share_re)["Absolute_Days"]
@@ -535,10 +466,8 @@ def plot_main_gwl_maps_absolute(df_gwl15, df_gwl2, df_gwl3,
 
 def plot_main_dumbbell_absolute(df_gwl2, shapefile_path, dpi=300, share_re="current",
                                 output_dir=None):
-    """Same layout as plot_main_dumbbell, but each effect is the absolute
-    change in cumulative residual load (GWL2 - GWL0.61) normalized by the
-    region's non-thermosensitive baseline demand, so it reads in units of
-    "days of baseline demand" instead of percent."""
+    """Fig. 5: demand, supply and combined effects at 2 degC for selected
+    regions, in days of baseline demand."""
     shp      = gpd.read_file(shapefile_path)
     name_col = "name" if "name" in shp.columns else shp.columns[1]
     df_db    = df_gwl2[df_gwl2["share_re"] == share_re].copy()

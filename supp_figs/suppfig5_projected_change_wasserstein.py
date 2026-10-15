@@ -19,7 +19,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XCLIM
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XCLIM
 
@@ -61,13 +61,8 @@ def plot_gwl_wasserstein_vs_mmm(
     change_label="Relative change in annual severity\ncompared to 0.61°C (%)",
     diff_label="Difference, historical-agreement-weighted\nminus multi-model mean (pp)",
 ):
-    """
-    Three-panel figure for one GWL level: a (inverse-W2 weighted) and b
-    (multi-model mean) side by side on one shared continuous diverging scale,
-    c (a - b) full width below on its own diverging scale. rel_w2/rel_mmm are
-    2-D relative-change arrays on the cropped grid (from
-    _compute_ensemble_rel_change), drawn at `extent`.
-    """
+    """One GWL: a (inverse-W2 weighted) and b (multi-model mean) on a shared
+    scale, c = a - b below. rel_w2/rel_mmm are 2-D relative changes (%)."""
     rel_diff = rel_w2 - rel_mmm
 
     shp = gpd.read_file(shapefile_path)
@@ -86,9 +81,7 @@ def plot_gwl_wasserstein_vs_mmm(
         _agree = hatchings.interp(lat=da_mask_ref.lat, lon=da_mask_ref.lon, method="nearest")
         failed_eval_band = land_shp_band & (_agree.values <= agreement_threshold)
 
-    # Fixed inch layout on a FIG_WIDTH_IN-wide canvas: row 1 two half-width
-    # maps (a | b) + their shared colorbar, row 2 one full-width map (c) +
-    # its colorbar.
+    # Fixed layout: a | b with a shared colorbar, then c full width.
     fig_w  = FIG_WIDTH_IN
     margin, hgap = 0.05, 0.10
     half_w = (fig_w - 2 * margin - hgap) / 2

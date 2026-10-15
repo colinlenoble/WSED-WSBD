@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Extended Data Fig. 12: sensitivity of SWED and SWBD changes to the
-event-threshold choices (previously produced by fig1.py).
+event-threshold choices.
 
 Top row: historical SWED change (value-by-alpha maps) for capacity-factor
 quantile thresholds 0.05 / 0.10 / 0.20; bottom row: GWL2 SWBD change for
@@ -14,7 +14,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 
@@ -34,7 +34,7 @@ from fig1 import (build_land_mask, build_parser, FIG_WIDTH_IN, fit_to_width,
 
 
 # =============================================================================
-# Value-by-alpha colour helper (also used by aux_code/extra_figs_fig1.py)
+# Value-by-alpha colour helper
 # =============================================================================
 
 def _compute_valuebyalpha_rgba(
@@ -86,13 +86,8 @@ def rl_threshold_csv(rl_path, rl_thr):
 
 
 def _load_wsbd_gwl2(csv_path):
-    """
-    GWL2 inverse-W2-weighted mean SWBD change vs GWL0.61, in days of baseline demand
-    -- delegates to main_figs/fig45.py's own loader (load_gwl_dfs, which also drops
-    EXCLUDED_RUNS) and metric (_mmm_absolute_days) so these panels match
-    fig45's Fig. 4 (fig4_main_gwl_maps_absolute_days) exactly. Returns poly_idx /
-    Absolute_Days, with +/-inf (zero baseline demand) set to NaN.
-    """
+    """GWL2 inverse-W2-weighted SWBD change vs GWL0.61 in days of baseline demand,
+    computed as in fig45.py's Fig. 4 (poly_idx, Absolute_Days; inf -> NaN)."""
     from fig45 import load_gwl_dfs, _mmm_absolute_days, MAIN_MIX
     _, df_gwl2, _ = load_gwl_dfs(csv_path)
     mmm = _mmm_absolute_days(df_gwl2, share_re=MAIN_MIX)
@@ -124,9 +119,7 @@ def plot_combined_threshold_sensitivity(
     mmm_99  = _load_wsbd_gwl2(csv_thr99)
     mmm_995 = _load_wsbd_gwl2(csv_thr995)
 
-    # Same colour scale construction as fig45.plot_main_gwl_maps_absolute:
-    # symmetric around 0, capped at the 95th percentile of |change| pooled
-    # over the panels shown (here the three RL thresholds).
+    # Colour scale as in Fig. 4: symmetric, capped at the pooled 95th percentile.
     abs_vals = np.concatenate([np.abs(m["Absolute_Days"].dropna().values)
                                for m in (mmm_95, mmm_99, mmm_995)])
     vmax_days = (max(1.0, np.ceil(np.nanpercentile(abs_vals, 95)))
@@ -138,8 +131,8 @@ def plot_combined_threshold_sensitivity(
     gdf_re_band = gdf_re.cx[:, MAP_LAT_SOUTH:MAP_LAT_NORTH]
 
     # 3-row 2-col layout left: value-by-alpha, right: WSBD
-    fig_width_in  = FIG_WIDTH_IN        # same column width as all other figures
-    fig_height_in = fig_width_in   # 3 rows: approx 3� single-map height
+    fig_width_in  = FIG_WIDTH_IN
+    fig_height_in = fig_width_in   # 3 rows
     proj = ccrs.EqualEarth()
     fig  = plt.figure(figsize=(fig_width_in, fig_height_in), dpi=dpi)
     gs   = fig.add_gridspec(3, 2, hspace=0.25, wspace=0.05,

@@ -1,16 +1,8 @@
 # -*- coding: cp1252 -*-
 """
-Generic event-duration-class decomposition, shared between the persistent
-(rolling-mean) compound-drought pipeline in fig_persistent.py and the
-classic daily-coincidence pipeline in fig1.py.
-
-Given any boolean/0-1 (time, lat, lon) "compound low-production day" field --
-however it was derived (raw daily coincidence, or a rolling-mean-smoothed
-"low week") -- this module walks contiguous runs of True into an event
-table, then lets callers recompute annual frequency/duration/severity
-restricted to events of a given duration class (exactly 1 day, exactly 2
-days, 3+ days, ...). This is what powers the value-by-alpha decomposition
-figures that ask "which event-duration class is driving the change".
+Event table and event-duration-class decomposition of a 0/1 (time, lat, lon)
+compound-day field: annual frequency, duration and severity restricted to
+events of a given length (1 day, 2 days, 3+ days, ...).
 """
 import numpy as np
 import pandas as pd
@@ -22,14 +14,8 @@ import xarray as xr
 # =============================================================================
 
 def compute_event_table(da, time_dim="time"):
-    """
-    Long-format table with one row per (event day, lat, lon) for every
-    contiguous run of True in boolean/0-1 DataArray `da`. Each row carries the
-    event's total length in the 'duration' column (via a groupby transform),
-    so the same table can be used both to compute annual event statistics and
-    to rebuild a day-level mask of "events lasting >= N days" without
-    re-walking the runs.
-    """
+    """One row per (event day, lat, lon) for every run of True in `da`, with the
+    event's start year and total 'duration'."""
     da = da.astype(int)
     first_time = pd.Timestamp(da[time_dim][0].values)
     da_pad = xr.concat(
@@ -57,14 +43,8 @@ def compute_event_table(da, time_dim="time"):
 
 
 def build_duration_class_mask(df, template_da, duration_class, time_dim="time"):
-    """
-    Boolean (time, lat, lon) mask, same shape as `template_da`, reconstructed
-    from the event table: True on days belonging to an event whose total
-    duration matches `duration_class`, a (op, value) pair with op in
-    {'eq', 'ge'} (e.g. ('eq', 1) for single-day events, ('ge', 3) for events
-    lasting 3 days or more). Vectorized via index lookup rather than
-    re-walking the runs.
-    """
+    """(time, lat, lon) mask of days in events matching `duration_class`, an
+    (op, value) pair with op 'eq' or 'ge' (e.g. ('ge', 3): 3+ days)."""
     op, val = duration_class
     if op == "eq":
         sub = df[df["duration"] == val]
@@ -88,12 +68,8 @@ def build_duration_class_mask(df, template_da, duration_class, time_dim="time"):
 
 def compute_annual_stats_for_duration_class(df_events_dedup, template_da, duration_class,
                                              time_dim="time"):
-    """
-    Annual (year, lat, lon) event frequency (count) and mean duration for
-    events matching `duration_class` (see build_duration_class_mask for the
-    (op, value) convention). Reindexed onto template_da's full grid/year
-    range, 0-filled where no qualifying event occurred that year.
-    """
+    """Annual event count and mean duration of events matching `duration_class`,
+    0 where there are none."""
     op, val = duration_class
     if op == "eq":
         sub = df_events_dedup[df_events_dedup["duration"] == val]
@@ -114,11 +90,7 @@ def compute_annual_stats_for_duration_class(df_events_dedup, template_da, durati
     return freq, dur
 
 
-# Event-duration classes used by the value-by-alpha decomposition: label ->
-# (op, value) as understood by build_duration_class_mask /
-# compute_annual_stats_for_duration_class. "all" == ("ge", 1) since every
-# event lasts at least 1 day by construction, so it is mathematically the
-# unrestricted index -- kept as a class like any other rather than special-cased.
+# Duration classes, label -> (op, value); "all" is ("ge", 1).
 DECOMPOSITION_DURATION_CLASSES = [
     ("all", ("ge", 1)),
     ("eq1", ("eq", 1)),
@@ -136,36 +108,17 @@ def compute_duration_decomposition(
     compound, daily_deficit, wcf_da, scf_da, ref_start, ref_end,
     duration_classes=DECOMPOSITION_DURATION_CLASSES, compute_severity_index=True,
 ):
-    """
-    Annual (year, lat, lon) drought-severity index (frequency * mean duration
-    * severity), decomposed by event-duration class -- e.g. only single-day
-    events, only 2-day events, events lasting 3+ days, and (as just another
-    class) all events combined.
+    """Annual severity index (frequency x duration x mean daily deficit) for each
+    event-duration class.
 
-    `compound` is the plain 0/1 (time, lat, lon) "compound low-production
-    day" field (rolling-mean-smoothed or raw daily -- the caller's pipeline
-    decides), not land-masked. `daily_deficit` is the matching per-day
-    severity field (sum of the wind/solar deficits below threshold) used to
-    average over each duration class's qualifying days. `wcf_da`/`scf_da` are
-    the raw (non-rolled) capacity-factor fields, used only to build the
-    resource/land validity mask from reference-period non-NaN coverage.
+    compound      : 0/1 (time, lat, lon) compound-day field, not land-masked
+    daily_deficit : per-day wind + solar deficit below threshold
+    wcf_da/scf_da : capacity factors, for the validity mask (non-NaN over the
+                    reference period)
 
-    Returns ({label: annual_index_DataArray}, resource_valid, freq_all,
-    freq_by_class), where freq_all is the "all events" class's annual
-    event-count array -- exposed so callers can replicate fig1.py's
-    build_land_mask convention (exclude pixels with zero events in the
-    first on-record year) if needed -- and freq_by_class is
-    {label: annual_frequency_DataArray} for every class (freq_all ==
-    freq_by_class["all"]), letting callers decompose frequency alone
-    (e.g. fig_red_decomposition.py's frequency value-by-alpha, which fixes
-    duration per panel and so has no use for the duration/severity
-    factors). frequency/duration here are 0-filled rather than NaN for
-    no-event pixel-years, so that check has to be `== 0`, not `.isnull()`.
-
-    `compute_severity_index=False` skips building the (expensive,
-    full-grid-resample) severity index altogether -- for callers that only
-    want freq_by_class -- and `indices` comes back empty in that case.
-    """
+    Returns ({label: index}, resource_valid, freq_all, freq_by_class);
+    frequency and duration are 0 (not NaN) without events.
+    compute_severity_index=False skips the expensive index (indices empty)."""
     print("  Building event table of compound low-production spells")
     df_events = compute_event_table(compound)
     df_events_dedup = df_events.drop_duplicates(["event_id", "lat", "lon"])
@@ -188,8 +141,7 @@ def compute_duration_decomposition(
             class_mask = build_duration_class_mask(df_events, compound, duration_class)
             severity = xr.where(class_mask, daily_deficit, np.nan).resample(time="YE").mean()
             severity["time"] = severity.time.dt.year
-            # 0-fill (not NaN) for pixel-years with no qualifying event --
-            # a "no drought" year is real, known data.
+            # Years without a qualifying event: 0, not NaN.
             severity = severity.rename({"time": "year"}).fillna(0.0)
             indices[label] = (freq_by_class[label] * dur * severity).load()
         if duration_class == ("ge", 1):

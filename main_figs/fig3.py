@@ -18,7 +18,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XCLIM
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XCLIM
 
@@ -38,11 +38,7 @@ import rasterio
 from rasterio.features import geometry_mask
 from scipy import stats
 
-# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
-# (prefers a .zarr store when present, falls back to .nc).
 from io_utils import match_files, glob_any, open_dataset_any
-# Grey (no wind capacity) / dots (obs.-projection trend discrepancy)
-# exclusion layers, shared with fig1.py and fig45.py.
 from map_overlays import (draw_wcf_zero_overlay, draw_discrepancy_dots,
                           add_exclusion_legend)
 
@@ -60,35 +56,17 @@ from itertools import groupby
 # =============================================================================
 FIG_WIDTH_IN = 5.15   # column width - fontsizes in pt will match LaTeX
 
-# Latitude band shown on EqualEarth maps in this module (matches the
-# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
-# and 58S were excluded due to artifacts in the duration metric"). Applied
-# by masking data/shapefiles to this band and calling ax.set_global() --
-# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
-# it clips to the bounding rectangle of the extent box's own corners, whose
-# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
-# themselves, sitting well short of it at other latitudes -- slicing
-# through real land (e.g. eastern Australia) even though it's nominally
-# within +/-180 deg longitude.
+# Latitude band shown on maps (regions poleward of 68N/58S are excluded, see
+# Methods). Applied by masking + ax.set_global(): ax.set_extent() clips real
+# land on EqualEarth's curved meridians.
 MAP_LAT_SOUTH = -58
 MAP_LAT_NORTH = 68
 EQUAL_EARTH_ASPECT = 2.05   # width / height of a set_global() EqualEarth axes
 
 
 def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
-    """
-    White out everything poleward of [lat_south, lat_north] on a set_global()
-    EqualEarth map. Needed because cfeature.COASTLINE/ax.coastlines() draw
-    the *entire* globe's coastlines (Antarctica, remote Arctic islands)
-    regardless of how the data/shapefile were masked to this band, and
-    shp.cx[:, lat_south:lat_north] keeps whole country geometries (e.g.
-    Russia, Canada, Greenland) rather than clipping them at the band's edge
-    -- both leak real content poleward of the intended crop (see
-    MAP_LAT_SOUTH/NORTH above). Draws a white cap over each pole, in
-    PlateCarree and densely sampled in longitude so it follows the
-    projection's own curved boundary, on top of coastlines/boundaries but
-    below panel labels/region boxes (zorder 20+ elsewhere in this module).
-    """
+    """White caps poleward of [lat_south, lat_north], hiding coastlines and whole
+    country shapes drawn beyond the band (below labels, zorder 20+)."""
     lons = np.linspace(-180.0, 180.0, 361)
     for lat_edge, lat_pole in ((lat_south, -90.0), (lat_north, 90.0)):
         cap = Polygon(
@@ -116,11 +94,7 @@ def build_parser(description=(
     parser.add_argument(
         "--preprocessed_path",
         default=config.PATH_PREPROCESSED,
-        help=(
-            "Root folder of the preprocessed daily wcf/scf files (zarr, falls "
-            "back to .nc) (e.g. <GCM>/wcf_day_*.zarr). Used to build the "
-            "aggregated datasets in memory on every run."
-        ),
+        help="Root folder of the preprocessed daily wcf/scf files (<GCM>/wcf_day_*).",
     )
     parser.add_argument(
         "--gwl_levels",
@@ -138,50 +112,31 @@ def build_parser(description=(
         "--exclude_gcm_run",
         nargs="+",
         default=config.EXCLUDE_GCM_RUN,
-        help="GCM:run pairs to exclude (default: EC-Earth3-Veg-LR:r3i1p1f1).",
+        help="GCM:run pairs to exclude.",
     )
 
     # --- Pre-computed data (optional) ---
     parser.add_argument(
         "--regional_csv",
         default=None,
-        help=(
-            "Path to a pre-computed regional CSV file "
-            "(columns: GWL, region, realization, GCM, frequency, intensity, duration). "
-            "If not provided, the regional DataFrame is computed on-the-fly."
-        ),
+        help="Optional precomputed regional CSV (computed on the fly otherwise).",
     )
     parser.add_argument(
         "--agreement_path",
         default=config.AGREEMENT_NC_PATH,
-        help=(
-            "Path to a pre-computed model-agreement DataArray (.nc), built by "
-            "trend_sev_eval.py's build_agreement_mask(). Values are agreement_pct: the %% "
-            "of GCM realizations whose bootstrap trend CI overlaps the ERA5 reference trend "
-            "CI at each cell. Cells with value <= agreement_threshold are hatched on the map. "
-            "If not provided, no hatching is applied."
-        ),
+        help="Model-agreement mask from trend_sev_eval.py (%% of realizations whose "
+             "trend CI overlaps ERA5's).",
     )
     parser.add_argument(
         "--agreement_threshold",
         type=float,
         default=config.AGREEMENT_THRESHOLD,
-        help=(
-            "Threshold below which cells are hatched (default: config.AGREEMENT_THRESHOLD, "
-            "%.0f%%%% of models with an overlapping trend CI)." % config.AGREEMENT_THRESHOLD
-        ),
+        help="Agreement %% at or below which cells are flagged.",
     )
     parser.add_argument(
         "--wcf_zero_mask_path",
         default=config.WCF_ZERO_MASK_NC_PATH,
-        help=(
-            "Path to the cached wcf-zero land mask (.nc, built by fig1.py's "
-            "build_wcf_zero_mask()/save_wcf_zero_mask()). Land pixels where "
-            "ERA5 wcf is exactly 0 over the whole reference period; greyed "
-            "out on every gridded map here, independent of the no-wind "
-            "quantile mask and of any agreement hatching. If not found, "
-            "this overlay is skipped."
-        ),
+        help="Mask of land pixels with zero ERA5 wcf (greyed out; built by fig1.py).",
     )
 
     # --- Ensemble weighting ---
@@ -189,22 +144,14 @@ def build_parser(description=(
         "--weighting",
         choices=["w2", "mmm"],
         default="w2",
-        help=(
-            "Ensemble averaging: 'w2' (default) weights each realization by 1/n_gcm "
-            "times the inverse of its normalized Wasserstein trend distance to ERA5 "
-            "at each pixel (see _build_wasserstein_pixel_weight); 'mmm' is the flat "
-            "multi-model mean (1/n_gcm only)."
-        ),
+        help="'w2': 1/n_gcm x inverse Wasserstein trend distance to ERA5; "
+             "'mmm': flat multi-model mean.",
     )
     parser.add_argument(
         "--wasserstein_path",
         default=config.WASSERSTEIN_NC_PATH,
-        help=(
-            "Path to a pre-computed per-(GCM, run), per-pixel empirical Wasserstein "
-            "trend-distance DataArray (.nc), built by trend_sev_eval_wasserstein.py's "
-            "wasserstein_empirical_grid() (variables w2_distance/w2_normalized, dims "
-            "realization/lat/lon, coords GCM/run). Required with --weighting w2."
-        ),
+        help="Per-pixel Wasserstein file (trend_sev_eval_wasserstein.py), "
+             "needed for --weighting w2.",
     )
 
     # --- Shapefile / output ---
@@ -232,10 +179,7 @@ def parse_args():
 # =============================================================================
 
 def compute_intensity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
-    """
-    Expected shortfall: mean positive deficit on compound-event days,
-    aggregated yearly.
-    """
+    """Annual mean capacity-factor deficit on compound-event days."""
     deficit_scf = xr.where(scf_ds["scf"] < scf_thr, scf_thr - scf_ds["scf"], 0)
     deficit_wcf = xr.where(wcf_ds["wcf"] < wcf_thr, wcf_thr - wcf_ds["wcf"], 0)
     daily_deficit = deficit_scf + deficit_wcf
@@ -246,14 +190,7 @@ def compute_intensity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
 
 
 def duration_xr(da):
-    """
-    Compute mean event duration and event frequency per (year, lat, lon).
-
-    Returns
-    -------
-    ds      : Dataset with 'duration' (mean days per event)
-    ds_freq : Dataset with 'frequency' (number of events)
-    """
+    """Mean event duration (days) and number of events per (year, lat, lon)."""
     da = da.convert_calendar("standard")
     da = da.sortby("lat").sortby("lon")
     da["lat"] = da["lat"].astype(float)
@@ -322,11 +259,7 @@ def duration_xr(da):
 
 
 def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea):
-    """
-    Build the aggregated gridded dataset for one (GCM, GWL) pair and return it
-    in memory. Nothing is written to disk here -- the caller concatenates the
-    per-GCM datasets directly, avoiding a save/reload round trip.
-    """
+    """Annual SWED indices for one (GCM, run, GWL), regridded to ERA5, in memory."""
     print(f"    Building {gcm} / {gwl}")
 
     # Load projection data (zarr preferred, falls back to .nc)
@@ -402,12 +335,8 @@ def _build_single_gcm(preprocessed_path, gwl, gcm, run, ssp, wcf_rea):
 
 
 def _print_gcm_run_summary(label, ds):
-    """
-    Diagnostic: print every (GCM, run) pair in ds and flag any that appear
-    more than once. Duplicate (GCM, run) pairs within a single GWL's built
-    dataset break from_ds_to_plot_decomp's alignment (a "common" pair would
-    then be counted multiple times on one side but not the other).
-    """
+    """Print the (GCM, run) pairs in ds and flag duplicates, which would break
+    from_ds_to_plot_decomp's alignment."""
     gcms = ds.GCM.values
     runs = ds.run.values
     pairs = list(zip(gcms, runs))
@@ -428,27 +357,8 @@ def _print_gcm_run_summary(label, ds):
 
 
 def build_gridded_datasets(preprocessed_path, gwl_list, exclude_gcm=None, exclude_gcm_run=None):
-    """
-    Build the aggregated gridded dataset for every requested GWL, entirely in
-    memory (no per-GCM/GWL cache file is written to or read from disk).
-
-    Parameters
-    ----------
-    preprocessed_path : str
-        Root directory containing per-GCM subdirectories with daily .nc files.
-    gwl_list : list of str
-        GWL keys to process, e.g. ['GWL0-61', 'GWL1-5', 'GWL2', 'GWL3'].
-    exclude_gcm : list of str or None
-        GCMs to skip entirely.
-    exclude_gcm_run : list of str or None
-        "GCM:run" pairs to skip.
-
-    Returns
-    -------
-    dict of {gwl_key: xr.Dataset}
-        One dataset per GWL that had at least one usable GCM, concatenated
-        over a fresh 'realization' dimension.
-    """
+    """{gwl: Dataset} of SWED indices for every realization, built in memory.
+    exclude_gcm_run holds "GCM:run" strings."""
     exclude_gcm     = exclude_gcm or []
     exclude_gcm_run = set(tuple(x.split(":")) for x in (exclude_gcm_run or []))
 
@@ -518,10 +428,7 @@ def rasterize_shapefile(shapefile, shape, transform):
 
 
 def build_land_mask(ref_2d, shapefile_path):
-    """
-    Build a boolean land mask on the lat/lon grid of ref_2d (a 2-D DataArray).
-    ref_2d must have dims (lat, lon) - no time or realization.
-    """
+    """Boolean land mask on the (lat, lon) grid of ref_2d, excluding its NaNs."""
     shapefile = gpd.read_file(shapefile_path)
     transform = rasterio.transform.from_bounds(
         ref_2d.lon.min().item(), ref_2d.lat.min().item(),
@@ -536,28 +443,14 @@ def build_land_mask(ref_2d, shapefile_path):
 
 
 def load_wcf_zero_mask(path):
-    """
-    Load the wcf-zero land mask built by fig1.py's build_wcf_zero_mask()/
-    save_wcf_zero_mask() (land pixels, per shp_re, where ERA5 wcf is exactly
-    0 across the whole reference period). This is the sole "no wind
-    resource" grey layer on the gridded maps in this file -- replaces the
-    quantile-based (10th-percentile wcf > 0) mask this module used to build
-    itself, which crashed on newer xarray (interp() rejects bool dtype) and
-    duplicated what fig1.py already computes. Independent of any
-    GCM-trend-agreement hatching -- see draw_wcf_zero_overlay.
-    """
+    """Land pixels with zero ERA5 wcf over the reference period (built by fig1.py),
+    greyed out on the maps."""
     return xr.open_dataarray(path).astype(bool)
 
 
 def fit_to_width(fig, width_in=FIG_WIDTH_IN, n_iter=4, tol=0.002):
-    """
-    Rescale the figure canvas (both dimensions, fonts untouched) so that
-    savefig(..., bbox_inches="tight") yields an image exactly width_in wide.
-    Without this, the tight crop leaves each figure at a different width, so
-    once LaTeX scales them all to the column width their fonts (panel
-    letters, titles, legends) end up at different effective point sizes.
-    Accounts for savefig's own pad_inches on each side.
-    """
+    """Rescale the canvas (not the fonts) so the tight-cropped image is exactly
+    width_in wide, keeping font sizes consistent across figures in LaTeX."""
     target = width_in - 2 * plt.rcParams["savefig.pad_inches"]
     for _ in range(n_iter):
         fig.canvas.draw()
@@ -582,21 +475,12 @@ def _reduce_to_2d(da):
 # =============================================================================
 
 def from_ds_to_plot_decomp(ds_gwl, ds_ref):
-    """
-    Align baseline (ds_ref) and projection (ds_gwl) datasets by common
-    (GCM, run) pairs -- not just GCM name, since a given GCM can have a
-    different set of available runs at different GWLs (e.g. one run may
-    not reach a higher warming level at all). Matching on name alone can
-    pick a different number of realizations from each dataset whenever
-    that happens, which then fails when they're recombined.
-    Returns (ref_freq, ref_int, ref_dur, proj_freq, proj_int, proj_dur, weight).
-    """
+    """Keep the (GCM, run) pairs present in both baseline and projection (a GCM
+    may lack some runs at higher GWLs), in the same order.
+    Returns (ref_freq, ref_int, ref_dur, proj_freq, proj_int, proj_dur, weight)."""
     pairs_gwl = list(zip(ds_gwl.GCM.values, ds_gwl.run.values))
     pairs_ref = list(zip(ds_ref.GCM.values, ds_ref.run.values))
 
-    # Find indices *separately* in each dataset, then sort both by the same
-    # (GCM, run) key so that paired realizations correspond to the same
-    # GCM/run rather than just the same GCM.
     common_pairs = set(pairs_ref) & set(pairs_gwl)
     ref_indices = [i for i, p in enumerate(pairs_ref) if p in common_pairs]
     gwl_indices = [i for i, p in enumerate(pairs_gwl) if p in common_pairs]
@@ -633,10 +517,8 @@ def from_ds_to_plot_decomp(ds_gwl, ds_ref):
 
     ds_gwl["realization"] = ds_ref.realization.astype(int)
 
-    # Promote GCM/run (data variables) to coordinates so they are carried by
-    # every DataArray extracted from this dataset (GCM is needed by the GCM
-    # bootstrap; run is needed to match realizations against the Wasserstein
-    # distance file's own (GCM, run) coords in _build_wasserstein_pixel_weight).
+    # GCM/run as coordinates so extracted DataArrays carry them (GCM bootstrap,
+    # Wasserstein matching).
     ds_gwl = ds_gwl.assign_coords(
         GCM=("realization", ds_gwl.GCM.values),
         run=("realization", ds_gwl.run.values),
@@ -680,31 +562,11 @@ def _w2_pair_index(da_proj_freq, ds_wasserstein):
 
 def _build_wasserstein_pixel_weight(da_proj_freq, ds_wasserstein, base_weight,
                                      var=W2_VAR, eps=W2_EPS):
-    """
-    Combine the usual per-realization 1/n_gcm weight with a per-pixel weight
-    equal to the inverse of that realization's normalized empirical
-    Wasserstein trend distance to ERA5 at that pixel (ds_wasserstein's
-    w2_normalized, from trend_sev_eval_wasserstein.wasserstein_empirical_grid()):
-    a realization whose bootstrap trend distribution is closer to ERA5's at a
-    given location counts for more there, on top of (not instead of) the
-    existing 1/n_gcm de-duplication across multi-run GCMs.
-
-    Matching is by (GCM, run) pair, since ds_wasserstein's realization axis
-    (built from GWL1 files only) does not generally line up positionally with
-    da_proj_freq's own realization axis (built per-GWL in from_ds_to_plot_decomp).
-    Realizations in da_proj_freq with no Wasserstein match get weight 0
-    (excluded) everywhere; eps floors w2_normalized so a near-zero distance
-    cannot make a single realization dominate the pixel mean.
-
-    Returns
-    -------
-    (weight_pix, inv_w2): two xr.DataArrays with dims (realization, lat, lon),
-    positionally aligned with da_proj_freq's realization axis (no
-    'realization' coordinate, matching base_weight's own convention).
-    weight_pix = base_weight * inv_w2 is the ensemble-mean weight; inv_w2
-    alone is what the GCM bootstraps use, since resampling GCMs already
-    provides the 1/n_gcm part. (None, None) if no (GCM, run) pair matches.
-    """
+    """Per-pixel ensemble weights: base_weight (1/n_gcm) times the inverse of each
+    realization's normalized Wasserstein trend distance to ERA5 (floored at
+    eps), matched by (GCM, run); unmatched realizations get 0.
+    Returns (weight_pix, inv_w2), dims (realization, lat, lon); the GCM
+    bootstrap uses inv_w2 alone. (None, None) if nothing matches."""
     proj_idx, w2_idx, missing = _w2_pair_index(da_proj_freq, ds_wasserstein)
     if missing:
         print(f"    [warn] no Wasserstein match for {len(missing)} realization(s), "
@@ -728,9 +590,8 @@ def _build_wasserstein_pixel_weight(da_proj_freq, ds_wasserstein, base_weight,
 
 
 def load_wasserstein(args):
-    """Open args.wasserstein_path when args.weighting == 'w2' (None for 'mmm').
-    Missing file is a hard error: the figures never silently fall back to
-    the multi-model mean."""
+    """Wasserstein dataset for --weighting w2 (None for mmm). A missing file is
+    an error, not a silent fallback."""
     if args.weighting != "w2":
         return None
     if not os.path.exists(args.wasserstein_path):
@@ -742,12 +603,8 @@ def load_wasserstein(args):
 
 
 def drop_near_zero_reference_std(ds_w2, sigma_ref_min=W2_SIGMA_REF_MIN):
-    """NaN out w2_normalized wherever ERA5's own bootstrap-trend std (recovered
-    as w2_distance / w2_normalized) is below sigma_ref_min. Files written before
-    trend_sev_eval_wasserstein.py's SIGMA_REF_MIN fix divided by a ~1e-12 floor
-    there instead, giving w2_normalized ~1e8-1e9 that swamp every region mean:
-    the 1-2 realizations without such pixels then take ~all of the inverse-W2
-    weight. A no-op on files built after the fix (those pixels are already NaN)."""
+    """NaN out w2_normalized where ERA5's bootstrap-trend std (w2_distance /
+    w2_normalized) is below sigma_ref_min, where the normalization blows up."""
     wd, wn = ds_w2.w2_distance, ds_w2.w2_normalized
     keep = (wd == 0) | ((wd / wn) > sigma_ref_min)
     n_total = int(np.isfinite(wn.values).sum())
@@ -759,12 +616,7 @@ def drop_near_zero_reference_std(ds_w2, sigma_ref_min=W2_SIGMA_REF_MIN):
 
 
 def ensemble_weight(da_proj_freq, base_weight, inputs):
-    """
-    Ensemble weight for one GWL's aligned fields: (weight_pix, inv_w2) from
-    _build_wasserstein_pixel_weight under inverse-W2 weighting, or
-    (base_weight, None) for the flat multi-model mean (inputs.ds_wasserstein
-    is None).
-    """
+    """(weight_pix, inv_w2) under W2 weighting, (base_weight, None) for the mmm."""
     if inputs.ds_wasserstein is None:
         return base_weight, None
     weight_pix, inv_w2 = _build_wasserstein_pixel_weight(
@@ -776,13 +628,8 @@ def ensemble_weight(da_proj_freq, base_weight, inputs):
 
 
 def region_mean_w2(ds_wasserstein, region_mask, var=W2_VAR):
-    """
-    cos(latitude)-weighted mean of w2_normalized over the True pixels of
-    region_mask (a boolean (lat, lon) DataArray), per realization of
-    ds_wasserstein. Returns a pd.Series indexed by (GCM, run) -- the
-    region-level distance whose inverse (times 1/n_gcm) weights that
-    realization's region-mean value.
-    """
+    """cos(lat)-weighted mean w2_normalized over region_mask, per realization,
+    as a Series indexed by (GCM, run)."""
     region_mask = region_mask.reset_coords(drop=True)   # keep only lat/lon
     w2 = ds_wasserstein[var].interp(lat=region_mask.lat, lon=region_mask.lon,
                                     method="nearest")
@@ -825,10 +672,7 @@ REGIONS_DF = [
 
 
 def create_dataframe_regional(built_datasets, mask, regions=None):
-    """
-    For each already-built (in-memory) GWL dataset and each region, extract
-    the spatial mean of frequency, intensity and duration per realization.
-    """
+    """Regional mean frequency, intensity and duration per GWL and realization."""
     if regions is None:
         regions = REGIONS_DF
 
@@ -836,9 +680,8 @@ def create_dataframe_regional(built_datasets, mask, regions=None):
     for gwl_label, base_ds in built_datasets.items():
         print(f"  Aggregating regional stats for {gwl_label}")
 
-        # Subsetting first gives us an independent Dataset, so masking below
-        # does not mutate the shared dataset the main plotting loop reuses.
-        ds = base_ds[["frequency", "intensity", "duration", "GCM", "run"]]
+        # Subset first so masking doesn't modify the shared dataset.
+        ds =base_ds[["frequency", "intensity", "duration", "GCM", "run"]]
         ds["frequency"] = ds["frequency"].where(mask == 1)
         ds["intensity"] = ds["intensity"].where(mask == 1)
         ds["duration"]  = ds["duration"].where(mask == 1)
@@ -876,11 +719,7 @@ def create_dataframe_regional(built_datasets, mask, regions=None):
 
 
 def region_w2_table(ds_wasserstein, mask, regions=None):
-    """
-    Long (region, GCM, run, w2_mean) table: each region box's
-    cos(latitude)-weighted mean normalized Wasserstein distance over its
-    land pixels (region_mean_w2), per realization of ds_wasserstein.
-    """
+    """(region, GCM, run, w2_mean) table of region_mean_w2 over each box's land."""
     if regions is None:
         regions = REGIONS_DF
     land = mask.astype(bool)
@@ -897,14 +736,8 @@ def region_w2_table(ds_wasserstein, mask, regions=None):
 
 
 def add_severity_and_weights(df, region_w2=None, eps=W2_EPS):
-    """
-    Add 'severity' column (frequency x intensity x duration) and the
-    per-realization 'weight' column: the inverse-frequency GCM weight
-    (1/n_gcm, split across a GCM's runs), times -- when region_w2 (from
-    region_w2_table) is given -- the inverse of that realization's mean
-    normalized Wasserstein distance over the region. Realizations with no
-    Wasserstein match get a NaN weight (excluded from the weighted mean).
-    """
+    """Add 'severity' (freq x int x dur) and 'weight' (1/n_gcm split across runs,
+    divided by the regional w2_mean if region_w2 is given; NaN if unmatched)."""
     df = df.copy()
     df["severity"] = df["frequency"] * df["intensity"] * df["duration"]
 
@@ -991,9 +824,7 @@ def plot_gwl_valuebyalpha_discrete(
     # --- 5. RGBA assembly ---
     nlat, nlon = dChange.shape
     valid_mask = np.isfinite(dChange.values) & np.isfinite(severity.values)
-    # RGB defaults to white (not black) for invalid/masked (e.g. ocean) pixels --
-    # alpha stays 0 so they're still fully transparent, but this avoids a solid
-    # black sea in viewers that don't alpha-composite the PNG correctly.
+    # Masked pixels: white with alpha 0 (avoids a black sea in some viewers).
     rgba_map   = np.ones((nlat, nlon, 4), dtype=float)
     rgba_map[..., 3] = 0.0
     cb = np.clip(change_bin, 0, n_bins_change - 1)
@@ -1036,8 +867,7 @@ def plot_gwl_valuebyalpha_discrete(
                            transform=ccrs.PlateCarree(), zorder=10)
 
     if hatchings is not None:
-        # Dot hatching: land pixels that failed the trend-agreement evaluation
-        # (agreement_pct <= agreement_threshold).
+        # Dots: land pixels failing the trend-agreement test.
         _agree_float = hatchings.interp(
             lat=da_mask.lat, lon=da_mask.lon, method="nearest"
         )
@@ -1194,11 +1024,8 @@ def _compute_ensemble_rel_change(
     da_proj_freq, da_proj_int, da_proj_dur,
     weight, mask, lat_min=-60, lat_max=68,
 ):
-    """
-    Return the ensemble-weighted mean relative change (%) as a 2-D numpy array
-    on the cropped ERA5 grid.  Used to freeze colour-bin membership at GWL1.5
-    and apply the same spatial masks to higher GWLs.
-    """
+    """Ensemble-mean relative change (%) as a 2-D array, used to freeze the
+    colour-bin membership at GWL1.5."""
     def _crop(da):
         return da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
     base = (da_ref_freq  * da_ref_int  * da_ref_dur ).weighted(weight).mean(dim="realization")
@@ -1240,8 +1067,6 @@ def _compute_rgba_map(
 
     nlat, nlon    = dChange.shape
     valid_px      = np.isfinite(dChange.values) & np.isfinite(severity.values)
-    # RGB defaults to white (not black) for invalid/masked (e.g. ocean) pixels --
-    # see plot_gwl_valuebyalpha_discrete's rgba_map for the same fix/rationale.
     rgba_map      = np.ones((nlat, nlon, 4), dtype=float)
     rgba_map[..., 3] = 0.0
     cb = np.clip(change_bin, 0, n_bins_change - 1)
@@ -1257,11 +1082,7 @@ def _compute_rgba_map(
 
 
 def _block_index_lists(lats, lons, block_size):
-    """
-    Precompute, once, the pixel row/col indices belonging to each spatial
-    block along lat and lon. Reused across every bootstrap draw instead of
-    being recomputed inside the resampling loop.
-    """
+    """Row/col pixel indices of each block_size-degree block along lat and lon."""
     lat_edges = np.arange(lats.min(), lats.max(), block_size)
     lon_edges = np.arange(lons.min(), lons.max(), block_size)
     row_idx_by_block = [
@@ -1274,12 +1095,8 @@ def _block_index_lists(lats, lons, block_size):
 
 
 def _draw_block_resample(rng, row_idx_by_block, col_idx_by_block):
-    """
-    One block-bootstrap draw: resample lat-blocks and lon-blocks with
-    replacement and return the resulting pixel row/col indices (repeated
-    when a block is drawn more than once), matching the cartesian product
-    that the equivalent nested-loop formulation would visit.
-    """
+    """One block-bootstrap draw: lat and lon blocks resampled with replacement;
+    returns the pixel row/col indices."""
     n_lat_b = len(row_idx_by_block)
     n_lon_b = len(col_idx_by_block)
     sel_lat = rng.integers(0, n_lat_b, size=n_lat_b) if n_lat_b else np.array([], dtype=int)
@@ -1300,37 +1117,10 @@ def compute_global_change_stats_gwl(
     block_size=10,
     inv_w2=None,
 ):
-    """
-    Compute the global area-weighted mean relative change in the compound index
-    and its 95 % spatial block-bootstrap confidence interval.
-
-    Parameters
-    ----------
-    da_ref_*  / da_proj_* : xr.DataArray
-        Frequency, intensity, duration for baseline and projection (realization, lat, lon).
-    weight : xr.DataArray
-        Ensemble weights: per-realization GCM weights (dim realization), or
-        per-pixel inverse-W2 weights (realization, lat, lon) from
-        ensemble_weight().
-    inv_w2 : xr.DataArray or None
-        Per-pixel inverse-W2 weight alone (realization, lat, lon), used to
-        weight the realizations drawn in each GCM-bootstrap sample (GCM
-        resampling already supplies the 1/n_gcm part). None: plain mean.
-    mask : array-like
-        Land mask (1 = valid).
-    lat_min / lat_max : float
-        Latitude crop before computing global mean.
-    n_bootstrap : int
-        Number of block-bootstrap iterations.
-    block_size : float
-        Block size in degrees for the spatial bootstrap (respects spatial autocorrelation).
-
-    Returns
-    -------
-    global_rel_change : float   global weighted-mean relative change (%)
-    ci_lower_rel      : float   2.5th percentile of bootstrap distribution (%)
-    ci_upper_rel      : float   97.5th percentile of bootstrap distribution (%)
-    """
+    """Global area-weighted relative change (%) in annual severity with 95% CIs
+    from a spatial block bootstrap (block_size degrees) and a GCM bootstrap
+    (one run per resampled GCM, weighted by inv_w2 if given).
+    Returns (change, spatial_lo, spatial_hi, gcm_lo, gcm_hi)."""
     def _crop(da):
         return da.where(da.lat > lat_min, drop=True).where(da.lat < lat_max, drop=True)
 
@@ -1348,9 +1138,7 @@ def compute_global_change_stats_gwl(
     global_late  = float(proj_comp.weighted(lat_weights).mean(dim=["lat", "lon"]).values)
     global_rel_change = 100.0 * (global_late - global_early) / global_early
 
-    # Spatial block-bootstrap on the 2-D absolute-change field (vectorized:
-    # block membership is precomputed once, then each draw is a single
-    # numpy fancy-indexing extraction instead of a per-pixel Python loop).
+    # Spatial block bootstrap on the absolute-change field.
     data         = abs_change.values
     lats         = abs_change.lat.values
     lons         = abs_change.lon.values
@@ -1421,28 +1209,10 @@ def compute_bin_change_stats_gwl(
     reference_data=None,
     inv_w2=None,
 ):
-    """
-    For each discrete colour bin of the value-by-alpha map, compute the
-    area-weighted mean relative change in compound index and its 95 %
-    spatial block-bootstrap CI.
-
-    Bins follow change_edges = [-100, -25, -10, 10, 25, 100] by default,
-    matching the 5 colour categories (dark blue ? light blue ? gray ? orange ? red).
-
-    Parameters
-    ----------
-    inv_w2 : xr.DataArray or None
-        See compute_global_change_stats_gwl.
-    reference_data : 2-D numpy array or None
-        If provided (e.g., GWL1.5 rel_change from _compute_ensemble_rel_change),
-        bin *membership* is determined from this reference field while the
-        bootstrap *values* are taken from the current GWL's rel_change.
-        If None, both membership and values come from the current GWL.
-
-    Returns
-    -------
-    list of dict with keys: 'bin', 'mean', 'ci_lower', 'ci_upper', 'n_pixels'
-    """
+    """compute_global_change_stats_gwl for each colour bin of the map
+    (change_edges, 5 bins from dark blue to red). If reference_data is given
+    (the GWL1.5 change field), it sets bin membership while values come from
+    the current GWL. Returns one dict per bin."""
     if change_edges is None:
         change_edges = [-100, -25, -10, 10, 25, 100]
 
@@ -1502,10 +1272,7 @@ def compute_bin_change_stats_gwl(
         bin_masks.append(bin_pix)
     n_pixels_list = [int(np.sum(bp)) for bp in bin_masks]
 
-    # Spatial block-bootstrap (vectorized): draw once per iteration and
-    # compute every bin's weighted mean from that same resampled field,
-    # instead of resampling independently -- and via nested pixel loops --
-    # for each bin.
+    # Spatial block bootstrap: one draw per iteration, shared by all bins.
     row_idx_by_block, col_idx_by_block = _block_index_lists(lats, lons, block_size)
     boot_means = np.full((n_bootstrap, n_bins), np.nan)
     for it in range(n_bootstrap):
@@ -1591,24 +1358,19 @@ LEVEL_TO_LABEL = {"1.5": "1.5°C", "2.0": "2.0°C", "3.0": "3.0°C"}
 
 
 def prepare_inputs(args, with_regions=True):
-    """Inputs shared by Fig. 3 and Extended Data Figs. 4-5: the in-memory
-    ensemble datasets (GWL0-61 + args.gwl_levels), the land mask, the
-    wcf-zero mask, the agreement hatching and (for Fig. 3 only) the regional
-    DataFrame behind the violin panels."""
+    """Inputs shared by Fig. 3 and ED Figs. 4-5: ensemble datasets (GWL0-61 +
+    args.gwl_levels), land mask, wcf-zero mask, agreement mask and (Fig. 3
+    only) the regional DataFrame for the violins."""
     os.makedirs(args.output_dir, exist_ok=True)
     for lv in args.gwl_levels:
         if lv not in LEVEL_TO_KEY:
             raise ValueError(f"Unknown GWL level '{lv}'. Valid: {list(LEVEL_TO_KEY.keys())}.")
-    # Checked first, so a missing Wasserstein file fails before the
-    # (long) dataset build rather than after it.
+    # Load first so a missing file fails before the long dataset build.
     ds_wasserstein = load_wasserstein(args)
 
     # ------------------------------------------------------------------
-    # STEP 0 - Build all aggregated gridded datasets, in memory
+    # STEP 0 - Build the gridded datasets (baseline + projections), in memory
     # ------------------------------------------------------------------
-    # We always build GWL0-61 (baseline) plus every requested projection level.
-    # Nothing is written to/read from disk here; the resulting datasets are
-    # reused directly below for the regional dataframe and the figures.
     gwl_keys_to_build = ["GWL0-61"] + [LEVEL_TO_KEY[lv] for lv in args.gwl_levels]
     print("=" * 60)
     print("STEP 0 - Building aggregated gridded datasets (in memory)")
@@ -1632,10 +1394,6 @@ def prepare_inputs(args, with_regions=True):
     ref_2d = _reduce_to_2d(ds_baseline.duration)
     mask   = build_land_mask(ref_2d, args.shapefile)
 
-    # wcf-zero land mask (land pixels where ERA5 wcf is exactly 0 over the
-    # whole reference period), built and cached by fig1.py. This is the
-    # sole "no wind resource" grey layer on the maps below -- see
-    # draw_wcf_zero_overlay. Independent of any agreement hatching.
     wcf_zero_mask = None
     if args.wcf_zero_mask_path is not None and os.path.exists(args.wcf_zero_mask_path):
         print(f"  Loading wcf-zero land mask from {args.wcf_zero_mask_path} ...")
@@ -1659,9 +1417,7 @@ def prepare_inputs(args, with_regions=True):
         if os.path.exists(regional_csv_path):
             print(f"Found existing regional DataFrame at {regional_csv_path}, loading it.")
             df_regions = pd.read_csv(regional_csv_path)
-            if "run" not in df_regions.columns:
-                # Older cache without the run column needed to match
-                # realizations to the Wasserstein file -- rebuild it.
+            if "run" not in df_regions.columns:  # needed for Wasserstein matching
                 print("  Cached regional DataFrame has no 'run' column, recomputing.")
                 df_regions = None
         if df_regions is None:
@@ -1693,9 +1449,8 @@ def prepare_inputs(args, with_regions=True):
 
 
 def iter_gwl_decomp(args, inputs):
-    """Yield (level, gwl_key, gwl_label, fields) for each requested GWL, where
-    `fields` is from_ds_to_plot_decomp's (ref freq/int/dur, proj freq/int/dur,
-    weight) tuple aligned against the GWL0-61 baseline."""
+    """Yield (level, gwl_key, gwl_label, fields) per GWL, fields being
+    from_ds_to_plot_decomp's output against the GWL0-61 baseline."""
     print("\n" + "=" * 60)
     print("STEP 4 - Producing figures")
     print("=" * 60)
@@ -1724,8 +1479,7 @@ def main():
         # Inverse-W2 pixel weights (or the flat 1/n_gcm with --weighting mmm)
         weight, inv_w2 = ensemble_weight(da_proj_freq, base_weight, inputs)
 
-        # Freeze colour-bin membership at GWL1.5 so higher GWLs report stats
-        # for the same spatial zones that were red/orange/gray/etc. at 1.5°C.
+        # Bin membership frozen at GWL1.5 so all GWLs report the same zones.
         if level == "1.5":
             gwl15_rel_change_data = _compute_ensemble_rel_change(
                 da_ref_freq, da_ref_int, da_ref_dur,

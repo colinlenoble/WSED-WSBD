@@ -3,7 +3,7 @@
 Extended Data Fig. 13: sensitivity of SWBD changes to demand-model parameters.
 
 One panel per DemandConfig (make_rl_files.DEMAND_CONFIGS), in days of baseline
-demand (previously fig45.py STEP 5). Reads the demand-sensitivity CSVs written
+demand. Reads the demand-sensitivity CSVs written
 by main_pipeline/make_rl_files.py; map helpers come from main_figs/fig45.py.
 """
 import os
@@ -11,7 +11,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ["ESMFMKFILE"]       = config.ESMFMKFILE_XENV
 os.environ["MPLBACKEND"]       = "Agg"
@@ -37,10 +37,8 @@ from fig45 import (FIG_WIDTH_IN, MAIN_MIX, MAIN_THR,
 
 def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
                                           agg_datasets_dir, dpi=300, period="Annual"):
-    """Same layout as plot_supp_demand_sensitivity, but each panel plots the
-    absolute change in cumulative residual load (GWL2 - GWL0.61) normalized
-    by the region's non-thermosensitive baseline demand, so the anomaly reads
-    in units of "days of baseline demand" instead of percent."""
+    """One map per demand configuration of the SWBD change at 2 degC vs
+    0.61 degC, in days of baseline demand."""
     REF_COLOR = "#c0392b"
     ALT_COLOR = "#2c3e50"
     _meta = {

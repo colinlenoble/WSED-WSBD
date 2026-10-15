@@ -16,16 +16,13 @@ calculate_cf.aggregate_ds_cf_reanalysis():
 Inputs are {preprocessed_path}/{reanalysis}/{scf,wcf}_agg_{reanalysis}_{v1,v2}.nc
 (one value per poly_idx and day) and the shapefile they were aggregated on
 (config.SHAPEFILE_PATH, the one calculate_cf.py passes), matched by position.
-
-Port of como24_group5/code_final/1.9 aggregation_figure.ipynb (which used
-the W5E5 aggregates instead of ERA5).
 """
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ["ESMFMKFILE"]       = config.ESMFMKFILE_XENV
 

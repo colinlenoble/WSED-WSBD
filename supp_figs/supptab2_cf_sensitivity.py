@@ -3,80 +3,23 @@
 Extended Data Table 2: sensitivity of SWED severity to the capacity-factor
 parametrization.
 
-Compare wind / solar capacity-factor *tuning* choices against the default
-model on real ERA5 data, reusing supptab3_wind_extrapolation_sensitivity.py's compound
-low-wind/low-solar "severity" metric (expected shortfall on compound-event
-days) and comparison methodology -- generalized from the 3 wind_method
-extrapolation strategies to a broader set of tuning choices: the wind
-turbine power curve (cut-in/rated/cut-out speed) plus the 3 wind_method
-options, the PVGIS solar technology/mounting presets
-(compute_solar_cf.PVGIS_K_PRESETS / PVGIS_U_PRESETS), and (folded in from
-the former analyze_zero_cf.py) the wind low-event threshold's zero-handling
-("raw_threshold": the naive `wcf_ref.quantile(q)` with zeros included,
-compared against the pipeline default `wcf_ref.where(wcf_ref>0).quantile(q)`).
+On ERA5, compares the mean SWED severity obtained with alternative
+capacity-factor settings against the default model:
+  - wind: hub-height extrapolation method and power-curve cut-in/rated/
+    cut-out speeds;
+  - solar: PVGIS technology/mounting presets;
+  - "raw_threshold": low-wind threshold computed with zero wcf values
+    included. By default zeros are excluded, so a pixel always below cut-in
+    gets a NaN threshold and no events.
+Only one model is varied at a time; the other stays at its default. Inputs
+as in supptab3_wind_extrapolation_sensitivity.py.
 
-Every tuning config's effect on the long-term mean severity is boiled down
-to two comparable-scale numbers -- RMSE and relative RMSE (RMSE normalized
-by the default's own mean severity, in %) across pixels, against that
-config's own family default -- and reported in ONE multi-panel figure that
-puts wind-CF tuning, the zero-threshold hypothesis, and solar-CF tuning
-side by side (instead of the three separate per-family map/scatter figures
-this script used to produce). R2, MAE and the Spearman rank correlation of
-the reference-period -> rest-of-record relative change are kept as extra
-columns in the summary table for anyone who wants to build a different view
-from it. Figure width and font sizes are harmonized with fig1.py's
-FIG_WIDTH_IN / panel-letter / title conventions so this sits visually
-alongside the paper's other figures.
-
-For each family ("wind" or "solar"), "default" is the reference every other
-tuning config in that family is compared against (unlike
-supptab3_wind_extrapolation_sensitivity.py, which uses wind100 as reference); the *other* CF
-model (solar when sweeping wind, wind when sweeping solar) stays fixed at
-its own default throughout, so each family's comparison isolates that one
-model's tuning choice. The zero-threshold hypothesis ("raw_threshold") is
-wind-only and compared against the same wind "default".
-
-Zero-inflation background (why "raw_threshold" exists): every
-threshold-fitting step in this pipeline computes the "low wind"/"low solar"
-event threshold as the q-th quantile of *non-zero* CF values only
-(`x_ref.where(x_ref > 0).quantile(q)`). Solar is zero every night by
-construction, so filtering zeros there just keeps the threshold meaningful
-over daylight hours. Wind is zero whenever wind speed is below the
-turbine's cut-in speed; a pixel where wind speed is *always* below cut-in
-has wcf == 0 on every day of the reference period, so `.where(wcf_ref>0)`
-turns the whole slice to NaN and the quantile comes out NaN -- `wcf <=
-wcf_thr` is then False every day, and the pixel silently contributes 0 to
-frequency/severity instead of being flagged high-risk. The "wind" family's
-zero-fraction diagnostics (printed before the severity sweep) and the
-"raw_threshold" config quantify how much this default zero-filtering
-choice matters.
-
-Source data / dependencies: identical to supptab3_wind_extrapolation_sensitivity.py (see its
-docstring) -- config.ERA5_REGRID_ZARR2_DIR, dependency-light imports
-(wind_potential.py / compute_solar_cf.py only, no xesmf/xclim/xagg,
-geopandas or cartopy -- this script has no maps).
-
-Outputs (under --out_dir):
-  cf_tuning_severity_summary.csv          -- one row per non-default config,
-                                              each compared against its
-                                              `reference` config (group,
-                                              config, reference, R2, MAE,
-                                              RMSE, relative_RMSE_pct,
-                                              Spearman rho/p-value, n_pixels,
-                                              axis-mismatch counts), plus a
-                                              "wind_pairwise" group of extra
-                                              wind-alternative-vs-alternative
-                                              rows (currently just
-                                              shear_uniform vs. wind100 --
-                                              shear_local vs. wind100 is
-                                              already the "wind" group's
-                                              "wind100" row, since
-                                              shear_local is the default)
-  cf_tuning_severity_effect_summary.png   -- 2-panel bar chart (RMSE,
-                                              relative RMSE) of every config
-                                              vs. its family default,
-                                              grouped wind / zero-hypothesis
-                                              / solar
+Outputs (in --out_dir):
+  cf_tuning_severity_summary.csv         R2, MAE, RMSE, relative RMSE and
+                                         Spearman rho of the relative change,
+                                         per config vs its family default
+                                         (plus shear_uniform vs wind100)
+  cf_tuning_severity_effect_summary.png  RMSE and relative RMSE bar charts
 
 Usage:
     python supptab2_cf_sensitivity.py
@@ -100,7 +43,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 from wind_potential import (
     DEFAULT_DS_CF_CONFIG,
     get_hub_height_wind, compute_wind_potential_from_hub_wind,
@@ -116,11 +59,9 @@ from supptab3_wind_extrapolation_sensitivity import (
 REFERENCE = "default"
 
 # =============================================================================
-# Graphical config -- matches fig1.py's FIG_WIDTH_IN and the font sizes it
-# uses for supplementary/summary figures (panel letters, titles, ticks),
-# so this sits visually alongside the paper's other figures.
+# Figure style (as in fig1.py)
 # =============================================================================
-FIG_WIDTH_IN = 5.15          # LaTeX single-column width, matches fig1.FIG_WIDTH_IN
+FIG_WIDTH_IN = 5.15          # LaTeX single-column width
 SUPTITLE_FONTSIZE = 8
 PANEL_LETTER_FONTSIZE = 8
 AXIS_LABEL_FONTSIZE = 6
@@ -158,14 +99,8 @@ _FAMILY_CONFIGS = {"wind": WIND_TUNING_CONFIGS, "solar": SOLAR_TUNING_CONFIGS}
 
 
 # =============================================================================
-# Zero-inflation diagnostics (folded in from the former analyze_zero_cf.py).
-# Wind-only: wind speed below a turbine's cut-in speed makes wcf exactly 0,
-# and a pixel that's always below cut-in over the reference period turns the
-# default `.where(wcf_ref>0).quantile(q)` threshold into NaN there (see
-# module docstring). These are printed diagnostics only, run once before the
-# wind severity sweep -- the "raw_threshold" config below is what actually
-# quantifies the effect on severity (RMSE/relative RMSE, alongside every
-# other tuning config, in the summary CSV/figure).
+# Zero-wcf diagnostics (printed only; the effect on severity is the
+# "raw_threshold" config)
 # =============================================================================
 
 def zero_fraction(da, dim="time"):
@@ -176,8 +111,7 @@ def zero_fraction(da, dim="time"):
 
 
 def summarize_zero_fraction(frac, label):
-    """Print a distribution of per-pixel zero-fraction (NaNs, e.g. outside
-    the region mask, excluded)."""
+    """Print the distribution of per-pixel zero fraction."""
     vals = frac.values
     valid = np.isfinite(vals)
     n_valid = int(valid.sum())
@@ -199,8 +133,7 @@ def summarize_zero_fraction(frac, label):
 
 
 def report_removal_cutoffs(frac_wcf_ref):
-    """Show how many pixels get flagged as 'always-zero wind' at several
-    candidate cutoffs, to make the removal criterion's sensitivity explicit."""
+    """Number of 'always-zero wind' pixels for several zero-fraction cutoffs."""
     vals = frac_wcf_ref.values
     n_valid = int(np.isfinite(vals).sum())
     print(f"\n--- 'Always-zero wind' pixel counts by cutoff ({n_valid} valid pixels) ---")
@@ -225,13 +158,12 @@ def report_zero_diagnostics(wcf_default, ref_period):
 
 
 # =============================================================================
-# Severity (reproduces supptab3_wind_extrapolation_sensitivity.yearly_severity_for_method,
-# split so wcf/scf can be supplied independently -- that version always
-# recomputes wcf from cfg and takes scf as a fixed input, which only fits
-# the wind sweep; here either side can be the one held fixed.)
+# Severity
 # =============================================================================
 
 def _yearly_severity(wcf, scf, ref_period, quantile, filter_zero_wind=True, filter_zero_solar=True):
+    """Yearly per-pixel severity from given wcf and scf (thresholds from the
+    reference period, zeros excluded unless filter_zero_* is False)."""
     wcf_ref = wcf.sel(time=slice(*ref_period))
     scf_ref = scf.sel(time=slice(*ref_period))
     wcf_src = wcf_ref.where(wcf_ref > 0) if filter_zero_wind else wcf_ref
@@ -249,16 +181,8 @@ def _yearly_severity(wcf, scf, ref_period, quantile, filter_zero_wind=True, filt
 
 
 def compute_family_severity(family, ds, alpha, ref_period, quantile, skip_zero_diagnostics=False):
-    """
-    Yearly per-pixel severity for every tuning config in `family`. The
-    non-swept CF model (solar when family='wind', wind when family='solar')
-    is held at its own default throughout, computed once and reused.
-
-    For family='wind', an extra "raw_threshold" config is appended: same
-    wcf/scf as "default", but the low-wind threshold is fit on the raw
-    (zero-inclusive) quantile instead of the pipeline's zero-filtered one --
-    see the module docstring and report_zero_diagnostics.
-    """
+    """Yearly severity for every config of `family` ('wind' or 'solar'), the
+    other model held at its default. 'wind' also gets "raw_threshold"."""
     configs = _FAMILY_CONFIGS[family]
 
     wind_hub_default = get_hub_height_wind(ds, DEFAULT_DS_CF_CONFIG, alpha=alpha)
@@ -299,10 +223,7 @@ def compute_family_severity(family, ds, alpha, ref_period, quantile, skip_zero_d
 
 
 # =============================================================================
-# Per-config metrics (mean-severity RMSE / relative RMSE / R2 / MAE against
-# the family default, plus Spearman rank correlation of the reference-period
-# -> rest-of-record relative change) -- everything the summary table/figure
-# needs, computed once per config.
+# Metrics vs the family default
 # =============================================================================
 
 def _mae(y_true, y_pred):
@@ -320,11 +241,7 @@ def _rmse(y_true, y_pred):
 
 
 def _relative_rmse(y_true, y_pred):
-    """RMSE normalized by the mean of the reference (y_true), as a
-    percentage (a.k.a. NRMSE/CV(RMSE)) -- puts wind/zero-hypothesis/solar
-    configs, whose severity units differ in typical magnitude, on one
-    comparable scale, without the per-pixel divide-by-near-zero blowups a
-    pixel-wise relative-difference map would have near-zero severity."""
+    """RMSE as a percentage of the mean of y_true (CV(RMSE))."""
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
     if not valid.any():
         return np.nan
@@ -343,11 +260,8 @@ def _rel_change(sev, ref_start_year, ref_end_year):
 
 
 def compute_group_summary(group, severities, other_names, reference, ref_period, axis_thr=1e-6):
-    """One summary row per config in `other_names`, all compared against
-    `severities[reference]` -- usually that group's own family default, but
-    `reference` can be any other key in `severities` (see
-    compute_wind_pairwise_summary, which compares two non-default wind
-    configs directly instead of each against "default")."""
+    """One summary row per config in `other_names`, compared against
+    severities[reference]."""
     mean_severity = {n: severities[n].mean(dim="year") for n in [reference, *other_names]}
     ref_start_year = int(pd.Timestamp(ref_period[0]).year)
     ref_end_year = int(pd.Timestamp(ref_period[1]).year)
@@ -382,23 +296,14 @@ def compute_group_summary(group, severities, other_names, reference, ref_period,
 
 
 def compute_wind_pairwise_summary(severities_wind, ref_period):
-    """Extra rows comparing wind hub-height extrapolation alternatives
-    directly against each other, in addition to each-vs-"default"
-    (shear_local) already covered by the "wind" group:
-      - "uniform_vs_wind100": shear_uniform vs. wind100 (neither is the
-        pipeline default; both are alternatives to shear_local).
-    "local vs 100m" is NOT recomputed here -- DEFAULT_DS_CF_CONFIG already
-    uses wind_method="shear_local", so it's exactly the "wind" group's
-    existing config="wind100" row (reference="default")."""
+    """wind100 vs shear_uniform (shear_local vs wind100 is already the "wind"
+    group's wind100 row)."""
     return compute_group_summary(
         "wind_pairwise", severities_wind, ["wind100"], "shear_uniform", ref_period)
 
 
 # =============================================================================
-# Consolidated multi-panel figure: every tuning config's RMSE / relative
-# RMSE vs. its family default, grouped wind / zero-hypothesis / solar on one
-# comparable scale. Width/fonts harmonized with fig1.py (FIG_WIDTH_IN,
-# panel-letter style, title/tick font sizes).
+# Summary figure: RMSE / relative RMSE of every config vs its family default
 # =============================================================================
 
 def plot_severity_effect_summary(summary, out_path):
@@ -453,8 +358,7 @@ def plot_severity_effect_summary(summary, out_path):
 
 
 # =============================================================================
-# Full analysis: both families + the zero-threshold hypothesis, combined
-# into one summary table and one summary figure.
+# Full analysis
 # =============================================================================
 
 def analyze_all(ds, alpha, ref_period, quantile, out_dir, skip_zero_diagnostics=False):
@@ -496,14 +400,13 @@ def main():
     default_out_dir = os.path.join(config.SUMMARY_FIGS_DIR, "cf_tuning_comparison")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src_dir", default=config.ERA5_REGRID_ZARR2_DIR,
-                    help="regridded ERA5 archive, W5E5 grid, Zarr format 2 (default: config.ERA5_REGRID_ZARR2_DIR)")
+                    help="ERA5 regridded to the W5E5 grid (Zarr v2)")
     ap.add_argument("--path_folder", default=config.PATH_FOLDER,
-                    help="fallback root for the cached shear exponent (default: config.PATH_FOLDER)")
+                    help="fallback location of the cached shear exponent")
     ap.add_argument("--path_preprocessed", default=config.PATH_PREPROCESSED,
-                    help="preferred root for the cached shear exponent (default: config.PATH_PREPROCESSED)")
+                    help="preferred location of the cached shear exponent")
     ap.add_argument("--alpha_path", default=None,
-                    help="cached local shear exponent .nc; default derived from "
-                         "--path_preprocessed/--path_folder + --ref_start/--ref_end")
+                    help="cached local shear exponent .nc (default: derived from the paths above)")
     ap.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
     ap.add_argument("--out_dir", default=default_out_dir)
     ap.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
@@ -512,7 +415,7 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="only load the first N monthly stores (for testing)")
     ap.add_argument("--no_mask", action="store_true", help="skip the land/region shapefile mask")
     ap.add_argument("--skip_zero_diagnostics", action="store_true",
-                    help="skip the wind zero-fraction diagnostic report (printed by default)")
+                    help="skip the wind zero-fraction report")
     args = ap.parse_args()
     ref_period = (args.ref_start, args.ref_end)
     os.makedirs(args.out_dir, exist_ok=True)

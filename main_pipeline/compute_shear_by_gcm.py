@@ -1,31 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Fit the local (per-pixel) Hellmann wind shear exponent (10 m -> 100 m) on
-each target GCM's own native grid, for the reference period
-1982-01-01..2001-12-31.
+Local Hellmann wind shear exponent (10 m -> 100 m) on each GCM's native grid,
+fit over 1982-2001.
 
-Unlike compute_era5_regrid_shear.py (which fits alpha on the ERA5_regrid
-0.5 deg grid) or calculate_cf.regrid_alpha_to_grid (which interpolates an
-*already-fit* alpha field onto the target grid), this script regrids the
-wind speeds first: ERA5 u10/v10/u100/v100 (from ERA5_regrid, the 0.5 deg
-W5E5-grid archive; see regrid_era5_to_w5e5.py) are bilinearly interpolated
-onto each GCM's native lat/lon grid, and alpha is computed from those
-regridded wind speeds. This is the approach requested for the 14-GCM
-ensemble used in this project, so that the wind shear used to extrapolate
-each GCM's own 10 m wind to hub height reflects that GCM's own resolution.
-
-GCM grids are read directly off one real preprocessed file per GCM under
-E:/preprocessed_gwl1/{GCM}/ rather than reconstructed from resolution specs
--- several of them (CanESM5, CNRM-CM6-1, MPI-ESM1-2-LR, ...) are Gaussian
-(spectral) grids that are not evenly spaced in latitude.
-
-xesmf/ESMF is not installed on this machine (config.py's ESMFMKFILE paths
-are HPC-only), so this uses xarray's bilinear .interp() rather than
-conservative regridding. All 14 target GCM grids are coarser than the
-0.5 deg ERA5_regrid source grid, so this is downsampling, not upsampling.
-
-Sea pixels are masked out (per-GCM, after regridding) using
-shp_re.shp (same shapefile as fit_local_shear.py's DEFAULT_SHAPEFILE).
+ERA5 u10/v10/u100/v100 on the W5E5 0.5 deg grid are interpolated
+(bilinear) onto each GCM grid before fitting alpha, so the shear matches the
+GCM's resolution. GCM grids are read from one preprocessed file per GCM
+(several are Gaussian grids). Sea pixels are masked with shp_re.shp. Paths
+below are those of the local machine where this was run.
 
 Output: one file per GCM,
     {OUT_DIR}/shear_exponent_{GCM}_1982-01-01_2001-12-31.nc
@@ -41,16 +23,12 @@ import glob
 import os
 import sys
 
-# Must be imported before xarray/zarr (pulled in below): on this machine,
-# zarr's codec libs shadow netCDF4's HDF5 DLL of the same name if netCDF4 is
-# imported second, causing "DLL load failed" at write time.
+# Import before xarray/zarr, whose HDF5 DLL otherwise shadows netCDF4's on Windows.
 import netCDF4  # noqa: F401
 
 import numpy as np
 import xarray as xr
 
-# config.py lives one level up, at the repo root, and puts main_pipeline/
-# (fit_local_shear.py) on sys.path.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -96,9 +74,8 @@ def load_era5_wind(era5_dir=ERA5_REGRID_DIR, ref_period=REF_PERIOD):
 
 
 def _extend_lon_periodic(ds, lon_dim="longitude"):
-    """Pad the (global, periodic) longitude axis by one cell on each side,
-    so .interp() near the -180/180 seam (e.g. a GCM grid point exactly at
-    lon=-180) isn't extrapolating past ERA5's cell-center bounds."""
+    """Pad longitude by one periodic cell on each side so .interp() near
+    -180/180 doesn't extrapolate."""
     lon = ds[lon_dim].values
     left = ds.isel({lon_dim: [-1]}).assign_coords({lon_dim: [lon[-1] - 360.0]})
     right = ds.isel({lon_dim: [0]}).assign_coords({lon_dim: [lon[0] + 360.0]})
@@ -106,12 +83,9 @@ def _extend_lon_periodic(ds, lon_dim="longitude"):
 
 
 def regrid_wind_to_gcm(era5_wind, gcm_lat, gcm_lon):
-    """Bilinearly interpolate u10/v10/u100/v100 onto the (gcm_lat, gcm_lon)
-    grid. Target latitudes are clipped to ERA5's cell-center range (+-89.75)
-    before interpolating -- GCM grids that include the exact pole (+-90,
-    e.g. IPSL-CM6A-LR, NorESM2-MM) would otherwise extrapolate; the returned
-    field still carries the true (unclipped) pole latitude as its
-    coordinate, it just reuses the nearest ERA5 row's value there."""
+    """Bilinear interpolation of u10/v10/u100/v100 onto the GCM grid. Latitudes
+    are clipped to ERA5's range (+-89.75) so grids with the exact pole reuse
+    the nearest row instead of extrapolating."""
     era5_ext = _extend_lon_periodic(era5_wind)
     lat_min = float(era5_wind["latitude"].min())
     lat_max = float(era5_wind["latitude"].max())

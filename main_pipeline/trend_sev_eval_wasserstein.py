@@ -1,58 +1,20 @@
 # -*- coding: cp1252 -*-
 """
-Empirical-distribution twin of trend_sev_eval.py's uncertainty_range()/
-slopes_samples(): instead of approximating each realization's bootstrap
-trend distribution as a Gaussian (mean_trend, std back-solved from the CI
-half-width -- see classify_gcm_trend_agreement.py's pixel_wasserstein()) and
-comparing it to a single ERA5 composite already upsampled onto the fine
-reanalysis grid, this module keeps every bootstrap replicate and compares
-each GCM/run's own empirical trend distribution directly against ERA5's,
-computed *at the GCM's own native grid resolution*.
+Empirical Wasserstein (W2) distance between each GCM run's bootstrap
+distribution of severity trends and ERA5's, used to weight the ensemble.
 
-This is a deliberately standalone copy: every low-level helper below
-(compute_severity, duration_xr, the vectorized stationary-bootstrap index/
-slope machinery, preprocess_single_sev, ...) is duplicated from
-trend_sev_eval.py rather than imported from it, so this module never
-silently drifts if that file changes. Only generic infrastructure (config,
-io_utils) is shared, same as trend_sev_eval.py itself shares them.
+Both distributions are computed on the GCM's native grid (ERA5 there is the
+wcf_ref_*/scf_ref_* regridded by calculate_cf.py), keeping every bootstrap
+replicate. Low-level helpers are copied from trend_sev_eval.py so this
+module stays self-contained.
 
-Key realization that makes an at-native-resolution comparison possible with
-no extra regridding: wcf_ref_{GCM}_{reanalysis}/scf_ref_{GCM}_{reanalysis}
-(calculate_cf.calculate_ds_cf_reanalysis_grid_GCM) are *already* ERA5
-regridded onto each GCM's own native grid via conservative_normed area
-weighting -- trend_sev_eval.py's _build_ref_severity_grid() already loads
-these files, it just upsamples the result back onto the fine ERA5 grid
-(nearest_s2d) as its very last step. _build_ref_severity_native() below is
-that same function with the upsample removed, so "the regridded ERA5 at the
-corresponding GCM grid" is exactly this file's severity, on the GCM's own
-native (lat, lon).
-
-Three pipelines:
-  - wasserstein_empirical_grid(): per-pixel (at the GCM's native grid, then
-    "downscaled" -- upsampled via nearest_s2d, the same convention as
-    every other GCM-to-ERA5-grid step in this project -- back onto the
-    fine ERA5 grid for a shared, comparable grid across realizations)
-    empirical 2-Wasserstein distance between each realization's own
-    bootstrap trend distribution and ERA5's, plus that distance normalized
-    by ERA5's own bootstrap trend std at each pixel.
-  - wasserstein_empirical_agg(): aggregated-domain twin of
-    wasserstein_empirical_grid() -- the same empirical W2 recipe, but
-    starting from wcf_agg_*/scf_agg_* (a single 'poly_idx' spatial dim,
-    already spatially aggregated onto administrative polygons by
-    calculate_cf.py, one series per polygon) instead of wcf_day_*/scf_day_*
-    (lat, lon). Mirrors trend_sev_eval.py's own aggregated-domain pipeline
-    (preprocess_single_sev_agg/_build_ref_severity_agg/duration_xr_by_poly).
-    No xesmf regrid step anywhere here: every realization and ERA5's own
-    polygon-aggregated reference already share the same poly_idx index (the
-    one shapefile used to build the _agg_ files, config.AGREEMENT_SUFFIX_SHP).
-  - region_empirical_trend_samples(): the same idea restricted to a
-    region-mean series (as trend_sev_eval.py's slopes_samples() does), but
-    keeping every bootstrap replicate instead of just the low/up/mean
-    summary, so a region's actual empirical trend distribution can be
-    plotted or have its own empirical W2 recomputed directly from the
-    plotted samples.
-
-Run with the same conda environment as trend_sev_eval.py (needs xesmf).
+Pipelines:
+  - wasserstein_empirical_grid(): per pixel, then put on the ERA5 grid
+    (nearest_s2d); w2_distance and w2_normalized (divided by ERA5's
+    bootstrap trend std).
+  - wasserstein_empirical_agg(): the same per region (poly_idx).
+  - region_empirical_trend_samples(): bootstrap trend samples of region-mean
+    severity (ED Fig. 3).
 """
 import os
 import glob
@@ -60,7 +22,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 
 import xesmf as xe
@@ -71,18 +33,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from io_utils import match_files, glob_any, open_dataset_any
 
-# Below this ERA5 bootstrap-trend std, a pixel is treated as having ~zero
-# reference variability and dropped (NaN) from w2_normalized rather than
-# divided into: real sigma_ref values across the grid sit in ~[1e-3, 2e-2],
-# with a separate population pinned at ~0 (e.g. pixels where severity is
-# always zero) -- dividing those by a tiny epsilon floor instead of masking
-# them produced w2_normalized outliers up to ~1e10.
+# Below this ERA5 bootstrap-trend std (real values ~1e-3..2e-2; ~0 where
+# severity is always zero), w2_normalized is NaN instead of exploding.
 SIGMA_REF_MIN = 1e-6
 
 
 # ---------------------------------------------------------------------------
-# Duplicated low-level helpers (see trend_sev_eval.py for the originals --
-# kept byte-for-byte identical in behavior on purpose, see module docstring).
+# Helpers copied from trend_sev_eval.py
 # ---------------------------------------------------------------------------
 
 def _parse_exclude_gcm_run(exclude_gcm_run):
@@ -99,9 +56,7 @@ def _pos_quantile(da, q):
 
 
 def _target_grid(preprocessed_path, reanalysis):
-    """The reanalysis's own daily wcf record -- the fine grid every per-pixel output here is
-    finally "downscaled" (upsampled via nearest_s2d) onto, same target as trend_sev_eval.py's
-    _target_grid()."""
+    """Reanalysis wcf_day_* grid, onto which per-pixel outputs are regridded."""
     files, _ = match_files(os.path.join(preprocessed_path, reanalysis, 'wcf_day*'))
     if not files:
         raise FileNotFoundError(
@@ -181,14 +136,7 @@ def duration_xr(da):
 
 
 def duration_xr_by_poly(da):
-    """
-    Same event-duration/frequency algorithm as duration_xr(), but for data
-    aggregated onto administrative polygons (a single 'poly_idx' spatial dim,
-    as produced by calculate_cf.py's wcf_agg_*/scf_agg_* files) instead of a
-    (lat, lon) grid -- duplicated from trend_sev_eval.py's function of the
-    same name (see module docstring), used by preprocess_single_sev_agg /
-    _build_ref_severity_agg below.
-    """
+    """duration_xr() for region-aggregated data (single 'poly_idx' dim)."""
     da = da.convert_calendar('standard')
 
     first_time = pd.Timestamp(da.time[0].values)
@@ -243,13 +191,8 @@ def duration_xr_by_poly(da):
 
 
 def _severity_from_cf(wcf_gwl061, scf_gwl061, wcf_gwl1, scf_gwl1, duration_fn=duration_xr):
-    """
-    Per-model GWL0-61 threshold -> compound flag -> severity -> 40-year
-    concatenated series. `duration_fn` is the only piece that differs between
-    the gridded (duration_xr, (lat, lon)) and aggregated (duration_xr_by_poly,
-    poly_idx) pipelines -- same split as trend_sev_eval.py's function of the
-    same name.
-    """
+    """GWL0-61 thresholds -> compound days -> annual severity, as a 40-year
+    GWL0-61 + GWL1 series (duration_fn: gridded or per-region)."""
     wcf_thr = _pos_quantile(wcf_gwl061.wcf, 0.1)
     scf_thr = _pos_quantile(scf_gwl061.scf, 0.1)
 
@@ -299,8 +242,7 @@ def _severity_from_cf(wcf_gwl061, scf_gwl061, wcf_gwl1, scf_gwl1, duration_fn=du
 
 
 def preprocess_single_sev(preprocessed_path, GCM, run, reanalysis=None):
-    """Concatenated GWL0-61 + GWL1 40-year severity series, on the GCM's own native grid (no
-    regrid anywhere in this function -- wcf_day_*/scf_day_* are the GCM's native-grid fields)."""
+    """40-year GWL0-61 + GWL1 severity series on the GCM's native grid."""
     reanalysis = reanalysis or config.REANALYSIS
 
     def _load(var, gwl):
@@ -320,14 +262,7 @@ def preprocess_single_sev(preprocessed_path, GCM, run, reanalysis=None):
 
 
 def preprocess_single_sev_agg(preprocessed_path, GCM, run, reanalysis=None, suffix_shp=None):
-    """
-    Aggregated-domain twin of preprocess_single_sev(): identical severity/
-    duration/frequency/40-year-concatenation recipe (via _severity_from_cf()),
-    but starting from wcf_agg_*/scf_agg_* (poly_idx dim, already spatially
-    aggregated onto administrative polygons by calculate_cf.py) instead of
-    wcf_day_*/scf_day_* (lat, lon). Mirrors trend_sev_eval.py's function of
-    the same name.
-    """
+    """preprocess_single_sev() from region-aggregated wcf_agg_*/scf_agg_*."""
     reanalysis = reanalysis or config.REANALYSIS
     suffix_shp = suffix_shp or config.AGREEMENT_SUFFIX_SHP
 
@@ -348,16 +283,7 @@ def preprocess_single_sev_agg(preprocessed_path, GCM, run, reanalysis=None, suff
 
 
 def _build_ref_severity_agg(preprocessed_path, GCM, run, reanalysis, suffix_shp):
-    """
-    Aggregated-domain twin of _build_ref_severity_native(): ERA5's
-    reference-period severity under this GCM/run's own GWL0-61 threshold, on
-    wcf_agg_ref_*/scf_agg_ref_* (poly_idx) instead of wcf_ref_*/scf_ref_*
-    (lat, lon). No regrid anywhere: these _agg_ref_ files are already ERA5
-    aggregated onto the same polygons (config.AGREEMENT_SUFFIX_SHP) as
-    wcf_agg_*/scf_agg_*, so every realization and this reference share the
-    same poly_idx index directly. Mirrors trend_sev_eval.py's function of the
-    same name.
-    """
+    """_build_ref_severity_native() from region-aggregated wcf/scf_agg_ref_*."""
     def _load(name):
         path = os.path.join(preprocessed_path, GCM, name)
         if not os.path.exists(path):
@@ -394,19 +320,8 @@ def _build_ref_severity_agg(preprocessed_path, GCM, run, reanalysis, suffix_shp)
 
 
 def _build_ref_severity_native(preprocessed_path, GCM, run, reanalysis):
-    """
-    ERA5's reference-period severity under this GCM/run's own GWL0-61
-    threshold, on the GCM's OWN NATIVE grid -- trend_sev_eval.py's
-    _build_ref_severity_grid() with its final nearest_s2d upsample onto the
-    reanalysis's fine grid removed.
-
-    No regrid happens in this function at all: wcf_ref_{GCM}_{reanalysis}/
-    scf_ref_{GCM}_{reanalysis} are already ERA5 conservative_normed-regridded
-    onto the GCM's native grid upstream, by
-    calculate_cf.calculate_ds_cf_reanalysis_grid_GCM -- that *is* "the
-    regridded ERA5 at the corresponding GCM grid using conservative normed
-    weighting".
-    """
+    """ERA5 reference severity with this GCM run's GWL0-61 thresholds, on the
+    GCM's native grid (wcf_ref_*/scf_ref_* are already ERA5 regridded there)."""
     wcf_gwl061_files, _ = match_files(
         os.path.join(preprocessed_path, GCM, f'wcf_day_{GCM}_{config.SSP}_{run}_GWL0-61_{reanalysis}'))
     scf_gwl061_files, _ = match_files(
@@ -446,9 +361,7 @@ def _build_ref_severity_native(preprocessed_path, GCM, run, reanalysis):
 
 
 # ---------------------------------------------------------------------------
-# Vectorized stationary-bootstrap machinery (see trend_sev_eval.py's own
-# comment block for why this is vectorized across replicates instead of a
-# per-cell Python loop -- identical here).
+# Vectorized stationary bootstrap (as in trend_sev_eval.py)
 # ---------------------------------------------------------------------------
 
 def _stationary_bootstrap_indices(n, n_boot, block_size, rng):
@@ -483,9 +396,7 @@ def _slopes_from_indices(y, idx):
 
 
 def _stationary_bootstrap_slopes(y, n_boot=2000, block_size=5, rng=None):
-    """Full stationary-bootstrap OLS-slope sample array for a single 1-D series y (shape (n_boot,))
-    -- trend_sev_eval.py's _stationary_bootstrap_slopes() without the percentile/mean reduction,
-    since the region-mean pipeline below needs the raw samples, not just a CI."""
+    """All n_boot bootstrap OLS slopes of a 1-D series."""
     y = np.asarray(y, dtype=np.float64)
     if y.size < 2 or np.isfinite(y).sum() < 2:
         return np.full(n_boot, np.nan)
@@ -495,23 +406,8 @@ def _stationary_bootstrap_slopes(y, n_boot=2000, block_size=5, rng=None):
 
 
 def stationary_bootstrap_samples_grid(da, n_boot=500, block_size=5, boot_batch=250, rng=None):
-    """
-    Full stationary-bootstrap OLS-slope SAMPLE array at every point of `da`
-    (must have a 'year' dim, plus any number of other dims, e.g. lat/lon) --
-    unlike trend_sev_eval.py's stationary_bootstrap_ci_grid(), which reduces
-    the n_boot replicates straight to a percentile CI, this keeps every
-    replicate so two cells' empirical distributions can be compared directly
-    (e.g. via an empirical Wasserstein distance) instead of just their CI.
-
-    boot_batch still bounds memory during *generation* (see
-    stationary_bootstrap_ci_grid's docstring), but the full (n_boot,
-    n_cells) array is always materialized at the end -- an empirical
-    distance needs every sample, so there is no equivalent of that
-    function's streamed-percentile memory saving here.
-
-    Returns a DataArray with a leading 'boot' dim (size n_boot) plus da's
-    other (non-'year') dims/coords.
-    """
+    """All bootstrap OLS slopes at every point of `da` (needs a 'year' dim), as
+    a DataArray with a leading 'boot' dim. The full array is kept in memory."""
     if "year" not in da.dims:
         raise ValueError("Input DataArray must have a 'year' dimension.")
     rng = rng if rng is not None else np.random.default_rng()
@@ -536,20 +432,9 @@ def stationary_bootstrap_samples_grid(da, n_boot=500, block_size=5, boot_batch=2
 
 
 def empirical_w2(samples_a, samples_b):
-    """
-    Empirical 2-Wasserstein distance between two equal-size 1-D empirical
-    distributions, vectorized over every other dim shared by `samples_a`/
-    `samples_b` (e.g. lat/lon) -- both must carry a leading 'boot' dim of
-    the same size.
-
-    For two empirical measures built from the same number of equally
-    weighted samples, the W2-optimal transport plan is exactly the
-    order-statistic (sorted-value) pairing, so
-        W2 = sqrt(mean((sorted(a) - sorted(b)) ** 2))
-    is the closed-form distance -- no LP/CDF-integration solver needed, and
-    it vectorizes over every non-'boot' dim via one np.sort + elementwise op
-    instead of a per-cell scipy.stats.wasserstein_distance loop.
-    """
+    """Empirical W2 between two equal-size samples along 'boot', vectorized over
+    the other dims. For equal-weight samples the optimal pairing is by sorted
+    order: W2 = sqrt(mean((sorted(a) - sorted(b))**2))."""
     if samples_a.sizes["boot"] != samples_b.sizes["boot"]:
         raise ValueError("samples_a and samples_b must share the same 'boot' size for the "
                           "sorted-order-statistic W2 formula to apply.")
@@ -568,8 +453,8 @@ def empirical_w2(samples_a, samples_b):
 # ---------------------------------------------------------------------------
 
 def _wasserstein_realization(args):
-    """Worker: one realization's empirical W2 + normalized W2, computed at the GCM's native grid
-    and downscaled (nearest_s2d) onto the reanalysis's fine grid."""
+    """Worker: one realization's W2 and normalized W2 on its native grid,
+    regridded (nearest_s2d) onto the reanalysis grid."""
     (preprocessed_path, GCM, run, reanalysis, grid, n_boot, block_size, boot_batch, seed) = args
     rng = np.random.default_rng(seed)
 
@@ -596,30 +481,13 @@ def _wasserstein_realization(args):
 
 def wasserstein_empirical_grid(preprocessed_path, out_dir, reanalysis=None, exclude_gcm_run=None,
                                 n_boot=500, block_size=5, boot_batch=250, max_workers=4, seed=0):
-    """
-    Per-realization, per-pixel empirical 2-Wasserstein distance between each
-    GCM/run's own bootstrap trend distribution and ERA5's -- both
-    bootstrapped on the GCM's own native grid (ERA5's copy already
-    conservative-normed onto that grid upstream, see
-    _build_ref_severity_native()) -- then the resulting (lat, lon) distance
-    field is "downscaled" (regridded via nearest_s2d, same convention as
-    every other GCM-to-ERA5-grid step in this project) back onto the
-    reanalysis's fine grid, so every realization ends up on the same shared
-    grid for mapping/aggregation.
+    """Per-pixel W2 between each GCM run's and ERA5's bootstrap trend
+    distributions (both on the GCM grid), regridded onto the ERA5 grid
+    -> agg_wasserstein_empirical_GCMs_all_year_{reanalysis}.nc, dims
+    (realization, lat, lon): w2_distance, and w2_normalized (divided by ERA5's
+    trend std; NaN below SIGMA_REF_MIN).
 
-    Writes agg_wasserstein_empirical_GCMs_all_year_{reanalysis}.nc:
-    dims (realization, lat, lon), variables:
-      w2_distance   -- raw empirical W2 (severity-trend units), downscaled to the ERA5 grid.
-      w2_normalized -- w2_distance / std(ERA5's own native-grid bootstrap trend samples),
-                       also downscaled to the ERA5 grid. NaN where that std is below
-                       SIGMA_REF_MIN (near-zero ERA5 reference variability, e.g. always-zero
-                       severity) rather than a huge ratio from dividing by ~0.
-
-    n_boot defaults lower than trend_sev_eval.py's uncertainty_range()
-    (500 vs. 1000) since every replicate has to be kept in memory across the
-    whole grid here instead of being streamed straight into a percentile --
-    raise it if runtime memory allows.
-    """
+    n_boot is 500 (vs 1000 elsewhere) because all replicates stay in memory."""
     reanalysis = reanalysis or config.REANALYSIS
     exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
     grid = _target_grid(preprocessed_path, reanalysis)
@@ -648,21 +516,11 @@ def wasserstein_empirical_grid(preprocessed_path, out_dir, reanalysis=None, excl
 
 
 # ---------------------------------------------------------------------------
-# Aggregated-domain (per-polygon) empirical W2 pipeline: same recipe as the
-# full-grid pipeline above, but starting from wcf_agg_*/scf_agg_* (poly_idx)
-# instead of wcf_day_*/scf_day_* (lat, lon) -- see module docstring and
-# trend_sev_eval.py's own aggregated-domain pipeline (preprocess_single_sev_agg/
-# _build_ref_severity_agg/duration_xr_by_poly), which this mirrors.
+# Per-region (poly_idx) empirical W2 pipeline
 # ---------------------------------------------------------------------------
 
 def _iter_gcm_runs_agg(preprocessed_path, ssp, reanalysis, suffix_shp, gwl):
-    """
-    Yield (GCM, run) for every wcf_agg_*_{gwl}_{reanalysis}_{suffix_shp}.nc
-    file under preprocessed_path. Parses filenames by locating `ssp` in the
-    underscore-split name (duplicated from trend_sev_eval.py's function of
-    the same name) rather than fixed negative indices, since GCM names may
-    themselves contain underscores.
-    """
+    """Yield (GCM, run) for every wcf_agg_*_{gwl}_{reanalysis}_{suffix_shp}.nc."""
     pattern = os.path.join(preprocessed_path, '*',
                            f'wcf_agg_*{gwl}_{reanalysis}_{suffix_shp}.nc')
     for fpath in sorted(glob.glob(pattern)):
@@ -677,8 +535,7 @@ def _iter_gcm_runs_agg(preprocessed_path, ssp, reanalysis, suffix_shp, gwl):
 
 
 def _wasserstein_realization_agg(args):
-    """Worker: one realization's empirical W2 + normalized W2, per polygon (poly_idx).
-    No regrid: wcf_agg_*/wcf_agg_ref_* already share the same poly_idx index."""
+    """Worker: one realization's W2 and normalized W2 per region."""
     (preprocessed_path, GCM, run, reanalysis, suffix_shp, n_boot, block_size, boot_batch, seed) = args
     rng = np.random.default_rng(seed)
 
@@ -704,20 +561,9 @@ def _wasserstein_realization_agg(args):
 def wasserstein_empirical_agg(preprocessed_path, out_dir, reanalysis=None, exclude_gcm_run=None,
                                suffix_shp=None, n_boot=500, block_size=5, boot_batch=250,
                                max_workers=4, seed=0):
-    """
-    Aggregated-domain (per-polygon) twin of wasserstein_empirical_grid():
-    per-realization, per-polygon empirical 2-Wasserstein distance between
-    each GCM/run's own bootstrap trend distribution (from wcf_agg_*/scf_agg_*)
-    and ERA5's own (from wcf_agg_ref_*/scf_agg_ref_*, already aggregated onto
-    the same polygons -- see _build_ref_severity_agg()). No xesmf regrid step
-    anywhere: every realization and the ERA5 reference already share the same
-    poly_idx index (config.AGREEMENT_SUFFIX_SHP).
-
-    Writes agg_wasserstein_empirical_GCMs_aggregated_{reanalysis}_{suffix_shp}.nc:
-    dims (realization, poly_idx), variables:
-      w2_distance   -- raw empirical W2 (severity-trend units).
-      w2_normalized -- w2_distance / std(ERA5's own polygon-aggregated bootstrap trend samples).
-    """
+    """wasserstein_empirical_grid() per region
+    -> agg_wasserstein_empirical_GCMs_aggregated_{reanalysis}_{suffix_shp}.nc,
+    dims (realization, poly_idx)."""
     reanalysis = reanalysis or config.REANALYSIS
     suffix_shp = suffix_shp or config.AGREEMENT_SUFFIX_SHP
     exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
@@ -745,8 +591,7 @@ def wasserstein_empirical_agg(preprocessed_path, out_dir, reanalysis=None, exclu
 
 
 # ---------------------------------------------------------------------------
-# Region-mean empirical trend-sample pipeline (keeps every bootstrap
-# replicate, unlike trend_sev_eval.py's slopes_samples()).
+# Region-mean bootstrap trend samples
 # ---------------------------------------------------------------------------
 
 def _region_samples_realization(args):
@@ -778,25 +623,9 @@ def _region_samples_realization(args):
 
 def region_empirical_trend_samples(preprocessed_path, out_dir, reanalysis=None, exclude_gcm_run=None,
                                     regions=None, n_boot=2000, block_size=5, max_workers=4, seed=0):
-    """
-    Region-mean twin of wasserstein_empirical_grid(): full bootstrap trend
-    SAMPLE arrays (not just the low/up/mean summary trend_sev_eval.py's
-    slopes_samples() keeps) for each GCM/run's own region-mean severity
-    series, and for ERA5's own region-mean series on that GCM's native grid
-    (region-mean of _build_ref_severity_native()'s output) -- the samples
-    needed to draw each realization's actual empirical trend distribution
-    (not a Gaussian approximation), and to recompute an empirical W2 for a
-    region directly from the same samples that get plotted.
-
-    Default `regions` is trend_sev_eval.py's full 4-box REGIONS (Guiana
-    Shield/"Northern Amazon", Western U.S., India, Kenya) -- all four are
-    needed for classify_gcm_trend_agreement.py's panel d (the by-region dot
-    plot), which uses this same aggregate-first W2 for every region shown,
-    not just the two (Northern Amazon, India) panels b/c draw curves for.
-
-    Writes region_trend_samples_{reanalysis}.nc: dims (realization, region,
-    boot), variables gcm_trend_samples / ref_trend_samples, coords GCM, run.
-    """
+    """All bootstrap trend samples of the region-mean severity of each GCM run
+    and of ERA5 on its grid, for the four trend_sev_eval.py regions (ED Fig. 3)
+    -> region_trend_samples_{reanalysis}.nc, dims (realization, region, boot)."""
     reanalysis = reanalysis or config.REANALYSIS
     exclude_gcm_run = _parse_exclude_gcm_run(exclude_gcm_run)
     if regions is None:
@@ -837,27 +666,21 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--max-workers', type=int, default=4)
     parser.add_argument('--n-boot', type=int, default=500,
-                         help="Bootstrap replicates for the full-grid empirical W2 pipeline "
-                              "(default 500 -- every replicate is kept in memory across the "
-                              "whole grid, unlike trend_sev_eval.py's percentile-only bootstrap).")
+                         help="Bootstrap replicates for the per-pixel W2.")
     parser.add_argument('--n-boot-region', type=int, default=2000,
-                         help="Bootstrap replicates for the region-mean trend-sample pipeline "
-                              "(default 2000, matching trend_sev_eval.py's slopes_samples()).")
+                         help="Bootstrap replicates for the regional trend samples.")
     parser.add_argument('--block-size', type=int, default=5)
     parser.add_argument('--boot-batch', type=int, default=250)
     parser.add_argument('--exclude_gcm_run', nargs='+', default=config.EXCLUDE_GCM_RUN,
-                         help="GCM:run pairs to exclude, same convention as trend_sev_eval.py.")
+                         help="GCM:run pairs to exclude.")
     parser.add_argument('--skip-grid', action='store_true',
-                         help="Skip the full-grid empirical W2 pipeline.")
+                         help="Skip the per-pixel W2.")
     parser.add_argument('--skip-regions', action='store_true',
-                         help="Skip the region-mean trend-sample pipeline.")
+                         help="Skip the regional trend samples.")
     parser.add_argument('--aggregated', action='store_true',
-                         help="Also run the aggregated-domain empirical W2 pipeline "
-                              "(wasserstein_empirical_agg, on wcf_agg_*/scf_agg_* polygons), "
-                              "same convention as trend_sev_eval.py's --aggregated flag.")
+                         help="Also compute the per-region (poly_idx) W2.")
     parser.add_argument('--suffix-shp', default=config.AGREEMENT_SUFFIX_SHP,
-                         help="Shapefile-version suffix on wcf_agg_*/scf_agg_* files for "
-                              f"--aggregated (default: {config.AGREEMENT_SUFFIX_SHP!r}).")
+                         help="Shapefile-version suffix of the wcf_agg_*/scf_agg_* files.")
     args = parser.parse_args()
 
     preprocessed_path = config.PATH_PREPROCESSED

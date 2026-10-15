@@ -1,20 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Exclusion layers shared by the map figures (fig1.py, fig3.py, fig45.py), so
-every figure uses the same style:
-
+Exclusion layers shared by the map figures:
   - grey fill : land pixels with no wind capacity (ERA5 wcf == 0 over the
-                whole reference period, and the NaN data they produce), see
-                draw_wcf_zero_overlay(). The only grey used on the maps.
-  - black dots: pixels / polygons where observed (ERA5) and projected (GCM)
-                trends disagree (agreement_pct <= config.AGREEMENT_THRESHOLD),
-                see draw_discrepancy_dots() (gridded maps). Dots rather
-                than a solid fill, so the colour underneath still shows.
-  - black mask: same discrepancy criterion on the aggregated (polygon)
-                maps (fig45.py, suppfig7_agreement_variability.py): polygons filled solid black,
-                see draw_discrepancy_mask_polygons().
-
-Kept free of config / heavy imports so any figure script can use it.
+                reference period)
+  - black dots: gridded maps, where ERA5 and GCM trends disagree
+                (agreement_pct <= config.AGREEMENT_THRESHOLD); dots keep the
+                colour underneath visible
+  - black fill: the same criterion on regional (polygon) maps
 """
 import numpy as np
 import geopandas as gpd
@@ -43,17 +35,9 @@ DISCREPANCY_DOT_COLOR = "black"
 
 def draw_wcf_zero_overlay(ax, wcf_zero_mask, land_shp, target_lat, target_lon,
                           nan_data=None, zorder=7):
-    """
-    Single grey layer for excluded land pixels, drawn in WCF_ZERO_COLOR:
-    land pixels where ERA5 wcf is exactly 0 over the whole reference period
-    (wcf_zero_mask, built by fig1.py's build_wcf_zero_mask()) OR where the
-    plotted data is NaN (nan_data, 2-D bool on target_lat x target_lon --
-    those NaNs come from the same wcf == 0 pixels). Drawn above the
-    discrepancy dots (zorder 6) so it stays visible regardless of their
-    state at the same pixel. No-op if both masks are None/empty.
-
-    Returns True if any grey pixel was drawn (e.g. to show its legend entry).
-    """
+    """Grey over land pixels in wcf_zero_mask or where the plotted data is NaN
+    (nan_data, which comes from the same pixels), above the discrepancy dots.
+    Returns True if anything was drawn."""
     land = np.asarray(land_shp, dtype=bool)
     grey = np.zeros(land.shape, dtype=bool)
     if wcf_zero_mask is not None:

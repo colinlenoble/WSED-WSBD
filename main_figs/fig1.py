@@ -4,17 +4,15 @@ Figure 1: historical changes in annual SWED severity (ERA5, 1982-2001 vs
 2002-2021) -- value-by-alpha map plus regional time series with bootstrap
 trend CIs -- and the global-mean change statistic quoted in the text.
 
-The data loading (ds_final, land mask, wcf-zero mask) and CLI defined here
-are reused by supp_figs/suppfig2_mean_variables_6panel.py,
-supp_figs/suppfig12_combined_threshold_sensitivity.py,
-supp_figs/suppfig10_aggregation_comparison.py and aux_code/extra_figs_fig1.py.
+The data loading (ds_final, land mask, wcf-zero mask) and CLI are reused by
+supp_figs/suppfig2_*, suppfig10_* and suppfig12_*.
 """
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 
@@ -30,12 +28,7 @@ from shapely.geometry import Polygon
 import rasterio
 from rasterio.features import geometry_mask
 
-# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
-# (prefers a .zarr store when present, falls back to .nc).
 from io_utils import match_files, open_dataset_any
-
-# Generic event-duration-class decomposition, shared with fig_persistent.py's
-# rolling-mean pipeline (see duration_decomposition.py).
 from duration_decomposition import (
     compute_duration_decomposition, DECOMPOSITION_DURATION_CLASSES,
 )
@@ -47,8 +40,6 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.patheffects import withStroke
 from matplotlib import cm
 
-
-# Grey "no wind capacity" layer, shared with fig3.py and fig45.py.
 from map_overlays import draw_wcf_zero_overlay
 
 # =============================================================================
@@ -56,34 +47,16 @@ from map_overlays import draw_wcf_zero_overlay
 # =============================================================================
 FIG_WIDTH_IN = 5.15   # single column width pt fontsizes match LaTeX
 
-# Latitude band shown on EqualEarth maps in this module (matches the
-# analysis's own poleward exclusion; see Methods: "Regions poleward of 68N
-# and 58S were excluded due to artifacts in the duration metric"). Applied
-# by masking data/shapefiles to this band and calling ax.set_global() --
-# NOT ax.set_extent(), which miscalibrates on EqualEarth's curved meridians:
-# it clips to the bounding rectangle of the extent box's own corners, whose
-# right edge only touches the true 180 deg meridian at MAP_LAT_SOUTH/NORTH
-# themselves, sitting well short of it at other latitudes -- slicing
-# through real land (e.g. eastern Australia) even though it's nominally
-# within +/-180 deg longitude.
+# Latitude band shown on maps (regions poleward of 68N/58S are excluded, see
+# Methods). Applied by masking + ax.set_global(): ax.set_extent() clips real
+# land on EqualEarth's curved meridians.
 MAP_LAT_SOUTH = -58
 MAP_LAT_NORTH = 68
 
 
 def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
-    """
-    White out everything poleward of [lat_south, lat_north] on a set_global()
-    EqualEarth map. Needed because cfeature.COASTLINE/ax.coastlines() draw
-    the *entire* globe's coastlines (Antarctica, remote Arctic islands)
-    regardless of how the data/shapefile were masked to this band, and
-    shp.cx[:, lat_south:lat_north] keeps whole country geometries (e.g.
-    Russia, Canada, Greenland) rather than clipping them at the band's edge
-    -- both leak real content poleward of the intended crop (see
-    MAP_LAT_SOUTH/NORTH above). Draws a white cap over each pole, in
-    PlateCarree and densely sampled in longitude so it follows the
-    projection's own curved boundary, on top of coastlines/boundaries but
-    below panel labels/region boxes (zorder 20+ elsewhere in this module).
-    """
+    """White caps poleward of [lat_south, lat_north], hiding coastlines and whole
+    country shapes drawn beyond the band (below labels, zorder 20+)."""
     lons = np.linspace(-180.0, 180.0, 361)
     for lat_edge, lat_pole in ((lat_south, -90.0), (lat_north, 90.0)):
         cap = Polygon(
@@ -99,9 +72,7 @@ def mask_poles(ax, lat_south=MAP_LAT_SOUTH, lat_north=MAP_LAT_NORTH, zorder=12):
 # =============================================================================
 
 def build_parser(description="Figure 1: historical changes in annual SWED severity (ERA5)."):
-    """CLI shared by fig1.py and the scripts built on its data loading
-    (supp_figs/suppfig2_*, supp_figs/suppfig12_*, aux_code/extra_figs_fig1.py),
-    which add their own options on top."""
+    """CLI shared with the supp_figs scripts built on fig1's data loading."""
     parser = argparse.ArgumentParser(
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -117,11 +88,7 @@ def build_parser(description="Figure 1: historical changes in annual SWED severi
     parser.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
     parser.add_argument(
         "--wcf_zero_mask_path", default=config.WCF_ZERO_MASK_NC_PATH,
-        help=(
-            "Path to the cached wcf-zero land mask (.nc, built by "
-            "build_wcf_zero_mask()). Loaded if present; otherwise it is "
-            "computed from the ERA5 reference-period record and saved here."
-        ),
+        help="Cached wcf-zero land mask; built from ERA5 and saved here if missing.",
     )
     parser.add_argument("--output_dir", default="../final_figs")
     parser.add_argument("--dpi", type=int, default=300)
@@ -148,27 +115,13 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_threshold, wcf_threshold):
 
 
 def _pixel_duration_frequency(x, times_year, out_years):
-    """
-    Run-length-encode one pixel's 0/1 daily series into per-year event
-    duration (mean length of events starting that year) and frequency
-    (count of events starting that year). 0 where no event started that
-    year at a valid (non-masked) pixel -- a "no drought" year is real,
-    known data, not missing. NaN only where the pixel itself is entirely
-    masked (e.g. ocean, via the land_mask applied to start_cooc upstream),
-    so ocean-mask overlays elsewhere that test frequency/duration.isnull()
-    keep working. Called once per pixel by duration_xr's apply_ufunc, so
-    it only ever sees a single (time,) series -- no global stack/dropna
-    over the whole cube.
-    """
+    """Per-year mean duration and number of events starting that year, for one
+    pixel's 0/1 daily series. 0 for a year without events; NaN only for a
+    fully masked (ocean) pixel."""
     n_years = out_years.shape[0]
     dur_sum = np.zeros(n_years)
     count   = np.zeros(n_years)
     x = np.asarray(x)
-    # A pixel masked out entirely (e.g. ocean, via the land_mask applied to
-    # start_cooc before this runs) arrives as all-NaN -- keep it NaN so the
-    # ocean-mask overlays elsewhere (which test frequency/duration.isnull())
-    # still work. A valid land pixel that simply had no event some year (or
-    # ever) is real, known data -- 0, not missing.
     valid_pixel = bool(x.size) and not np.all(np.isnan(x))
     if valid_pixel and np.any(x > 0):
         xb     = (x > 0).astype(np.int8)
@@ -198,15 +151,8 @@ def _pixel_duration_frequency(x, times_year, out_years):
 
 
 def duration_xr(da, tile_lat=60, tile_lon=60):
-    """
-    Per-pixel event duration/frequency via a dask-chunked apply_ufunc:
-    lat/lon are tiled (tile_lat x tile_lon x full time per task) so each
-    dask task only ever holds one tile in memory and tiles run in
-    parallel, instead of the previous approach which cumsum'd and
-    stack()+dropna()'d the *entire* (time x lat x lon) global cube into
-    one dense array/pandas dataframe -- that materialization (tens of GB
-    for a multi-decade daily global grid) is what was causing the OOM.
-    """
+    """Per-pixel event duration/frequency, computed tile by tile with dask
+    (tile_lat x tile_lon x full time) to bound memory."""
     da = da.chunk({"time": -1, "lat": tile_lat, "lon": tile_lon})
     years_arr = da["time"].dt.year.values
     out_years = np.unique(years_arr)
@@ -269,9 +215,7 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
 
     print("  Computing duration and frequency  ")
     ds_dur, ds_freq = duration_xr(compound.start_cooc)
-    # A year with no compound day is 0 severity, not missing -- but only at
-    # pixels that have valid data at all (see _pixel_duration_frequency);
-    # re-mask by frequency's NaN (ocean-only, after that fix) so ocean stays NaN.
+    # Years without events have 0 severity; ocean stays NaN.
     severity_ds = severity_ds.fillna(0.0).where(ds_freq.frequency.notnull())
 
     ds_final = ds_dur.copy()
@@ -290,21 +234,9 @@ def build_ds_final(path_preprocessed, reanalysis, thr, ref_start, ref_end, shape
 # =============================================================================
 
 def build_daily_pipeline(path_preprocessed, reanalysis, threshold, ref_start, ref_end):
-    """
-    Raw-daily counterpart of fig_persistent.py's build_persistent_pipeline:
-    loads wcf/scf, defines the classic per-day coincidence threshold from the
-    reference period, and flags compound (wind AND solar) low-production
-    days -- with no rolling-mean smoothing. Returns (wcf, scf, wcf_thr,
-    scf_thr, compound), a plain 0/1 field left un-masked (land/ocean masking
-    happens downstream via mask==1, same convention as the persistent
-    pipeline), so it can feed compute_event_table directly.
-
-    This mirrors the compound-detection block inside build_ds_final, kept as
-    a separate function here because build_ds_final applies the land mask to
-    `compound` *before* the expensive duration_xr apply_ufunc (for memory --
-    see build_land_mask_from_grid), which compute_event_table cannot accept
-    (it requires an integer 0/1 field, not NaN-masked).
-    """
+    """Daily compound low wind and low solar days (reference-period quantile
+    thresholds), as in build_ds_final but unmasked and integer 0/1, as
+    compute_event_table needs. Returns (wcf, scf, wcf_thr, scf_thr, compound)."""
     print(f"  Loading wcf/scf for reanalysis={reanalysis}")
     wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
     scf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "scf_day_*"))
@@ -338,21 +270,9 @@ def build_duration_decomposition_daily(
     path_preprocessed, reanalysis, threshold, ref_start, ref_end,
     duration_classes=DECOMPOSITION_DURATION_CLASSES, compute_severity_index=True,
 ):
-    """
-    Classic daily-coincidence half of the value-by-alpha duration-class
-    decomposition: builds the raw-daily compound-event pipeline (see
-    build_daily_pipeline, the same event definition as build_ds_final /
-    this file's headline severity index) and hands it off to the generic
-    compute_duration_decomposition (see duration_decomposition.py), shared
-    with fig_persistent.py's build_duration_decomposition_persistent. This
-    lets the value-by-alpha decomposition ask, for fig1's own main result,
-    "which event-duration class (1 day, 2 days, 3+ days) is driving the
-    change" -- rather than re-deriving an approximation of it from the
-    persistent (rolling-mean) pipeline.
-
-    Returns ({label: annual_index_DataArray}, resource_valid, freq_all,
-    freq_by_class) -- see compute_duration_decomposition for details.
-    """
+    """Severity index split by event-duration class (1 day, 2 days, 3+ days),
+    via compute_duration_decomposition.
+    Returns ({label: annual index}, resource_valid, freq_all, freq_by_class)."""
     wcf, scf, wcf_thr, scf_thr, compound = build_daily_pipeline(
         path_preprocessed, reanalysis, threshold, ref_start, ref_end,
     )
@@ -380,14 +300,8 @@ def rasterize_shapefile(shapefile, shape, transform):
 
 
 def build_land_mask_from_grid(lat, lon, shapefile_path):
-    """
-    Land/ocean mask straight from a lat/lon grid, without depending on
-    ds_final (which doesn't exist yet inside build_ds_final). Used to drop
-    ocean cells before the expensive duration/severity step instead of
-    only masking afterwards for plotting -- a coarse superset of the
-    final build_land_mask() (that one additionally excludes cells where
-    duration ends up all-null, which can't be known before it's computed).
-    """
+    """Land mask from a lat/lon grid, used to drop ocean before the expensive
+    duration step (build_land_mask is the stricter, post-hoc version)."""
     shapefile = gpd.read_file(shapefile_path)
     shape = (len(lat), len(lon))
     transform = rasterio.transform.from_bounds(
@@ -408,29 +322,17 @@ def build_land_mask(ds_final, shapefile_path):
     )
     mask = rasterize_shapefile(shapefile, da.shape, transform)
     mask = mask[::-1, :]
-    # Exclude pixels with no event in year 0: duration there is NaN for a
-    # masked/ocean pixel or 0 for a valid pixel with no event that year --
-    # `> 0` catches both as "exclude", matching the pre-0-fill semantics of
-    # the old `duration.isnull()` check.
+    # Exclude pixels without any event in the first year (NaN or 0).
     duration_y0 = ds_final.isel(year=0).duration if "year" in ds_final.dims else ds_final.duration
     mask = mask & (duration_y0 > 0).values
-    # Return as a (lat, lon)-named DataArray, not a bare ndarray: callers do
-    # `.where(mask == 1)` against 3D (lat, lon, year) data, and a plain
-    # ndarray broadcasts positionally (right-aligned), silently misaligning
-    # lon against year instead of matching by dimension name.
+    # DataArray, not ndarray: a bare array would broadcast positionally
+    # against (lat, lon, year) data.
     return xr.DataArray(mask, dims=("lat", "lon"), coords={"lat": da.lat, "lon": da.lon})
 
 
 def build_wcf_zero_mask(path_preprocessed, reanalysis, ref_start, ref_end, shapefile_path):
-    """
-    Grey-out mask: land pixels (per shp_re, config.SHAPEFILE_PATH) where the
-    ERA5 wcf reanalysis is exactly 0 on every day of [ref_start, ref_end] --
-    flags a data/model artifact (no wind capacity factor ever computed
-    there), not a "low wind resource" judgement call. Independent of, and
-    meant to be drawn on top of, any GCM-trend-agreement hatching (see
-    fig3.py): a pixel is greyed out here regardless of whether it passes or
-    fails that separate test.
-    """
+    """Land pixels where ERA5 wcf is 0 on every day of [ref_start, ref_end] (a
+    data artifact), greyed out on all maps."""
     wcf_files, _ = match_files(os.path.join(path_preprocessed, reanalysis, "wcf_day_*"))
     if not wcf_files:
         raise FileNotFoundError(
@@ -474,14 +376,8 @@ def get_or_build_wcf_zero_mask(path_preprocessed, reanalysis, ref_start, ref_end
 
 
 def fit_to_width(fig, width_in=FIG_WIDTH_IN, n_iter=4, tol=0.002):
-    """
-    Rescale the figure canvas (both dimensions, fonts untouched) so that
-    savefig(..., bbox_inches="tight") yields an image exactly width_in wide.
-    Without this, the tight crop leaves each figure at a different width, so
-    once LaTeX scales them all to the column width their fonts (panel
-    letters, titles, legends) end up at different effective point sizes.
-    Accounts for savefig's own pad_inches on each side.
-    """
+    """Rescale the canvas (not the fonts) so the tight-cropped image is exactly
+    width_in wide, keeping font sizes consistent across figures in LaTeX."""
     target = width_in - 2 * plt.rcParams["savefig.pad_inches"]
     for _ in range(n_iter):
         fig.canvas.draw()
@@ -493,6 +389,8 @@ def fit_to_width(fig, width_in=FIG_WIDTH_IN, n_iter=4, tol=0.002):
 
 
 def stationary_bootstrap_ci_1d(y, years, n_boot=1000, block_size=5, ci=95):
+    """Stationary-bootstrap OLS trend of y: (mean slope, mean intercept, and
+    the lower/upper `ci` band of the fitted line at `years`)."""
     y = np.asarray(y, dtype=np.float64)
     if y.size < 2 or np.all(np.isnan(y)):
         return np.nan, np.nan, np.nan, np.nan
@@ -669,7 +567,6 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
             ts, np.arange(n_years), n_boot=n_boot, block_size=3, ci=95,
         )
 
-        # Map box (unchanged)
         ax_map.plot(
             [lon_lo, lon_hi, lon_hi, lon_lo, lon_lo],
             [lat_lo, lat_lo, lat_hi, lat_hi, lat_lo],
@@ -731,6 +628,8 @@ def plot_reanalysis_disagg_timeseries_valuebyalpha_discrete(
 # =============================================================================
 
 def compute_global_change_stats(ds_final, mask, n_bootstrap=1000, block_size=10):
+    """Global area-weighted change (%) in annual severity, 2002-2021 vs 1982-2001,
+    with a 95% spatial block-bootstrap CI (block_size degrees)."""
     ds = ds_final.where(mask == 1)
     ds["annual_severity"] = ds["frequency"] * ds["severity"] * ds["duration"]
     early = ds["annual_severity"].sel(year=slice(1982, 2001)).mean(dim="year")
@@ -803,8 +702,8 @@ def load_or_build_ds_final(args, data_path, thr):
 
 
 def load_base_inputs(args):
-    """ds_final at args.threshold, its land mask and the wcf-zero land mask --
-    the inputs shared by Fig. 1 and Extended Data Figs. 2 and 12."""
+    """ds_final at args.threshold, its land mask and the wcf-zero mask (shared by
+    Fig. 1 and ED Figs. 2 and 12)."""
     os.makedirs(args.output_dir, exist_ok=True)
     ds_final = load_or_build_ds_final(args, args.data_path, args.threshold)
 

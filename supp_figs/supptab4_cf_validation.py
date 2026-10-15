@@ -3,12 +3,8 @@
 Extended Data Table 4: evaluation of the ERA5 country-level capacity factors
 against external production data.
 
-Validation of the regional reanalysis capacity factors (DS_CF) against
-observed / independent national generation series.
-
 For every country, the daily reanalysis scf / wcf series is correlated
-(Pearson and Spearman) with the matching observed series over their whole
-overlapping period -- one coefficient per country, no per-year split:
+(Pearson and Spearman) with the observed series over their whole overlap:
 
   ninja : Renewables.ninja v1.1 national capacity factors
           (wind: current fleet, 1980-2016; solar: MERRA-2, 1985-2016)
@@ -30,9 +26,6 @@ Outputs (in --output_dir):
                                              n_countries and mean / median /
                                              min / max of both coefficients
   validation_cf_{reanalysis}_by_country.csv  one row per country
-
-Port of como24_group5/code_final/1.4 validation_energy_potential.ipynb
-(which used the W5E5 wpp / spp aggregates instead of the reanalysis CF).
 """
 import os
 import re
@@ -49,7 +42,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 from io_utils import open_dataset_any
 
 MIN_DAYS = 365          # countries with a shorter overlap are skipped

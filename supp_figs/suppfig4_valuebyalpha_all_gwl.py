@@ -2,7 +2,7 @@
 """
 Extended Data Fig. 4: projected changes in annual SWED severity at 1.5, 2 and
 3 degC warming, stacked value-by-alpha maps without the regional violin
-panels (previously STEP 5 of fig3.py).
+panels.
 
 Shares its ensemble building, inverse-Wasserstein ensemble weighting, land
 mask and CLI with main_figs/fig3.py.
@@ -12,7 +12,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XCLIM
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XCLIM
 
@@ -52,15 +52,8 @@ def plot_supp_valuebyalpha_stacked(
     sev_label="Average annual\nseverity (0.61 °C)",
     wcf_zero_mask=None,
 ):
-    """
-    Supplementary figure: value-by-alpha maps for multiple GWL levels stacked
-    vertically (one row per GWL), without violin plots.
-
-    Parameters
-    ----------
-    gwl_items : list of dict with keys 'rgba_map', 'extent', 'gwl_label'
-    da_mask_ref : 2-D DataArray (one realization) used for the wcf-zero contour
-    """
+    """Value-by-alpha maps, one row per GWL. gwl_items: dicts with 'rgba_map',
+    'extent', 'gwl_label'; da_mask_ref: 2-D field for the wcf-zero overlay."""
     if change_edges is None:
         change_edges = [-100, -25, -10, 10, 25, 100]
     if color_levels is None:
@@ -83,9 +76,7 @@ def plot_supp_valuebyalpha_stacked(
     land_shp_band = land_shp_band & lat_ok.values[:, None]
     n   = len(gwl_items)
 
-    # Maps span the full column width; the height is derived from the
-    # EqualEarth aspect so rows are not height-limited (a height-limited map
-    # shrinks the tight crop and LaTeX then upscales every font).
+    # Height from the EqualEarth aspect so maps fill the column width.
     fig_width_in  = FIG_WIDTH_IN
     map_h_in      = fig_width_in * 0.98 / EQUAL_EARTH_ASPECT
     title_in, gap_in, bottom_in = 0.22, 0.30, 0.05

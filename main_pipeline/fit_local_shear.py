@@ -1,18 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Fit a per-pixel ("local") Hellmann shear exponent for the 10 m -> 100 m
-log-law wind extrapolation, from a year of ERA5 daily u10/v10/u100/v100.
-
-Standalone version of Section 5 ("Local (climatological) shear exponent") of
-`wind_100m_extrapolation_2018.ipynb`: reuses that notebook's per-pixel
-alpha_empirical = log(ws100/ws10) / log(10), averaged over time, as an
-alternative to the single global WIND_HEIGHT_EXPONENT constant used in
-`2.1 calculate_epp_GCM_clean.py` (EPPConfig.wind_height_exponent).
-
-Note (see the notebook's closing Notes section): this "local" exponent is
-in-sample -- it is fit and evaluated on the same period. Applying it to a
-different year/model climatology is optimistic relative to true
-out-of-sample performance.
+Per-pixel Hellmann shear exponent for extrapolating wind from 10 m to 100 m,
+alpha = mean_t[log(ws100/ws10) / log(10)], from ERA5 daily u10/v10/u100/v100.
+The fit is in-sample, so its skill on other periods is optimistic.
 """
 import argparse
 import glob
@@ -61,28 +51,10 @@ def safe_to_netcdf(ds, path, mode="w", **kwargs):
 
 
 def fit_local_shear(file_pattern, shapefile_path=None, file_format=None, time_slice=None):
-    """
-    Per-pixel climatological Hellmann shear exponent:
-
-        alpha(lat, lon) = mean_t[ log(ws100(t) / ws10(t)) / log(10) ]
-
-    over every day in `file_pattern` (optionally restricted to `time_slice`)
-    where both the 10 m and 100 m winds are available. Same longitude
-    re-wrapping and masking approach as the notebook this is derived from.
-
-    file_format : "netcdf", "zarr", or None (default) to auto-detect from
-                  the extension of the matched files (".zarr" -> zarr,
-                  anything else -> netcdf). Pass explicitly if your zarr
-                  stores don't have a ".zarr" suffix.
-    time_slice  : optional (start, end) date-string pair, e.g.
-                  ("1982-01-01", "2001-12-31"), used to restrict the fit to
-                  a reference period. `file_pattern` should match every file
-                  that could contain data in that range -- the exact bounds
-                  are then applied on the opened time coordinate.
-
-    Returns an xr.Dataset with `alpha` (unitless shear exponent) and
-    `n_days` (number of days averaged into `alpha`, per pixel).
-    """
+    """alpha(lat, lon) = mean_t[log(ws100 / ws10) / log(10)] over the days in
+    `file_pattern` (optionally within `time_slice`, a (start, end) pair).
+    file_format: "netcdf", "zarr" or None (from the file extension).
+    Returns a Dataset with `alpha` and `n_days`."""
     files = sorted(glob.glob(file_pattern))
     if not files:
         raise FileNotFoundError(f"No files match pattern: {file_pattern}")
@@ -146,26 +118,20 @@ def fit_local_shear(file_pattern, shapefile_path=None, file_format=None, time_sl
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fit a per-pixel local shear exponent from ERA5 daily 10 m/100 m wind, "
-                     "as an alternative to the global WIND_HEIGHT_EXPONENT constant used in "
-                     "2.1 calculate_epp_GCM_clean.py.",
+        description="Fit a per-pixel shear exponent from ERA5 daily 10 m/100 m wind.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--data_dir", default="E:/climate_data/ERA5/daily",
                          help="Used to build the default file pattern (ignored if --file_pattern is set).")
     parser.add_argument("--file_pattern", default=None,
-                         help="glob pattern for the ERA5 daily wind files, "
-                              "e.g. 'E:/climate_data/ERA5/daily/ERA5_daily_*.zarr'. "
-                              "Defaults to '{data_dir}/ERA5_daily_*.zarr'.")
+                         help="Glob pattern of the ERA5 daily wind files "
+                              "(default: '{data_dir}/ERA5_daily_*.zarr').")
     parser.add_argument("--shapefile", default=DEFAULT_SHAPEFILE,
-                         help="Shapefile used to mask alpha to a region. Pass an empty "
-                              "string to fit on the full grid instead.")
+                         help="Mask shapefile (empty string: full grid).")
     parser.add_argument("--file_format", default=None, choices=[None, "netcdf", "zarr"],
-                         help="Force 'netcdf' or 'zarr' reading. Defaults to auto-detecting "
-                              "from the matched files' extension.")
+                         help="Force the file format (default: from the extension).")
     parser.add_argument("--start", default=None,
-                         help="Reference-period start date (e.g. '1982-01-01'). "
-                              "Both --start and --end must be given together.")
+                         help="Reference-period start date (with --end).")
     parser.add_argument("--end", default=None,
                          help="Reference-period end date (e.g. '2001-12-31').")
     parser.add_argument("--output", default="local_shear_exponent.nc")

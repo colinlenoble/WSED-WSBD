@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Wind capacity-factor physics: the power curve and the three ways of getting
-wind speed up to hub height. Split out of calculate_cf.py (which imports
-xesmf/xclim/xagg at module load) so scripts that only need the wcf formula
--- e.g. supptab3_wind_extrapolation_sensitivity.py, or any local script run outside the HPC
-env where xesmf/ESMF isn't installed -- can import it without dragging
-those in. Same dependency-light rationale as io_utils.py.
+Wind capacity factor: turbine power curve and the three ways of getting wind
+speed to hub height. Depends only on numpy/xarray, so scripts can use it
+without xesmf/xclim.
 """
 from dataclasses import dataclass
 
@@ -18,38 +15,17 @@ WIND_METHODS = ('shear_local', 'shear_uniform', 'wind100')
 @dataclass
 class DS_CFConfig:
     """
-    Physical constants for the wind potential calculation.
+    Wind capacity-factor settings.
 
-    Wind power curve parameters
-    ---------------------------
-    vr  : rated wind speed (m/s) turbine reaches full output above this
-    vci : cut-in wind speed (m/s) turbine starts generating below this
-    vco : cut-out wind speed (m/s) turbine shuts down above this
-    ref_height : height (m) of the input wind speed (reanalysis/GCM 10 m wind)
-    hub_height : height (m) the wind speed is extrapolated to (or read
-                 directly from, for wind_method='wind100'). Defaults to
-                 100 m.
-
-    Wind extrapolation method
-    --------------------------
-    wind_method : how ref_height wind is turned into hub_height wind before
-                  the power curve is applied (see get_hub_height_wind).
-        'shear_local'   (default) -- per-pixel Hellmann shear exponent fit
-                         from reanalysis 100 m/10 m wind (see fit_local_shear
-                         / get_local_shear_exponent / get_gcm_shear_exponent
-                         in calculate_cf.py). Backward-compatible default --
-                         unchanged behavior.
-        'shear_uniform' -- single global Hellmann exponent
-                         (uniform_shear_exponent) applied everywhere instead
-                         of a per-pixel fit.
-        'wind100'       -- skip extrapolation entirely and use the
-                         reanalysis/GCM 100 m wind (u100/v100) directly.
-                         Requires hub_height == 100 and u100/v100 present in
-                         the input dataset.
-    uniform_shear_exponent : Hellmann exponent used when
-                 wind_method='shear_uniform'. Defaults to 1/7 (~0.143), the
-                 standard atmospheric-boundary-layer power-law value over
-                 open terrain.
+    vr, vci, vco : rated, cut-in and cut-out wind speeds (m/s)
+    ref_height   : height of the input wind (m, 10 m)
+    hub_height   : turbine hub height (m, 100 m)
+    wind_method  : how hub-height wind is obtained (see get_hub_height_wind):
+        'shear_local'   per-pixel Hellmann exponent fit from reanalysis
+                        10 m/100 m wind (default)
+        'shear_uniform' single exponent, uniform_shear_exponent (1/7, open
+                        terrain)
+        'wind100'       100 m wind (u100/v100) used directly
     """
     # Wind turbine curve
     vr:  float = 13.0
@@ -73,12 +49,8 @@ DEFAULT_DS_CF_CONFIG = DS_CFConfig()
 
 
 def compute_wind_potential_from_hub_wind(wind_hub, cfg):
-    """
-    Cubic power curve applied to a wind speed already at cfg.hub_height
-    (0 below cut-in, cubic ramp between cut-in and rated, 1 between rated
-    and cut-out, 0 above cut-out). Shared by every wind_method in
-    get_hub_height_wind -- only how wind_hub is obtained differs.
-    """
+    """Power curve on hub-height wind: 0 below cut-in, cubic ramp up to rated,
+    1 up to cut-out, 0 above."""
     wind_pot = xr.where(wind_hub < cfg.vci, 0, wind_hub)
     wind_pot = xr.where(wind_pot >= cfg.vco, 0, wind_pot)
     wind_pot = xr.where((wind_pot >= cfg.vr) & (wind_pot < cfg.vco), 1, wind_pot)
@@ -91,24 +63,9 @@ def compute_wind_potential_from_hub_wind(wind_hub, cfg):
 
 
 def get_hub_height_wind(ds, cfg, alpha=None):
-    """
-    Wind speed at cfg.hub_height, dispatching on cfg.wind_method:
-
-      'wind100'       : ws100 = hypot(u100, v100) read directly from ds --
-                        no extrapolation, so no shear-exponent error, but
-                        only available where the archive actually has 100 m
-                        wind components. Requires cfg.hub_height == 100.
-      'shear_uniform' : ds['sfcWind'] extrapolated from cfg.ref_height to
-                        cfg.hub_height with a single global Hellmann
-                        exponent, cfg.uniform_shear_exponent (default 1/7).
-      'shear_local'   : ds['sfcWind'] extrapolated with a per-pixel alpha
-                        (must be supplied by the caller -- see
-                        calculate_cf.get_local_shear_exponent /
-                        get_gcm_shear_exponent).
-
-    Feed the result to compute_wind_potential_from_hub_wind to get the
-    capacity factor.
-    """
+    """Wind speed at cfg.hub_height: hypot(u100, v100) for 'wind100', else
+    sfcWind * (hub/ref)**alpha with the uniform exponent ('shear_uniform') or
+    the per-pixel `alpha` given ('shear_local')."""
     if cfg.wind_method == 'wind100':
         if cfg.hub_height != 100.0:
             raise ValueError(
@@ -135,15 +92,7 @@ def get_hub_height_wind(ds, cfg, alpha=None):
 
 
 def compute_wind_potential(sfcwind, alpha, cfg):
-    """
-    Wind capacity factor: extrapolate sfcwind from cfg.ref_height to
-    cfg.hub_height using the per-pixel Hellmann exponent alpha, then apply
-    the cubic power curve between cut-in and rated speed.
-
-    Kept as a thin shear-only wrapper for existing call sites; new code
-    computing wcf under any of the three wind_method options should call
-    get_hub_height_wind(ds, cfg, alpha) + compute_wind_potential_from_hub_wind
-    instead (see calculate_cf.calculate_ds_cf_reanalysis).
-    """
+    """Wind capacity factor with per-pixel shear exponent alpha (shorthand for
+    get_hub_height_wind + compute_wind_potential_from_hub_wind)."""
     wind_hub = sfcwind * (cfg.hub_height / cfg.ref_height) ** alpha
     return compute_wind_potential_from_hub_wind(wind_hub, cfg)

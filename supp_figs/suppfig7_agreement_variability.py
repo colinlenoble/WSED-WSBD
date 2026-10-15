@@ -8,39 +8,23 @@ Extended Data Fig. 7: model agreement on projected SWED severity changes
   c - total projection spread of SWED severity under 2°C warming
   d - fraction of that spread explained by internal variability
 
-Terminology: frequency (events/year), duration (days/event) and intensity
-(mean deficit on event days) are the three SWED components; severity is
-their product, frequency x duration x intensity. make_agg_files.py calls
-intensity "severity"; it is renamed on load.
+Severity = frequency x duration x intensity (make_agg_files.py calls
+intensity "severity"; renamed on load).
 
-The yearly indicators come from make_agg_files.load_agg_data_compound(),
-which reads every per-GCM wcf_agg_*/scf_agg_* aggregate under
---preprocessed_path. The result is cached in
-<preprocessed_path>/agg_datasets/compound_years_agg_freq_sev_dur.nc and
-reused on later runs (--rebuild forces a recompute). Significance of the severity change (each GWL vs GWL0-61,
-per GCM/run) is then computed on that rebuilt dataset with a paired
-permutation test + Benjamini-Hochberg FDR.
-
-Panels c-d (variance decomposition) are also rebuilt from scratch, from the
-same wcf_agg_*/scf_agg_* files resampled monthly instead of yearly
-(load_agg_data_compound(..., freq='month'), cached in
-agg_datasets/compound_monthly_agg_freq_sev_dur.nc) at --variability_gwl, then run
-through custom_regional_analysis() -- a port of cell 2 of
-como24_group5/code_final/3.2 Variability decomposition.ipynb (that cell is
-missing its two `for` loops as saved in the notebook; restored here).
-
-Both panel pairs are drawn on config.SHAPEFILE_PATH (shp_re): the _v1
-aggregates are built by calculate_cf.py on that shapefile, so their poly_idx
-is its row index.
-
-Port of cell 26 of como24_group5/code_final/3.1.3 disagreements.ipynb.
+Yearly and monthly regional indicators come from
+make_agg_files.load_agg_data_compound(), cached in
+<preprocessed_path>/agg_datasets/ (--rebuild to recompute). Panels a-b: per
+GCM run, sign of the significant severity change vs GWL0-61 (paired
+permutation test + Benjamini-Hochberg FDR). Panels c-d: decomposition of the
+monthly spread into internal and model variability at --variability_gwl.
+Regions are the rows of config.SHAPEFILE_PATH.
 """
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ["ESMFMKFILE"] = config.ESMFMKFILE_XENV
 
@@ -54,9 +38,7 @@ import cartopy.crs as ccrs
 import inspect
 from scipy.stats import permutation_test
 
-# scipy renamed permutation_test's RNG-seed parameter from 'random_state' to
-# 'rng' in 1.15; detect once so this runs on either an older HPC scipy
-# (random_state) or a newer one (rng) without an explicit version check.
+# permutation_test's seed argument is 'rng' from scipy 1.15, 'random_state' before.
 _PERMUTATION_TEST_RNG_KW = (
     "rng" if "rng" in inspect.signature(permutation_test).parameters else "random_state"
 )
@@ -98,18 +80,12 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--preprocessed_path", default=config.PATH_PREPROCESSED,
-                        help="Root of the per-GCM wcf_agg_*/scf_agg_* aggregates "
-                             "(make_agg_files.load_agg_data_compound()'s input). The yearly "
-                             "and monthly compound datasets built from them are cached under "
-                             "<preprocessed_path>/agg_datasets/.")
+                        help="Root of the per-GCM wcf_agg_*/scf_agg_* files; the derived "
+                             "datasets are cached in <preprocessed_path>/agg_datasets/.")
     parser.add_argument("--rebuild", action="store_true",
-                        help="Recompute the yearly/monthly compound datasets from the "
-                             "wcf_agg_*/scf_agg_* aggregates and overwrite the cache.")
+                        help="Recompute the cached yearly/monthly datasets.")
     parser.add_argument("--save_significance_nc", default=None,
-                        help="Optional path to also save the recomputed severity trend "
-                             "significance to (e.g. for reuse by other figures). Not read "
-                             "back in -- the significance is always recomputed from the "
-                             "rebuilt indicators.")
+                        help="Optional path to save the significance results.")
     parser.add_argument("--variability_gwl", default="GWL2",
                         help="GWL at which the variance decomposition (panels c-d) is run.")
     parser.add_argument("--alpha", type=float, default=0.10)
@@ -131,8 +107,7 @@ def parse_args():
 
 
 # =============================================================================
-# Trend significance (permutation test + FDR), inlined from
-# trend_significance_from_nc.py
+# Significance of the change (permutation test + FDR)
 # =============================================================================
 
 def comparison_triplets(ds, ssp, reference_gwl):
@@ -193,13 +168,7 @@ def trend_for_metric(data_by_gwl, metric, comparison_gwl, reference_gwl,
 # =============================================================================
 
 def _squeeze_degenerate_dims(da, keep):
-    """
-    Drop any size-1 dimension of `da` besides `keep`. On the raw aggregated
-    file, intensity (severity) can carry a stray length-1 dim alongside its
-    real time axis -- a leftover from make_agg_files.py's coordinate
-    bookkeeping (e.g. an auxiliary year/month label promoted to its own
-    dimension), not a genuine second data axis.
-    """
+    """Drop size-1 dims other than `keep` (intensity can carry a stray one)."""
     degenerate = [d for d in da.dims if d not in keep and da.sizes[d] == 1]
     return da.squeeze(degenerate, drop=True) if degenerate else da
 
@@ -217,18 +186,9 @@ def _time_dim(da, var_name, keep):
 
 
 def _align_time_axis(ds, dim_name, variables=("frequency", "duration", "intensity")):
-    """
-    Normalise `variables` onto a single, positionally-indexed `dim_name`
-    dimension before combining them. On the raw aggregated file
-    (make_agg_files.py) frequency/duration come out of duration_xr()
-    already on a `dim_name` dim, while intensity (severity) keeps
-    resample(time=...)'s 'time' dim, renamed to `dim_name` with its labels
-    turned into ints that don't line up with frequency/duration's own
-    within-window position -- and it can also retain a stray degenerate axis
-    on top of the real one. Left as-is, combining the variables would
-    silently broadcast the mismatched axes into a spurious extra dimension
-    instead of erroring loudly.
-    """
+    """Put `variables` on one positional `dim_name` axis. In the aggregated
+    file intensity's time labels don't match frequency/duration's, so
+    combining them as-is would broadcast into a spurious extra dimension."""
     keep = ("realization", "poly_idx")
     for var in variables:
         ds[var] = _squeeze_degenerate_dims(ds[var], keep)
@@ -246,13 +206,8 @@ def _align_time_axis(ds, dim_name, variables=("frequency", "duration", "intensit
 
 
 def _rename_intensity_and_compute_severity(ds, dim_name):
-    """
-    Shared finishing step for the yearly (load_indicators) and monthly
-    (load_variability) aggregates: rename make_agg_files.py's legacy
-    'severity' (really intensity) to 'intensity', align frequency/duration/
-    intensity onto a single `dim_name` axis (see _align_time_axis), fillna,
-    then compute severity = frequency x duration x intensity.
-    """
+    """Rename legacy 'severity' to 'intensity', align the time axes, fill NaNs
+    with 0 and compute severity = frequency x duration x intensity."""
     if "intensity" not in ds:
         if "severity" not in ds:
             raise ValueError("load_agg_data_compound() returned neither "
@@ -272,11 +227,7 @@ CACHE_FILES = {
 
 
 def load_compound_cached(preprocessed_path, freq, rebuild=False):
-    """
-    make_agg_files.load_agg_data_compound(preprocessed_path, freq), cached in
-    <preprocessed_path>/agg_datasets/ (raw output, legacy 'severity' naming
-    kept so the file matches make_agg_files.py's own).
-    """
+    """make_agg_files.load_agg_data_compound(), cached in agg_datasets/."""
     cache_path = os.path.join(preprocessed_path, "agg_datasets", CACHE_FILES[freq])
     if os.path.exists(cache_path) and not rebuild:
         print(f"  Loading cached {cache_path}")
@@ -289,11 +240,7 @@ def load_compound_cached(preprocessed_path, freq, rebuild=False):
 
 
 def load_indicators(preprocessed_path, rebuild=False):
-    """
-    Yearly indicators with the current terminology: frequency, duration,
-    intensity, and severity = frequency x duration x intensity, from
-    load_compound_cached(..., freq='year').
-    """
+    """Yearly frequency, duration, intensity and severity per region."""
     ds = load_compound_cached(preprocessed_path, "year", rebuild)
     return _rename_intensity_and_compute_severity(ds, "year")
 
@@ -306,11 +253,6 @@ def custom_regional_analysis(ds, var, gwl):
           two models with more than one run (CanESM5, MPI-ESM2-1-LR)
       M - model variability: variance across GCMs (first run of each)
     both normalised by their sum (`total`). Scenario variability is ignored.
-
-    Port of cell 2 of como24_group5/code_final/3.2 Variability
-    decomposition.ipynb -- that cell is missing its two `for` loops (over
-    poly_idx, and over internal_models) as saved in the notebook; restored
-    here from the (correctly indented) loop bodies.
     """
     ds = ds.where(ds.gwl == gwl, drop=True)
     x_temporal = ds[var].mean(dim="month")
@@ -351,25 +293,16 @@ def custom_regional_analysis(ds, var, gwl):
 
 
 def load_variability(preprocessed_path, gwl, rebuild=False):
-    """
-    Variance decomposition of SWED severity at `gwl` into internal (I) vs.
-    model (M) components, for panels c-d: the same wcf_agg_*/scf_agg_*
-    aggregates as load_indicators(), resampled monthly instead of yearly
-    (load_compound_cached(..., freq='month')), fed into
-    custom_regional_analysis().
-    """
+    """Internal (I) vs model (M) variability of monthly severity at `gwl`
+    (panels c-d)."""
     ds = load_compound_cached(preprocessed_path, "month", rebuild)
     ds = _rename_intensity_and_compute_severity(ds, "month")
     return custom_regional_analysis(ds, "severity", gwl)
 
 
 def compute_severity_significance(ds, gwls, alpha, ssp, reference_gwl, n_resamples, seed):
-    """
-    Sign of the significant severity change of each GWL in `gwls` vs
-    `reference_gwl`, per (GCM, run): +1 / -1 / 0 per poly_idx. Paired
-    permutation test on yearly values, Benjamini-Hochberg FDR at 2*alpha,
-    restricted to severity, one alpha and the plotted GWLs.
-    """
+    """Sign (+1 / -1 / 0) of the significant severity change per (GCM, run) and
+    region, for each GWL in `gwls` vs `reference_gwl`."""
     triplets = [t for t in comparison_triplets(ds, ssp, reference_gwl) if t[2] in gwls]
     if not triplets:
         raise ValueError(f"No (GCM, run) found for ssp={ssp!r} and GWLs {gwls}")
@@ -405,11 +338,8 @@ def compute_severity_significance(ds, gwls, alpha, ssp, reference_gwl, n_resampl
 
 
 def agreement_fractions(sig, gwl):
-    """
-    GCM-weighted share of simulations with a significant increase and a
-    significant decrease in severity at `gwl` (each GCM weighs 1/n_GCM,
-    split evenly across its runs).
-    """
+    """GCM-weighted share of simulations with a significant increase and
+    decrease at `gwl` (1/n_GCM per GCM, split across its runs)."""
     sub = sig.where(sig.GWL_comp == gwl, drop=True)
     counts = pd.Series(sub.GCM.values).value_counts()
     weights = xr.DataArray(
@@ -421,11 +351,7 @@ def agreement_fractions(sig, gwl):
 
 
 def load_discrepancy_idx(agreement_aggregated_nc, agreement_threshold):
-    """
-    poly_idx where observed (ERA5) and projected trends disagree
-    (agreement_pct <= threshold), as in fig45.load_hatch_agg. Returns an
-    empty array (no mask) if the file is missing.
-    """
+    """poly_idx where agreement_pct <= threshold (empty if the file is missing)."""
     if agreement_aggregated_nc is None or not os.path.exists(agreement_aggregated_nc):
         print(f"  Agreement file not found ({agreement_aggregated_nc}) -- no discrepancy mask")
         return np.array([], dtype=int)
@@ -444,11 +370,7 @@ def _panel_letter(ax, letter):
 
 
 def _align_to_shapefile(da, shp, what):
-    """
-    Reindex `da` (dim poly_idx) onto the shapefile's row index. poly_idx
-    values are shapefile row indices, but polygons with no valid grid cell
-    are absent from the aggregates; they come back as NaN (left unfilled).
-    """
+    """Reindex `da` onto the shapefile rows (regions without data become NaN)."""
     unknown = np.setdiff1d(da["poly_idx"].values, shp.index.values)
     if unknown.size:
         raise ValueError(f"{what} has {unknown.size} poly_idx not in the shapefile "

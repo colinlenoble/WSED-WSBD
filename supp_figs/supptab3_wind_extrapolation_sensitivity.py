@@ -3,33 +3,15 @@
 Extended Data Table 3: sensitivity of SWED severity to the wind-speed
 extrapolation.
 
-Compare the three wind capacity-factor methods (wind_potential.WIND_METHODS)
-against each other on real ERA5 data, treating wind100 -- the reanalysis
-100 m wind read directly, no shear extrapolation -- as the reference that
-shear_local (per-pixel fitted Hellmann exponent) and shear_uniform (single
-global exponent, default 1/7) are checked against.
+On ERA5, compares SWED severity from the three wind extrapolation methods
+(wind_potential.WIND_METHODS): shear_local (per-pixel Hellmann exponent) and
+shear_uniform (single exponent, 1/7) against wind100 (100 m wind, no
+extrapolation). Input: ERA5 on the W5E5 0.5 deg grid with u10/v10/u100/v100/
+t2m/ssrd (config.ERA5_REGRID_ZARR2_DIR). Runs without xesmf/xclim/xagg.
 
-Source data: config.ERA5_REGRID_ZARR2_DIR (W5E5 0.5 deg grid, Zarr format 2,
-has u10/v10/u100/v100/t2m/ssrd -- see regrid_era5_to_w5e5.py +
-convert_regrid_to_zarr2.py), so all three methods see exactly the same
-input and only the wcf formula differs.
-
-All paths default from config.py -- edit that file (not the constants here)
-to point at wherever this runs (HPC, local machine, ...).
-
-Runs without xesmf/xclim/xagg. wind_potential.py and compute_solar_cf.py
-are already dependency-light and imported directly; two short formulas
-that otherwise only live inside xesmf-importing modules (calculate_cf.py's
-ssrd unit conversion, make_grid_files.py's severity deficit) are
-reproduced below instead, each commented with its source -- importing
-those modules here would pull in xesmf at load time.
-
-For each of shear_local / shear_uniform, against wind100:
-  1. R2 (sklearn-style: 1 - SS_res/SS_tot, wind100 as ground truth) + a
-     scatter plot of long-term per-pixel mean compound-event severity.
-  2. Spearman rank correlation, per pixel, of the *relative change* in mean
-     severity from the reference period (1982-01-01..2001-12-31, matching
-     config.SHEAR_REF_PERIOD) to the rest of the record.
+For each method vs wind100: R2 of the long-term mean severity per pixel, and
+Spearman rho of the relative change from the reference period to the rest of
+the record.
 
 Usage:
     python supptab3_wind_extrapolation_sensitivity.py
@@ -51,7 +33,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 from wind_potential import DS_CFConfig, get_hub_height_wind, compute_wind_potential_from_hub_wind
 from compute_solar_cf import compute_solar_cf, DEFAULT_PVGIS_COEFFICIENTS
 
@@ -63,8 +45,7 @@ try:
 except ImportError:
     _HAS_MASKING = False
 
-# Seconds per daily ssrd accumulation step -- mirrors
-# calculate_cf.ERA5_SSRD_ACCUM_SECONDS / _standardize_reanalysis_names.
+# As calculate_cf.ERA5_SSRD_ACCUM_SECONDS (not imported: that module needs xesmf).
 ERA5_SSRD_ACCUM_SECONDS = 86400.0
 
 METHODS = ["wind100", "shear_uniform", "shear_local"]
@@ -72,15 +53,8 @@ REFERENCE_METHOD = "wind100"
 
 
 def local_shear_alpha_path(path_preprocessed, path_folder, ref_period):
-    """
-    Path to the cached local shear exponent file, mirroring
-    calculate_cf.get_local_shear_exponent's naming/fallback convention:
-    checked first under path_preprocessed/ERA5/, then under path_folder/ERA5/
-    (in case it was fit and left alongside the raw reanalysis archive
-    instead of the preprocessed one). Always under an 'ERA5' subfolder --
-    the shear exponent is fit from ERA5's own 10 m/100 m wind regardless of
-    config.REANALYSIS, matching get_local_shear_exponent's hardcoded path.
-    """
+    """Cached local shear exponent file (path_preprocessed/ERA5/, else
+    path_folder/ERA5/), as in calculate_cf.get_local_shear_exponent."""
     fname = f"shear_exponent_local_{ref_period[0]}_{ref_period[1]}.nc"
     preferred = os.path.join(path_preprocessed, "ERA5", fname)
     if os.path.exists(preferred):
@@ -90,7 +64,7 @@ def local_shear_alpha_path(path_preprocessed, path_folder, ref_period):
         return fallback
     raise FileNotFoundError(
         f"No cached local shear exponent at {preferred} or {fallback} -- "
-        "run compute_era5_regrid_shear.py (or calculate_cf.get_local_shear_exponent) first."
+        "run calculate_cf.get_local_shear_exponent first."
     )
 
 
@@ -107,18 +81,14 @@ def load_reanalysis(src_dir, limit=None):
     ds = ds.rename({"valid_time": "time"}).sortby("time")
     ds = ds.chunk({"time": -1, "latitude": 50, "longitude": 50})
 
-    # ssrd (accumulated J/m2) -> rsds (W/m2 mean); mirrors
-    # calculate_cf._standardize_reanalysis_names.
-    ds["rsds"] = ds["ssrd"] / ERA5_SSRD_ACCUM_SECONDS
-    # t2m (K) -> tas (degC); mirrors calculate_cf.calculate_ds_cf_reanalysis.
+    ds["rsds"] = ds["ssrd"] / ERA5_SSRD_ACCUM_SECONDS   # J/m2 -> W/m2
     ds["tas"] = ds["t2m"] - 273.15
     ds["sfcWind"] = np.hypot(ds["u10"], ds["v10"])
     return ds
 
 
 def load_region_mask(shapefile_path, lat, lon):
-    """Boolean DataArray, True where the grid-cell center falls inside the
-    shapefile -- same approach as fit_local_shear.rasterize_region_mask."""
+    """Boolean DataArray, True for grid cells inside the shapefile."""
     shapefile = gpd.read_file(shapefile_path)
     transform = rasterio.transform.from_bounds(
         float(lon.min()), float(lat.min()), float(lon.max()), float(lat.max()),
@@ -135,12 +105,8 @@ def load_region_mask(shapefile_path, lat, lon):
 
 
 def compute_severity(compound_da, scf_da, wcf_da, scf_thr, wcf_thr):
-    """
-    Expected shortfall: mean positive deficit on compound-event days,
-    aggregated yearly. Reproduces make_grid_files.compute_severity (that
-    module imports xesmf at load time, so it can't be imported directly
-    from this xesmf-free script).
-    """
+    """Annual mean deficit on compound-event days (copy of
+    make_grid_files.compute_severity, which would import xesmf)."""
     deficit_scf = xr.where(scf_da < scf_thr, scf_thr - scf_da, 0)
     deficit_wcf = xr.where(wcf_da < wcf_thr, wcf_thr - wcf_da, 0)
     daily_deficit = deficit_scf + deficit_wcf
@@ -149,12 +115,8 @@ def compute_severity(compound_da, scf_da, wcf_da, scf_thr, wcf_thr):
 
 
 def yearly_severity_for_method(ds, alpha, cfg, scf, ref_period, quantile):
-    """
-    Compute wcf for cfg.wind_method, derive the low-wind/low-solar compound
-    day flag from each variable's own reference-period quantile (matching
-    make_grid_files.load_gridded_data_compound's thresholding), and return
-    yearly per-pixel severity.
-    """
+    """Yearly per-pixel severity with wcf from cfg.wind_method (thresholds as in
+    make_grid_files.py)."""
     alpha_arg = alpha if cfg.wind_method == "shear_local" else None
     wind_hub = get_hub_height_wind(ds, cfg, alpha=alpha_arg)
     wcf = compute_wind_potential_from_hub_wind(wind_hub, cfg)
@@ -188,20 +150,9 @@ def r2_score(y_true, y_pred):
 
 
 def plot_discrepancy_maps(mean_severity, other_methods, out_dir, axis_thr=1e-6):
-    """
-    For each non-reference method, map (method - wind100) long-term mean
-    severity (diverging colormap), with the "axis" mismatches from the R2
-    scatter -- pixels sitting on the x or y axis because one method reports
-    ~0 severity there (no compound day ever crossed that pixel's
-    reference-period threshold) while the other reports a nonzero value --
-    marked explicitly, split by direction. Plain lat/lon pcolormesh (no
-    cartopy) to avoid a dependency that may need network access for
-    coastline data on a compute node.
-
-    Returns {method: (n_axis_x, n_axis_y)} -- axis_x = method > 0 where
-    wind100 ~ 0 (method sees severity wind100 misses), axis_y = wind100 > 0
-    where method ~ 0 (method misses severity wind100 sees).
-    """
+    """Map of (method - wind100) mean severity, marking pixels where only one of
+    the two has non-zero severity. No cartopy (needs network for coastlines).
+    Returns {method: (n method>0 & wind100~0, n wind100>0 & method~0)}."""
     ref = mean_severity[REFERENCE_METHOD]
     lat = ref["latitude"].values
     lon = ref["longitude"].values
@@ -242,18 +193,8 @@ def plot_discrepancy_maps(mean_severity, other_methods, out_dir, axis_thr=1e-6):
 
 
 def plot_relative_discrepancy_maps(mean_severity, other_methods, out_dir, zero_thr=1e-6, pct_clip=99):
-    """
-    For each non-reference method, map the relative difference in long-term
-    mean severity, (method - wind100) / wind100 in percent. Both panels
-    share one colorbar (scale set from the pooled pct_clip percentile of
-    |relative difference| across all methods), so the two comparisons are
-    directly comparable rather than each auto-scaled to its own range.
-
-    Pixels where wind100 ~ 0 are masked (NaN, left blank) -- the relative
-    difference is undefined/blows up there; see plot_discrepancy_maps for
-    the absolute map, which covers those pixels via the axis-mismatch
-    markers instead.
-    """
+    """Maps of (method - wind100) / wind100 (%) on one shared colour scale
+    (clipped at the pct_clip percentile); blank where wind100 ~ 0."""
     ref = mean_severity[REFERENCE_METHOD]
     lat = ref["latitude"].values
     lon = ref["longitude"].values
@@ -291,15 +232,13 @@ def main():
     default_out_dir = os.path.join(config.SUMMARY_FIGS_DIR, "wind_method_comparison")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--src_dir", default=config.ERA5_REGRID_ZARR2_DIR,
-                    help="regridded ERA5 archive, W5E5 grid, Zarr format 2 (default: config.ERA5_REGRID_ZARR2_DIR)")
+                    help="ERA5 regridded to the W5E5 grid (Zarr v2)")
     ap.add_argument("--path_folder", default=config.PATH_FOLDER,
-                    help="fallback root for the cached shear exponent (default: config.PATH_FOLDER)")
+                    help="fallback location of the cached shear exponent")
     ap.add_argument("--path_preprocessed", default=config.PATH_PREPROCESSED,
-                    help="preferred root for the cached shear exponent (default: config.PATH_PREPROCESSED)")
+                    help="preferred location of the cached shear exponent")
     ap.add_argument("--alpha_path", default=None,
-                    help="cached local shear exponent .nc; default derived from "
-                         "--path_preprocessed/--path_folder + --ref_start/--ref_end "
-                         "(see local_shear_alpha_path)")
+                    help="cached local shear exponent .nc (default: derived from the paths above)")
     ap.add_argument("--shapefile", default=config.SHAPEFILE_PATH)
     ap.add_argument("--out_dir", default=default_out_dir)
     ap.add_argument("--ref_start", default=config.SHEAR_REF_PERIOD[0])
@@ -328,10 +267,8 @@ def main():
                           method="nearest", tolerance=1e-6)
 
     print("Building solar potential (scf, shared across all wind methods)...")
-    # Persisted once: the per-method loop below builds a separate wcf graph
-    # on top of scf each time, so without persisting, dask would recompute
-    # it (tas/rsds/sfcWind -> scf) from scratch for every wind_method.
-    scf = compute_solar_cf(ds["tas"], ds["rsds"], ds["sfcWind"], cfg=DEFAULT_PVGIS_COEFFICIENTS)
+    # Persisted so it isn't recomputed for every wind method.
+    scf =compute_solar_cf(ds["tas"], ds["rsds"], ds["sfcWind"], cfg=DEFAULT_PVGIS_COEFFICIENTS)
     scf = scf.persist()
 
     severities = {}
@@ -369,8 +306,7 @@ def main():
     print("Wrote", r2_fig_path)
 
     # ------------------------------------------------------------------
-    # 1b. Map of where the discrepancy is largest -- the axis-hugging
-    #     points in the R2 scatter above, located geographically.
+    # 1b. Maps of the discrepancies
     # ------------------------------------------------------------------
     axis_counts = plot_discrepancy_maps(mean_severity, other_methods, args.out_dir)
     for method, (n_x, n_y) in axis_counts.items():

@@ -4,28 +4,24 @@ Extended Data Fig. 3: model skill in reproducing observed annual SWED severity
 trends (empirical, normalized Wasserstein distance to ERA5's bootstrap trend
 distribution).
 
-Script version of the classify_gcm_trend_agreement.ipynb cells that built this
-figure (Section 11: load the empirical W2 grids, drop pixels with a near-zero
-ERA5 bootstrap-trend std, build the per-realization table, draw the
-normalized-W2 composite). Panel a maps the per-pixel GCM-ensemble discrete
-median of w2_normalized (one realization's actual value, 1/n_runs(GCM)
-weights), not the ensemble mean. All the logic lives in
-aux_code/diagnostics/classify_gcm_trend_agreement.py; inputs are the
-trend_sev_eval_wasserstein.py outputs it points to (test_data/ by default).
+Loads the empirical W2 grids and regional trend samples written by
+trend_sev_eval_wasserstein.py, drops pixels with a near-zero ERA5
+bootstrap-trend std and draws the normalized-W2 composite (helpers in
+gcm_trend_agreement.py). Panel a maps the per-pixel ensemble median of
+w2_normalized (weights 1/n_runs(GCM)).
 """
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 
 import argparse
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(_REPO_ROOT, "aux_code", "diagnostics"))
-import classify_gcm_trend_agreement as cgta
+import gcm_trend_agreement as cgta
 
 
 def parse_args():
@@ -40,11 +36,10 @@ def parse_args():
 
 
 def drop_near_zero_reference_std(ds_w2, sigma_ref_min=cgta.SIGMA_REF_MIN):
-    """Recompute w2_normalized as NaN wherever ERA5's own bootstrap-trend std
-    (recovered as w2_distance / w2_normalized) is below sigma_ref_min, instead
-    of dividing into a ~zero value (notebook cell 30)."""
+    """Set w2_normalized to NaN where ERA5's bootstrap-trend std (w2_distance /
+    w2_normalized) is below sigma_ref_min."""
     wd, wn_old = ds_w2.w2_distance, ds_w2.w2_normalized
-    sigma_ref_recovered = wd / wn_old  # exact wherever the old 1e-12 floor wasn't hit
+    sigma_ref_recovered = wd / wn_old
     keep = (wd == 0) | (sigma_ref_recovered > sigma_ref_min)
     n_total = int(np.isfinite(wn_old.values).sum())
     n_dropped = int((np.isfinite(wn_old.values) & ~keep.values).sum())

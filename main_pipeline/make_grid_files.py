@@ -1,9 +1,11 @@
+"""Gridded annual SWED indicators (frequency, duration, intensity, severity)
+for every GCM run and GWL, regridded to the ERA5 grid."""
 import os
 import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ['ESMFMKFILE'] = config.ESMFMKFILE_XENV
 import xesmf as xe
 import xarray as xr
@@ -11,21 +13,12 @@ import numpy as np
 import pandas as pd
 import glob as glob
 
-# Zarr/NetCDF-agnostic file lookup + opener, shared with calculate_cf.py
-# (prefers a .zarr store when present, falls back to .nc).
 from io_utils import match_files, glob_any, open_dataset_any
 
 def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
-    """
-    Expected shortfall: mean positive deficit on compound-event days,
-    aggregated yearly.
-    """
+    """Annual mean positive deficit on compound-event days (intensity)."""
 
-    # Deficits (clip at 0 so negatives can't creep in). <= to match the
-    # compound-day definition in calculate_cf.py's _compound_indices
-    # (low_wind/low_solar use wcf/scf <= thr), so a day exactly at the
-    # threshold is treated consistently by both the event flag and the
-    # deficit used for severity.
+    # Deficits clipped at 0, with <= as in the compound-day definition.
     deficit_scf = xr.where(scf_ds["scf"] <= scf_thr, scf_thr - scf_ds["scf"], 0)
     deficit_wcf = xr.where(wcf_ds["wcf"] <= wcf_thr, wcf_thr - wcf_ds["wcf"], 0)
     daily_deficit = deficit_scf + deficit_wcf
@@ -41,14 +34,7 @@ def compute_severity(comp_da, scf_ds, wcf_ds, scf_thr, wcf_thr):
 
 
 def duration_xr(da):
-    """
-    Compute event durations for each (event_id, poly_idx), handling cases where
-    same event_id occurs in different regions (poly_idx).
-
-    Returns:
-      ds: Dataset of mean duration per year and lat-lon.
-      ds_freq: Dataset with the number of events per year and lat-lon.
-    """
+    """Mean event duration and number of events per (year, lat, lon)."""
     # Add a dummy time at the start to detect events starting at the first step
     print(da)
     da = da.convert_calendar('standard')
@@ -135,12 +121,7 @@ def duration_xr(da):
     ds_freq['frequency'] = ds_freq['frequency'].fillna(0)
     ds['duration'] = ds['duration'].fillna(0)
 
-    # Reindex onto the full (year, lat, lon) grid from da: a year with zero
-    # events at every single pixel never becomes a level value coming out of
-    # groupby/to_xarray above, so it's missing entirely (not just NaN) --
-    # the fillna(0) calls above can't catch that. This also keeps freq/dur
-    # on the same coordinates as compute_severity's intensity output, which
-    # is already calendar-complete via its .resample(...).fillna(0).
+    # Years without any event are missing from the groupby: reindex on all years.
     full_years = np.unique(da.time.dt.year.values)
     ds = ds.reindex(year=full_years, lat=da.lat.values, lon=da.lon.values, fill_value=0)
     ds_freq = ds_freq.reindex(year=full_years, lat=da.lat.values, lon=da.lon.values, fill_value=0)
@@ -148,16 +129,9 @@ def duration_xr(da):
     return ds, ds_freq
     
 def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
-    '''
-    Load gridded data for compound events and compute severity and duration in parallel.
-    
-    Parameters:
-      preprocessed_path: path to the preprocessed data files.
-      rolling: the rolling window size to use.
-    
-    Returns:
-      data: xarray.Dataset with duration, frequency, and severity per year and spatial point.
-    '''
+    """Annual duration, frequency and severity per grid cell for every GCM run at
+    `gwl`, regridded to the ERA5 grid and written to agg_datasets/gridded_<gwl>/
+    (reanalysis=True also does ERA5 on each GCM grid)."""
     # Find and sort file paths (zarr preferred, falls back to .nc)
     wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_ERA5'))
     scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_ERA5'))
@@ -178,7 +152,6 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
     wcf_rea_files, _ = match_files(preprocessed_path + 'ERA5/wcf_day*')
     wcf_rea = open_dataset_any(wcf_rea_files[0])
     wcf_rea = wcf_rea.isel(time=slice(0,2))
-    # Wrap the per-GCM processing in a delayed function
     def process_single_gcm(i, preprocessed_path, reanalysis):
         GCM = gcm_list[i]
         run = run_list[i]
@@ -318,16 +291,8 @@ def load_gridded_data_compound(preprocessed_path, gwl, reanalysis=False):
         
         
 def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
-    '''
-    Load gridded data for compound events and compute severity and duration in parallel.
-    
-    Parameters:
-      preprocessed_path: path to the preprocessed data files.
-      rolling: the rolling window size to use.
-    
-    Returns:
-      data: xarray.Dataset with duration, frequency, and severity per year and spatial point.
-    '''
+    """Time-mean wcf and scf of every GCM run at `gwl`, regridded to the ERA5 grid
+    and written to agg_datasets/gridded_<gwl>_ds_cf/."""
     # Find and sort file paths (zarr preferred, falls back to .nc)
     wcf_paths = glob_any(os.path.join(preprocessed_path, '*/wcf_day_*ssp*'+gwl+'_ERA5'))
     scf_paths = glob_any(os.path.join(preprocessed_path, '*/scf_day_*ssp*'+gwl+'_ERA5'))
@@ -348,7 +313,6 @@ def load_gridded_data_ds_cf(preprocessed_path, gwl, rolling=1):
     wcf_rea_files, _ = match_files(preprocessed_path + 'ERA5/wcf_day*')
     wcf_rea = open_dataset_any(wcf_rea_files[0])
     wcf_rea = wcf_rea.isel(time=slice(0,2))
-    # Wrap the per-GCM processing in a delayed function
     def process_single_gcm(i, preprocessed_path, rolling):
         GCM = gcm_list[i]
         run = run_list[i]

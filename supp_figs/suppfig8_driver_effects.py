@@ -3,8 +3,7 @@
 Extended Data Fig. 8: SWBD changes at 2 °C split into supply and demand drivers.
 
 Decomposition of SWBD changes at 2 °C warming into solar/wind supply and
-temperature-driven demand contributions, in days of baseline demand
-(previously fig45.py STEP 8). Reads the residual-load CSVs written by
+temperature-driven demand contributions, in days of baseline demand. Reads the residual-load CSVs written by
 main_pipeline/make_rl_files.py; map helpers come from main_figs/fig45.py.
 """
 import os
@@ -12,7 +11,7 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-import config  # repo-root config.py; also puts main_pipeline/, main_figs/, supp_figs/, aux_code/ on sys.path
+import config  # repo-root config.py; puts the code folders on sys.path
 os.environ["CARTOPY_DATA_DIR"] = config.CARTOPY_DATA_DIR_XENV
 os.environ["ESMFMKFILE"]       = config.ESMFMKFILE_XENV
 os.environ["MPLBACKEND"]       = "Agg"
@@ -62,9 +61,7 @@ def _driver_effects_figure(df_supply, supply_col, df_demand, demand_col,
     """2x2 SWBD driver decomposition at GWL 2.0°C:
     a supply effect, b demand effect (one shared symmetric colorbar),
     c dominant driver of the change, d dominant driver of the inter-model
-    spread (one shared 0-1 colorbar). Axes are placed at fixed inch positions
-    on a FIG_WIDTH_IN-wide canvas so panel letters print at the same size as
-    in the other supplementary figures."""
+    spread (one shared 0-1 colorbar)."""
     fig_w, fig_h = FIG_WIDTH_IN, 4.05
     fig  = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
     proj = ccrs.EqualEarth()
@@ -125,10 +122,7 @@ def _driver_effects_figure(df_supply, supply_col, df_demand, demand_col,
 
 def plot_supp_combined_driver_effects_absolute(df_gwl2, shapefile_path, hatch_df,
                                                output_dir, share_re="current", dpi=300):
-    """Same layout as plot_supp_combined_driver_effects, but panels a/b plot
-    the absolute change in cumulative residual load normalized by each
-    region's baseline demand (_mmm_supply_days/_mmm_demand_days), so they read
-    in "days of baseline demand". Panels c/d are unitless ratios either way."""
+    """ED Fig. 8 with supply/demand effects (a, b) in days of baseline demand."""
     _driver_effects_figure(
         _mmm_supply_days(df_gwl2, share_re), "Supply_Days",
         _mmm_demand_days(df_gwl2, share_re), "Demand_Days",
