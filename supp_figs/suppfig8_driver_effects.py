@@ -26,7 +26,7 @@ from map_overlays import discrepancy_mask_legend_handle
 
 from fig45 import (FIG_WIDTH_IN, MAIN_THR, MAIN_TOT_RE, PATHS, _add_colorbar,
                    _build_gdf, _draw_map, _mmm_demand_days, _mmm_supply_days,
-                   _save_fig, load_gwl_dfs, load_hatch_agg, w2_weighted_mean)
+                   _save_fig, load_gwl_dfs, load_hatch_agg, mmm_mean)
 
 
 # =============================================================================
@@ -34,17 +34,16 @@ from fig45 import (FIG_WIDTH_IN, MAIN_THR, MAIN_TOT_RE, PATHS, _add_colorbar,
 # =============================================================================
 
 def _driver_ratio_dfs(df_gwl2, share_re):
-    """Per-region supply share of (a) the absolute inverse-W2-weighted mean
-    driver effect (w2_weighted_mean) and (b) the inter-model spread (std
-    across GCMs' run-averaged effects, unweighted). 0 = demand dominates,
-    1 = supply."""
+    """Per-region supply share of (a) the absolute multi-model mean driver
+    effect (mmm_mean) and (b) the inter-model spread (std across GCMs'
+    run-averaged effects). 0 = demand dominates, 1 = supply."""
     df = df_gwl2[df_gwl2["share_re"] == share_re].copy()
     df["RE_Effect"]   = df["cum_rl_ds_cf"] - df["cum_rl_ref"]
     df["Temp_Effect"] = df["cum_rl_gwl"] - df["cum_rl_ref"]
     per_gcm = (df[["poly_idx", "GCM", "RE_Effect", "Temp_Effect"]]
                .groupby(["GCM", "poly_idx"]).mean().reset_index())
 
-    mean = (w2_weighted_mean(df, ["RE_Effect", "Temp_Effect"])
+    mean = (mmm_mean(df, ["RE_Effect", "Temp_Effect"])
             .set_index("poly_idx").abs())
     df_change = (mean["RE_Effect"] / (mean["RE_Effect"] + mean["Temp_Effect"])
                  ).rename("ratio").reset_index()

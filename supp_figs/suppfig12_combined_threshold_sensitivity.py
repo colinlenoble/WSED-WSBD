@@ -86,7 +86,7 @@ def rl_threshold_csv(rl_path, rl_thr):
 
 
 def _load_wsbd_gwl2(csv_path):
-    """GWL2 inverse-W2-weighted SWBD change vs GWL0.61 in days of baseline demand,
+    """GWL2 multi-model-mean SWBD change vs GWL0.61 in days of baseline demand,
     computed as in fig45.py's Fig. 4 (poly_idx, Absolute_Days; inf -> NaN)."""
     from fig45 import load_gwl_dfs, _mmm_absolute_days, MAIN_MIX
     _, df_gwl2, _ = load_gwl_dfs(csv_path)

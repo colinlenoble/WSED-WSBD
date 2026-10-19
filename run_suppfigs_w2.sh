@@ -6,8 +6,9 @@
 #SBATCH --cpus-per-task=3
 #SBATCH --mem=500G
 
-# Supplementary figures that use the inverse-Wasserstein (W2) ensemble
-# weighting: ED Figs. 4, 5, 6, 8, 9, 11, 12, 13.
+# Supplementary figures: ED Figs. 4, 5 (and the SWED half of 6) use the
+# inverse-Wasserstein (W2) ensemble weighting; the SWBD figures (ED Figs. 6,
+# 8, 9, 11, 12, 13) use the flat multi-model mean.
 
 ROOT=/gpfs/workdir/shared/juicce/RE_Colin/code_review/WSED-WSBD
 SUPP=$ROOT/supp_figs
@@ -33,7 +34,7 @@ run suppfig4_valuebyalpha_all_gwl.py
 run suppfig5_projected_change_wasserstein.py
 conda deactivate
 
-# --- SWBD / duration figures (share fig45.py, xenv) ---
+# --- SWBD / duration figures (share fig45.py, xenv; flat multi-model mean) ---
 source activate /gpfs/workdir/shared/juicce/envs/xenv
 run suppfig6_duration_distribution_swed_swbd.py
 run suppfig8_driver_effects.py

@@ -41,8 +41,7 @@ from fig45 import (DICT_LABELS, FIG_WIDTH_IN, MAIN_MIX,
                    PATHS, REGION_NAMES, _add_colorbar, _build_gdf, _draw_map,
                    _make_cmap, _mmm_combined, _mmm_re, _mmm_tas, _save_fig,
                    _three_panel_map, load_gwl_dfs, load_hatch_agg,
-                   mask_poles, _load_wasserstein_agg,
-                   _wasserstein_weight_table, w2_weighted_mean)
+                   mask_poles)
 from suppfig8_driver_effects import _driver_effects_figure
 
 
@@ -51,8 +50,7 @@ def _print_combined_effect_direction_stats(df_gwl, gwl_label, share_re="current"
     positive (increasing) vs. negative (decreasing) flat multi-model-mean
     Combined_Effect -- SWBDs change relative to 0.61 C, same metric/weighting
     as plot_main_gwl_maps -- out of how many regions have a finite value."""
-    combined = (_mmm_combined(df_gwl, share_re, vmax=None,
-                              weighting="mmm")["Combined_Effect"]
+    combined = (_mmm_combined(df_gwl, share_re, vmax=None)["Combined_Effect"]
                 .replace([np.inf, -np.inf], np.nan).dropna())
     n_total = len(combined)
     n_up    = int((combined > 0).sum())
@@ -64,16 +62,67 @@ def _print_combined_effect_direction_stats(df_gwl, gwl_label, share_re="current"
 # =============================================================================
 # INVERSE-WASSERSTEIN-DISTANCE POLYGON WEIGHTING
 #
-# Loader/weight table/weighted mean live in fig45.py (_load_wasserstein_agg,
-# _wasserstein_weight_table, w2_weighted_mean), where they are also the
-# default ensemble averaging of _mmm(). The wrappers below take an explicit
-# w2_table, for the companion figures that compare against the flat
-# multi-model mean (_mmm(..., weighting="mmm")).
+# Companion figures only: the paper figures (fig45.py) use the flat
+# multi-model mean (fig45._mmm). Weights per (GCM, run, poly_idx) come from
+# config.WASSERSTEIN_AGGREGATED_NC_PATH.
 # =============================================================================
+
+W2_EPS = 1e-3
+
+
+def _load_wasserstein_agg(wasserstein_path=None):
+    """Open config.WASSERSTEIN_AGGREGATED_NC_PATH (or an override). Returns
+    None (with a warning) if the file is missing."""
+    path = wasserstein_path or config.WASSERSTEIN_AGGREGATED_NC_PATH
+    if not os.path.exists(path):
+        print(f"  [WARN] Wasserstein aggregated file not found: {path}")
+        return None
+    return xr.open_dataset(path)
+
+
+def _wasserstein_weight_table(ds_wasserstein, var="w2_normalized", eps=W2_EPS):
+    """(GCM, run, poly_idx, w2_weight) table: 1/n_gcm (split across runs) times
+    1 / max(w2_normalized, eps)."""
+    gcms = np.asarray(ds_wasserstein["GCM"].values).astype(str)
+    runs = np.asarray(ds_wasserstein["run"].values).astype(str)
+    wcount = pd.Series(gcms).value_counts()
+    base_w = np.array([1.0 / wcount[g] / wcount.size for g in gcms])
+
+    w2     = ds_wasserstein[var].values                     # (realization, poly_idx)
+    inv_w2 = 1.0 / np.clip(w2, eps, None)
+    weight = np.nan_to_num(inv_w2 * base_w[:, None], nan=0.0)   # (realization, poly_idx)
+
+    poly_idx     = ds_wasserstein["poly_idx"].values
+    n_real, n_poly = weight.shape
+    return pd.DataFrame({
+        "GCM":       np.repeat(gcms, n_poly),
+        "run":       np.repeat(runs, n_poly),
+        "poly_idx":  np.tile(poly_idx, n_real),
+        "w2_weight": weight.ravel(),
+    })
+
+
+def w2_weighted_mean(df, cols, w2_table, by="poly_idx"):
+    """Inverse-W2-weighted mean of `cols` over (GCM, run), grouped by `by`.
+    Rows without a weight and non-finite values are excluded."""
+    d = df.copy()
+    d["GCM"] = d["GCM"].astype(str)
+    d["run"] = d["run"].astype(str)
+    d = d.merge(w2_table, on=["GCM", "run", "poly_idx"], how="inner")
+    d = d[d["w2_weight"] > 0]
+    out = {}
+    for c in cols:
+        v   = d[c].replace([np.inf, -np.inf], np.nan)
+        w   = d["w2_weight"].where(v.notna(), 0.0)
+        num = (v.fillna(0.0) * w).groupby(d[by]).sum()
+        den = w.groupby(d[by]).sum()
+        out[c] = num / den.replace(0.0, np.nan)
+    return pd.DataFrame(out).rename_axis(by).reset_index()
+
 
 def _mmm_wasserstein(df_gwl, effect_col, share_re, vmax, compute_fn, w2_table):
     """Inverse-W2-weighted per-polygon mean of effect_col using w2_table
-    (see fig45.w2_weighted_mean)."""
+    (see w2_weighted_mean)."""
     df = df_gwl[df_gwl["share_re"] == share_re].copy()
     compute_fn(df)
     out = w2_weighted_mean(df, [effect_col], w2_table=w2_table)
@@ -166,13 +215,13 @@ def plot_gwl2_wasserstein_vs_mmm(df_gwl2, shapefile_path, hatch_df, w2_table,
       a) average SWBDs change vs 0.61 deg C, weighted per polygon by each
          realization's 1/n_gcm times its inverse normalized Wasserstein trend
          distance to ERA5 at that polygon (_mmm_combined_wasserstein),
-      b) the flat multi-model mean (_mmm_combined(..., weighting="mmm")),
+      b) the flat multi-model mean (_mmm_combined),
          side by side with a on one shared continuous colour scale,
       c) a - b in percentage points, full width, diverging (PuOr_r)
          on its own scale. Agreement masking is shown in a/b but omitted in
          c, since it describes trend agreement, not this reweighting.
     """
-    df_flat = _mmm_combined(df_gwl2, share_re=share_re, vmax=None, weighting="mmm")
+    df_flat = _mmm_combined(df_gwl2, share_re=share_re, vmax=None)
     df_w2   = _mmm_combined_wasserstein(df_gwl2, w2_table, share_re=share_re, vmax=None)
 
     # a/b: shared continuous scale from the data (2nd-98th percentile of
@@ -1072,7 +1121,7 @@ def main():
         PATHS["agreement_nc"], PATHS["shapefile"],
         agreement_aggregated_nc=PATHS["agreement_aggregated_nc"],
     )
-    ds_wasserstein_agg = _load_wasserstein_agg(PATHS["wasserstein_aggregated_nc"])
+    ds_wasserstein_agg = _load_wasserstein_agg()
     w2_table = (_wasserstein_weight_table(ds_wasserstein_agg)
                 if ds_wasserstein_agg is not None else None)
 

@@ -44,7 +44,7 @@ main_pipeline/       data production
   make_agg_files.py             regional SWED indicators
   make_rl_files.py              residual-load (SWBD) tables
   trend_sev_eval.py             GCM vs ERA5 trend evaluation and agreement masks
-  trend_sev_eval_wasserstein.py Wasserstein distances used to weight the ensemble
+  trend_sev_eval_wasserstein.py Wasserstein distances used to weight the SWED ensemble
   duration_decomposition.py     event tables and event-duration classes
   io_utils.py                   NetCDF/Zarr file helpers
 main_figs/           main-text figures
@@ -83,7 +83,10 @@ Run from the repository root, in this order:
 4. `python main_pipeline/trend_sev_eval.py --aggregated`: trend CIs and
    agreement masks (per pixel and per region).
 5. `python main_pipeline/trend_sev_eval_wasserstein.py --aggregated`:
-   Wasserstein distances for ensemble weighting.
+   Wasserstein distances for SWED ensemble weighting (the SWBD figures,
+   Figs. 4-5 and ED Figs. 8/9/11/13 and the SWBD halves of ED Figs. 6/12, use
+   the flat multi-model mean; the per-region file is only read by
+   `aux_code/extra_figs_fig45.py`).
 6. Figure and table scripts (below).
 
 `make_grid_files.py` writes gridded indicators to disk but is optional:

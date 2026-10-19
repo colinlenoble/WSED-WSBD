@@ -9,9 +9,9 @@ band and warming level.
   formula at daily resolution), run-length encoded into events.
 
 Each SWBD region is assigned to the latitude band it overlaps most (by area).
-Duration shares are pooled per band, weighting regions by area and
-realizations by inverse Wasserstein distance (--weighting w2) or equally
-per GCM (mmm). Two figures are written: the ratio of each GWL's duration
+Duration shares are pooled per band, weighting regions by area. SWED
+realizations are weighted by inverse Wasserstein distance (--weighting w2) or
+equally per GCM (mmm); SWBD realizations always equally per GCM. Two figures are written: the ratio of each GWL's duration
 shares to the GWL0-61 baseline, and the shares themselves.
 """
 import os
@@ -120,11 +120,10 @@ def parse_args():
                          help="X-axis cap (days) of the share figure.")
     parser.add_argument("--min_events", type=int, default=5)
     parser.add_argument("--weighting", choices=["w2", "mmm"], default="w2",
-                        help="'w2': inverse-Wasserstein weights; 'mmm': equal weight per GCM.")
+                        help="SWED only -- 'w2': inverse-Wasserstein weights; 'mmm': equal "
+                             "weight per GCM. SWBD always uses equal weight per GCM.")
     parser.add_argument("--wasserstein_path", default=config.WASSERSTEIN_NC_PATH,
                         help="Per-pixel Wasserstein file (SWED zone weights).")
-    parser.add_argument("--wasserstein_agg_path", default=config.WASSERSTEIN_AGGREGATED_NC_PATH,
-                        help="Per-polygon Wasserstein file (SWBD region weights).")
     parser.add_argument("--duration_split_day", type=float, default=DURATION_SPLIT_DAY_DEFAULT,
                          help="Day splitting short-term from persistent events.")
     return parser.parse_args()
@@ -436,17 +435,13 @@ def load_plot_data_cache(path, meta):
 # a zone's regions
 # =============================================================================
 
-def _region_group_counts(counts_df, gwl, poly_idx, x_int, inv_w2=None):
+def _region_group_counts(counts_df, gwl, poly_idx, x_int):
     """Duration-share curve of one region: normalized per GCM, then averaged
-    with weight 1/n_GCM (or with inverse-Wasserstein weights inv_w2).
-    Returns (arr_share, raw_total) or None."""
+    with weight 1/n_GCM. Returns (arr_share, raw_total) or None."""
     sub = counts_df[(counts_df["gwl"] == gwl) & (counts_df["poly_idx"] == poly_idx)]
     if sub.empty:
         return None
     raw_total = float(sub["count"].sum())
-    if inv_w2 is not None:
-        pooled = swed_mod._group_counts_weighted(sub, x_int, inv_w2)
-        return None if pooled is None else (pooled[0], raw_total)
 
     gcm_series, gcm_totals = [], []
     for gcm, gsub in sub.groupby("GCM"):
@@ -468,15 +463,13 @@ def _region_group_counts(counts_df, gwl, poly_idx, x_int, inv_w2=None):
     return arr_share, raw_total
 
 
-def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_int, min_events=5,
-                           poly_inv_w2=None):
+def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_int, min_events=5):
     """Area-weighted mean of the zone's regional curves (_region_group_counts),
     skipping regions with fewer than min_events events. None if none qualify."""
     polys = [p for p, z in zone_of_poly.items() if z == zone]
     curves, weights = [], []
     for poly_idx in polys:
-        inv = None if poly_inv_w2 is None else poly_inv_w2.get(poly_idx, {})
-        group = _region_group_counts(counts_df, gwl, poly_idx, x_int, inv_w2=inv)
+        group = _region_group_counts(counts_df, gwl, poly_idx, x_int)
         if group is None:
             continue
         arr_share, raw_total = group
@@ -495,35 +488,20 @@ def zone_group_counts_swbd(counts_df, gwl, zone, zone_of_poly, area_of_poly, x_i
     return (curves * weights[:, None]).sum(axis=0) / weights.sum()
 
 
-def load_poly_inv_w2(path, var="w2_normalized", eps=1e-3):
-    """{poly_idx: {(GCM, run): 1 / max(w2_normalized, eps)}} from the
-    per-polygon Wasserstein file."""
-    ds = xr.open_dataset(path)
-    gcms = np.asarray(ds.GCM.values).astype(str)
-    runs = np.asarray(ds.run.values).astype(str)
-    inv = 1.0 / np.clip(ds[var].values, eps, None)          # (realization, poly_idx)
-    out = {}
-    for j, poly in enumerate(ds.poly_idx.values):
-        out[int(poly)] = {(g, r): float(inv[i, j]) for i, (g, r) in enumerate(zip(gcms, runs))
-                          if np.isfinite(inv[i, j])}
-    ds.close()
-    return out
-
-
 def load_ensemble_weights(args):
-    """{"SWED": zone weights, "SWBD": polygon weights} for --weighting w2
-    (None for mmm). Missing files are an error, not a silent fallback."""
+    """{"SWED": zone weights} for --weighting w2 (None for mmm). SWBD is
+    always an equal-weight multi-model mean. A missing file is an error, not
+    a silent fallback."""
     if args.weighting != "w2":
         return None
-    for path in (args.wasserstein_path, args.wasserstein_agg_path):
-        if not os.path.exists(path):
-            raise SystemExit(f"Wasserstein file not found: {path} -- run "
-                             "main_pipeline/trend_sev_eval_wasserstein.py first, or "
-                             "pass --weighting mmm.")
+    if not os.path.exists(args.wasserstein_path):
+        raise SystemExit(f"Wasserstein file not found: {args.wasserstein_path} -- run "
+                         "main_pipeline/trend_sev_eval_wasserstein.py first, or "
+                         "pass --weighting mmm.")
     ds = xr.open_dataset(args.wasserstein_path)
     swed = swed_mod.zone_inv_w2(ds, args.shapefile)
     ds.close()
-    return {"SWED": swed, "SWBD": load_poly_inv_w2(args.wasserstein_agg_path)}
+    return {"SWED": swed}
 
 
 # =============================================================================
@@ -587,8 +565,7 @@ def _share_fns(swed_counts_df, swbd_counts_df, zone_of_poly, area_of_poly, min_e
     def _swbd_share(gwl, zlabel, x):
         return zone_group_counts_swbd(
             swbd_counts_df, gwl, zlabel, zone_of_poly, area_of_poly, x,
-            min_events=min_events,
-            poly_inv_w2=None if weights is None else weights["SWBD"])
+            min_events=min_events)
 
     return {"SWED": _swed_share, "SWBD": _swbd_share}
 

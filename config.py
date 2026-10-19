@@ -41,7 +41,9 @@ AGREEMENT_SUFFIX_SHP = "v1"  # shapefile-version suffix on wcf_agg_*/scf_agg_* f
 # Empirical Wasserstein trend distance to ERA5 per (GCM, run), built by
 # trend_sev_eval_wasserstein.py: per pixel (realization, lat, lon) and per
 # polygon (realization, poly_idx). Variables w2_distance and w2_normalized
-# (divided by ERA5's bootstrap trend std).
+# (divided by ERA5's bootstrap trend std). The per-pixel file weights the SWED
+# figures; the per-polygon one is only read by aux_code/extra_figs_fig45.py
+# (the SWBD paper figures use the flat multi-model mean).
 WASSERSTEIN_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/agg_wasserstein_empirical_GCMs_all_year_ERA5.nc"
 WASSERSTEIN_AGGREGATED_NC_PATH = "/gpfs/workdir/shared/juicce/RE_Colin/climate_data/climate_proc/trend_evaluation/agg_wasserstein_empirical_GCMs_aggregated_ERA5_v1.nc"
 # Same, per polygon, for SWBD severity (main scenario), built by trend_sev_eval_wasserstein_swbd.py.

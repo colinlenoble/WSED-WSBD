@@ -46,7 +46,7 @@ import cartopy.feature as cfeature
 from map_overlays import draw_discrepancy_mask_polygons, discrepancy_mask_legend_handle
 from fig45 import (PATHS, MAIN_THR, MAIN_TOT_RE, FIG_WIDTH_IN,
                    MAP_LAT_SOUTH, MAP_LAT_NORTH, mask_poles,
-                   load_gwl_dfs, load_hatch_agg, _save_fig, w2_weighted_mean)
+                   load_gwl_dfs, load_hatch_agg, _save_fig, mmm_mean)
 
 NO_MIX_CHANGE_COLOR = "#8B4513"
 QUADRANT_COLORS = {
@@ -93,13 +93,12 @@ def _load_shares(share_csv):
 
 
 def _mix_df_percent(df_gwl2_curr, df_gwl2_fut):
-    """Relative change (%): cum_rl averaged over (GCM, run) rows with the
-    inverse-W2 polygon weights (fig45.w2_weighted_mean), then the ratio is
-    taken on those ensemble means."""
+    """Relative change (%): cum_rl multi-model mean over (GCM, run) rows
+    (fig45.mmm_mean), then the ratio is taken on those ensemble means."""
     cols = ["cum_rl_ref", "cum_rl_gwl", "cum_rl_tas", "cum_rl_ds_cf"]
-    df_c = w2_weighted_mean(df_gwl2_curr[df_gwl2_curr["share_re"] == "current"], cols)
-    df_f = (w2_weighted_mean(df_gwl2_fut[df_gwl2_fut["share_re"] == "future"],
-                             ["cum_rl_ref"])
+    df_c = mmm_mean(df_gwl2_curr[df_gwl2_curr["share_re"] == "current"], cols)
+    df_f = (mmm_mean(df_gwl2_fut[df_gwl2_fut["share_re"] == "future"],
+                     ["cum_rl_ref"])
             .rename(columns={"cum_rl_ref": "cum_rl_ref_future"}))
 
     df_mix = df_c.merge(df_f, on="poly_idx", how="left")
@@ -112,7 +111,7 @@ def _mix_df_percent(df_gwl2_curr, df_gwl2_fut):
 
 def _mix_df_days(df_gwl2_curr, df_gwl2_fut):
     """Mix and warming effects in days of baseline demand: each row divided by
-    its demand_bas (the same in both CSVs), then inverse-W2-weighted."""
+    its demand_bas (the same in both CSVs), then multi-model mean."""
     keys = ["poly_idx", "GCM", "run"]
     df_c = df_gwl2_curr[df_gwl2_curr["share_re"] == "current"][
         keys + ["cum_rl_ref", "cum_rl_gwl", "demand_bas"]]
@@ -124,7 +123,7 @@ def _mix_df_days(df_gwl2_curr, df_gwl2_fut):
     df["gwl_effect"] = (df["cum_rl_gwl"] - df["cum_rl_ref"]) / df["demand_bas"]
     df[["mix_effect", "gwl_effect"]] = (df[["mix_effect", "gwl_effect"]]
                                         .replace([np.inf, -np.inf], np.nan))
-    return w2_weighted_mean(df, ["mix_effect", "gwl_effect"])
+    return mmm_mean(df, ["mix_effect", "gwl_effect"])
 
 
 def _add_mix_change(df_mix, cur_share, fut_share):
