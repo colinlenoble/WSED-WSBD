@@ -3,7 +3,8 @@
 Extended Data Fig. 9: effect of the renewable share on SWBD changes.
 
 SWBD changes at each warming level for a 25/50/75 % renewable share, in days
-of baseline demand. Reads the residual-load CSVs
+of baseline demand, as flat multi-model means (fig45.mmm_mean: runs, then
+GCMs). Reads the residual-load CSVs
 written by main_pipeline/make_rl_files.py; map helpers come from
 main_figs/fig45.py.
 """
@@ -37,7 +38,7 @@ from fig45 import (FIG_WIDTH_IN, PATHS, _draw_map, _mmm_absolute_days,
 
 def plot_re_share_effect_absolute(gwl_dfs_by_share, shapefile_path, hatch_df,
                                   output_dir, tag, dpi=300):
-    """3x3 maps (renewable share x GWL) of the SWBD change vs 0.61 degC, in days
+    """3x3 maps (renewable share x GWL) of the multi-model-mean SWBD change vs 0.61 degC, in days
     of baseline demand."""
     TOT_RE_VALS   = [0.25, 0.5, 0.75]
     GWL_TITLES    = ["1.5°C", "2.0°C", "3.0°C"]
@@ -96,7 +97,7 @@ def plot_re_share_effect_absolute(gwl_dfs_by_share, shapefile_path, hatch_df,
 
     fig.text(0.5, 0.995, "Effect of solar-wind penetration level on SWBDs",
              ha="center", va="top", fontsize=8, fontweight="bold")
-    fig.text(0.5, 0.970, "Multi-model mean, current mix, threshold = 0.99",
+    fig.text(0.5, 0.970, "Current mix, threshold = 0.99",
              ha="center", va="top", fontsize=6, style="italic", color="#444444")
 
     legend_handles = [

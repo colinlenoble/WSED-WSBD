@@ -3,7 +3,7 @@
 Extended Data Fig. 13: sensitivity of SWBD changes to demand-model parameters.
 
 One panel per DemandConfig (make_rl_files.DEMAND_CONFIGS), in days of baseline
-demand. Reads the demand-sensitivity CSVs written
+demand, as flat multi-model means (fig45.mmm_mean: runs, then GCMs). Reads the demand-sensitivity CSVs written
 by main_pipeline/make_rl_files.py; map helpers come from main_figs/fig45.py.
 """
 import os
@@ -37,8 +37,8 @@ from fig45 import (FIG_WIDTH_IN, MAIN_MIX, MAIN_THR,
 
 def plot_supp_demand_sensitivity_absolute(shapefile_path, hatch_df, output_dir,
                                           agg_datasets_dir, dpi=300, period="Annual"):
-    """One map per demand configuration of the SWBD change at 2 degC vs
-    0.61 degC, in days of baseline demand."""
+    """One map per demand configuration of the multi-model-mean SWBD change
+    at 2 degC vs 0.61 degC, in days of baseline demand."""
     REF_COLOR = "#c0392b"
     ALT_COLOR = "#2c3e50"
     _meta = {
