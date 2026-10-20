@@ -311,19 +311,6 @@ def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
         print(f"  [INFO] {gwl_label}: avg |supply effect| / avg |demand effect| "
               f"(days of baseline demand) = {ratio:.3f}")
 
-    # 25th / 75th percentiles across regions, supply and demand separately,
-    # then the |supply| / |demand| ratio at each percentile.
-    if len(supply) and len(demand):
-        for q in (25, 75):
-            s_q  = np.percentile(supply, q)
-            d_q  = np.percentile(demand, q)
-            sa_q = np.percentile(supply.abs(), q)
-            da_q = np.percentile(demand.abs(), q)
-            ratio_q = sa_q / da_q if da_q > 0 else np.nan
-            print(f"  [INFO] {gwl_label}: P{q} supply effect = {s_q:.3f}, "
-                  f"P{q} demand effect = {d_q:.3f} (days of baseline demand); "
-                  f"P{q} |supply| / P{q} |demand| = {sa_q:.3f} / {da_q:.3f} = {ratio_q:.3f}")
-
     # Joint sign of supply and demand drivers, per region (aligned on poly_idx).
     joint = (_mmm_supply_days(df_gwl, share_re)
              .merge(_mmm_demand_days(df_gwl, share_re), on="poly_idx")
@@ -541,6 +528,17 @@ def main():
                                 args.output_dir, dpi=args.dpi, share_re=MAIN_MIX)
     plot_main_dumbbell_absolute(df_gwl2, PATHS["shapefile"], dpi=args.dpi,
                                 share_re=MAIN_MIX, output_dir=args.output_dir)
+
+    print("\n=== STEP 3: Supply/demand stats at 25% and 75% renewable share ===")
+    for tot_re in (0.25, 0.75):
+        csv_re = os.path.join(PATHS["out_dir"],
+            f"rl_agg_adaptation_Annual_{MAIN_THR}_ren_pen_{tot_re}_{MAIN_MIX}_v2.csv")
+        if not os.path.exists(csv_re):
+            print(f"  [WARN] {csv_re} missing -- skipped.")
+            continue
+        for df_gwl, gwl_label in zip(load_gwl_dfs(csv_re), ("1.5°C", "2°C", "3°C")):
+            _print_supply_demand_stats(df_gwl, f"{gwl_label}, RE share {tot_re:.0%}",
+                                       share_re=MAIN_MIX)
     print("\nDone.")
 
 
