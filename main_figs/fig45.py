@@ -311,6 +311,19 @@ def _print_supply_demand_stats(df_gwl, gwl_label, share_re="current"):
         print(f"  [INFO] {gwl_label}: avg |supply effect| / avg |demand effect| "
               f"(days of baseline demand) = {ratio:.3f}")
 
+    # 25th / 75th percentiles across regions, supply and demand separately,
+    # then the |supply| / |demand| ratio at each percentile.
+    if len(supply) and len(demand):
+        for q in (25, 75):
+            s_q  = np.percentile(supply, q)
+            d_q  = np.percentile(demand, q)
+            sa_q = np.percentile(supply.abs(), q)
+            da_q = np.percentile(demand.abs(), q)
+            ratio_q = sa_q / da_q if da_q > 0 else np.nan
+            print(f"  [INFO] {gwl_label}: P{q} supply effect = {s_q:.3f}, "
+                  f"P{q} demand effect = {d_q:.3f} (days of baseline demand); "
+                  f"P{q} |supply| / P{q} |demand| = {sa_q:.3f} / {da_q:.3f} = {ratio_q:.3f}")
+
     # Joint sign of supply and demand drivers, per region (aligned on poly_idx).
     joint = (_mmm_supply_days(df_gwl, share_re)
              .merge(_mmm_demand_days(df_gwl, share_re), on="poly_idx")
